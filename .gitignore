@@ -1,0 +1,23 @@
+# 依赖与构建产物
+node_modules/
+dist/
+build/
+*.pyc
+__pycache__/
+.venv/
+venv/
+
+# 运行时产物
+server.log
+*.log
+timeseries-studio-server/dataset/*
+!timeseries-studio-server/dataset/.gitkeep
+
+# 本地验证草稿
+.verify/
+
+# 编辑器与系统
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

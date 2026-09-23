@@ -1,0 +1,145 @@
+@import "tailwindcss";
+
+/* ============================================================
+   UI 精修层（移植自原型 index.html 的 scoped 样式）
+   ============================================================ */
+:root {
+  --brand-50:#eef2ff; --brand-100:#e0e7ff; --brand-500:#6366f1;
+  --brand-600:#4f46e5; --brand-700:#4338ca;
+  --ink-900:#0f172a; --ink-700:#334155; --ink-500:#64748b; --ink-400:#94a3b8;
+  --line:#e2e8f0; --line-soft:#eef2f6;
+  --card-shadow:0 1px 2px rgba(15,23,42,.04), 0 4px 16px -6px rgba(15,23,42,.10);
+  --card-shadow-hover:0 2px 6px rgba(15,23,42,.06), 0 12px 28px -10px rgba(15,23,42,.18);
+  --ring:0 0 0 3px rgba(99,102,241,.28);
+  --radius:14px;
+}
+
+html { -webkit-text-size-adjust:100%; height:100%; }
+body { height:100%; }
+#app { display:flex; flex-direction:column; height:100vh; }
+body {
+  -webkit-font-smoothing:antialiased; -moz-osx-font-smoothing:grayscale;
+  font-family:"Inter","Segoe UI","PingFang SC","Microsoft YaHei",system-ui,-apple-system,sans-serif;
+  letter-spacing:.005em;
+  background:
+    radial-gradient(1200px 600px at 100% -10%, #eef2ff 0%, rgba(238,242,255,0) 55%),
+    #f1f5f9;
+}
+::selection { background:var(--brand-100); color:var(--brand-700); }
+
+:where(button,a,select,input,[tabindex]):focus-visible { outline:none; box-shadow:var(--ring); border-radius:8px; }
+
+/* 滚动条 */
+::-webkit-scrollbar { width:9px; height:9px; }
+::-webkit-scrollbar-track { background:transparent; }
+::-webkit-scrollbar-thumb { background:#cbd5e1; border-radius:9999px; border:2px solid transparent; background-clip:content-box; }
+::-webkit-scrollbar-thumb:hover { background:#94a3b8; background-clip:content-box; }
+* { scrollbar-width:thin; scrollbar-color:#cbd5e1 transparent; }
+
+/* 竖排文字（操作历史导轨） */
+.writing-vertical { writing-mode:vertical-rl; text-orientation:upright; letter-spacing:.14em; }
+
+/* 可读性下限：把过小的 9/10px 文案抬到舒适区间 */
+.step-panel .text-\[9px\],  #app-header .text-\[9px\]  { font-size:10.5px; line-height:1.35; }
+.step-panel .text-\[10px\], #app-header .text-\[10px\] { font-size:11px;   line-height:1.4; }
+.step-panel .text-\[11px\] { font-size:11.5px; line-height:1.45; }
+
+/* ---------- 卡片：统一圆角 / 描边 / 柔和阴影 ---------- */
+.step-panel .rounded-xl.border,
+.step-panel .rounded-2xl.border { box-shadow:var(--card-shadow); border-color:var(--line); }
+
+/* ---------- 表格：更易扫读、可交互 ---------- */
+.step-panel table { border-spacing:0; }
+.step-panel thead th {
+  position:relative; font-weight:600; color:#475569;
+  background:#f8fafc; white-space:nowrap;
+}
+.step-panel thead th:first-child { border-top-left-radius:8px; }
+.step-panel thead th:last-child  { border-top-right-radius:8px; }
+.step-panel tbody td { border-color:var(--line-soft); }
+.step-panel tbody tr { transition:background-color .12s ease; }
+.step-panel tbody tr:nth-child(even) { background:rgba(248,250,252,.6); }
+.step-panel tbody tr:hover { background:var(--brand-50); }
+
+/* ---------- 表单控件：更大点击区 + 清晰聚焦 ---------- */
+.step-panel select,
+.step-panel input[type="text"],
+.step-panel input[type="number"] {
+  transition:border-color .15s ease, box-shadow .15s ease, background-color .15s ease;
+}
+.step-panel select:hover,
+.step-panel input[type="text"]:hover,
+.step-panel input[type="number"]:hover { border-color:#c7d2fe; }
+.step-panel select:focus,
+.step-panel input[type="text"]:focus,
+.step-panel input[type="number"]:focus { border-color:var(--brand-500); box-shadow:var(--ring); outline:none; }
+.step-panel input[type="checkbox"] { width:14px; height:14px; cursor:pointer; }
+.step-panel label:has(input[type="checkbox"]) { user-select:none; }
+
+/* ---------- 按钮：悬停微抬升 / 按下反馈 ---------- */
+.step-panel button, #app-header button { transition:transform .1s ease, box-shadow .18s ease, background-color .18s ease, border-color .18s ease, color .18s ease; }
+.step-panel button:not(.qtab-btn):not(.feat-tab-btn):not(.alog-filter):active,
+#app-header button:active { transform:translateY(1px); }
+
+.step-btn { white-space:nowrap; }
+.step-btn:hover { transform:translateY(-1px); }
+
+.qtab-btn, .feat-tab-btn { position:relative; }
+.qtab-btn:hover, .feat-tab-btn:hover { background:#f8fafc; }
+
+/* ---------- 图表容器 ---------- */
+#chart-explore-main { min-height:320px; }
+#chart-explore-dist { min-height:220px; }
+#chart-quality-clean { min-height:300px; }
+
+#step-2 > * { flex-shrink:0; }
+
+/* ---------- 顶栏 ---------- */
+#app-header { backdrop-filter:saturate(180%) blur(6px); background:rgba(255,255,255,.92); }
+#app-header nav { max-width:100%; }
+#app-header .step-btn span { line-height:1; }
+
+/* ---------- 操作历史抽屉 ---------- */
+#action-log-drawer { box-shadow:-18px 0 48px -22px rgba(15,23,42,.35); }
+#action-log-rail { box-shadow:-4px 0 14px -6px rgba(15,23,42,.25); }
+
+.code-modal:not(.hidden) { animation:fade-in .16s ease; }
+.code-modal > div { animation:pop-in .18s cubic-bezier(.2,.8,.2,1); }
+@keyframes fade-in { from{opacity:0} to{opacity:1} }
+@keyframes pop-in { from{opacity:0; transform:translateY(8px) scale(.985)} to{opacity:1; transform:none} }
+
+.step-panel:not(.hidden) { animation:panel-in .22s ease; }
+@keyframes panel-in { from{opacity:0; transform:translateY(4px)} to{opacity:1; transform:none} }
+
+/* ---------- 响应式 ---------- */
+@media (max-width:1280px) {
+  #app-header { flex-wrap:wrap; row-gap:.5rem; }
+  #app-header nav { order:3; width:100%; justify-content:flex-start; overflow-x:auto; padding-bottom:2px; }
+  #app-header nav::-webkit-scrollbar { height:0; }
+}
+@media (max-width:1100px) {
+  .step-panel .grid-cols-12 > .col-span-6 { grid-column:span 12 / span 12; }
+  .step-panel .grid-cols-12 > .col-span-5,
+  .step-panel .grid-cols-12 > .col-span-7 { grid-column:span 12 / span 12; }
+}
+@media (max-height:760px) {
+  #chart-explore-main { min-height:260px; }
+  #chart-quality-clean { min-height:240px; }
+}
+@media (prefers-reduced-motion:reduce) {
+  *, *::before, *::after { animation-duration:.001ms !important; transition-duration:.001ms !important; }
+}
+
+/* ---------- 操作记录引导高亮 ---------- */
+@keyframes rail-pulse { 0%,100%{box-shadow:0 0 0 0 rgba(99,102,241,.4)} 50%{box-shadow:0 0 0 10px rgba(99,102,241,0)} }
+.rail-highlight { animation:rail-pulse 1.2s ease 3; background:#eef2ff !important; }
+
+/* ---------- 步骤引导提示 ---------- */
+.step-guide-banner { background:linear-gradient(135deg,#eef2ff 0%,#e0e7ff 100%); border:1px solid #c7d2fe; border-radius:12px; padding:12px 16px; display:flex; align-items:center; gap:12px; }
+.step-guide-banner .guide-step { display:flex; align-items:center; gap:6px; font-size:11px; color:#64748b; }
+.step-guide-banner .guide-step.active { color:#4f46e5; font-weight:600; }
+.step-guide-banner .guide-step.done { color:#10b981; }
+.step-guide-banner .guide-arrow { color:#cbd5e1; font-size:10px; }
+
+/* Element Plus 局部微调：与原型紧凑风格对齐 */
+.el-message { top: 60px !important; }
