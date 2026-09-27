@@ -1,15 +1,47 @@
-"""TimeSeries Studio 后端：为浏览器端无法胜任的能力提供真实计算。
+"""TimeSeries Studio 后端：数据加工全部在这里真实发生。
 
-无状态设计：前端随每个请求携带数据，服务端不使用任何数据库。
+工作台不再把整张表放进浏览器：POST /api/ws 之后明细留在服务端的 DataFrame 里，
+前端只持有元数据与"当前页附近"的行窗口，每个加工动作是一条打在服务端的命令。
 唯一的落盘位置是数据集目录 <cwd>/dataset（可用 TSS_DATASET_DIR 覆盖），不存在时自动创建。
 
-  GET    /api/health                   探活，前端据此决定"在线/需后端"呈现
-  POST   /api/parse                    解析 CSV/Excel/Parquet/Feather（pyarrow 真实解码列式压缩）
-  POST   /api/export                   编码为 Parquet/Feather/CSV/Excel 字节流
-  POST   /api/anomaly/iforest          scikit-learn 完整版孤立森林逐列检测
-  GET    /api/datasets                 列举数据集目录中的真实文件（"最近打开的数据集"）
-  POST   /api/datasets                 导入上传文件：落盘到数据集目录并解析返回
-  GET    /api/datasets/{name}/parse    打开数据集目录中的已有文件并解析
+  GET    /api/health                 探活 + 能力声明，前端据此决定"在线可编辑 / 离线只读"
+  GET    /api/datasets               列举数据集目录中的真实文件（"最近打开的数据集"）
+
+  POST   /api/ws                     上传文件建工作区（persist=true 时同时落盘到数据集目录）
+  POST   /api/ws/preset              用种子化 numpy 生成内置示例数据集
+  POST   /api/ws/dataset             打开数据集目录里的已有文件
+  GET    /api/ws/{id}                元数据（列、行数、采样频率、时间格式、版本号、命令序列）
+  GET    /api/ws/{id}/rows           分页行窗口
+  GET    /api/ws/{id}/columns        整列取数（外生变量按时间戳对齐这类必须要整列的操作用）
+  GET    /api/ws/{id}/overview       缺失率 / 重复率 / 时间范围等整表统计
+  GET    /api/ws/{id}/quality        第四步诊断：每列缺失统计 + 缺失段区间 + 重复时间戳
+  GET    /api/ws/{id}/series         单列抽稀曲线（含原始行号、缺失标记、异常覆盖层）
+  GET    /api/ws/{id}/stats          第三步统计矩阵：Count/Mean/Std/四分位/Min/Max/缺失率
+  GET    /api/ws/{id}/hist           第三步直方图：25 桶计数 + 均值/中位数所在桶
+  GET    /api/ws/{id}/series-multi   第三步叠加曲线：多列共享时间轴，服务端按点数上限抽稀
+  GET    /api/ws/{id}/first-complete 新特征列的首个完整行号（长窗口特征开头必为空）
+  GET    /api/ws/{id}/anomaly        服务端留存的最近一次检测结果（索引不外泄）
+  POST   /api/ws/{id}/anomaly-detect 3σ / IQR / 滑窗 MAD / sklearn 孤立森林 / 表达式
+  POST   /api/ws/{id}/op/...         加工命令：时间格式、重命名、删列、单位换算、
+                                     列运算、重采样、缺失段填补、重复时间戳合并、
+                                     异常修复、掩码生成/删除、四类特征编码
+  POST   /api/ws/{id}/op/exo-preset  预设模板生成外生变量列（服务端 seeded numpy）
+  POST   /api/ws/{id}/op/exo-formula 时间公式生成外生变量列
+  POST   /api/ws/{id}/op/exo-file    侧表按时间戳对齐挂列（只引用文件名 + sha，不重传文件）
+  GET    /api/exo/presets            预设清单与公式变量表（界面下拉选项读它，不再自己抄）
+  POST   /api/exo/inspect            侧表先看后挂：落盘并回表头 / 可用变量名 / 时间列候选
+  POST   /api/ws/{id}/restore        回到某个版本号（撤销的服务端实现）
+  GET    /api/ws/{id}/export         宽表直出 csv/xlsx/parquet/feather（明细不过网络）
+  DELETE /api/ws/{id}                关闭工作区（同时删掉它的命令日志）
+
+  GET    /api/session                读回上次会话：服务端逐个重建/核对其引用的工作区再返回
+  PUT    /api/session                保存会话（只收 UI 状态，携带整列数据的请求直接 400）
+  DELETE /api/session                清除会话
+
+  POST   /api/export                 行数据 → Parquet/Feather/CSV/Excel 字节流（自带行的调用方用）
+
+工作区的命令日志与会话落在 <cwd>/.tss-state（可用 TSS_STATE_DIR 覆盖）。落的是「怎么算出来的」，
+不是明细本身：后端重启后同一个 wsId 仍能按日志重放复原，刷新页面也就不再丢撤销历史。
 """
 from __future__ import annotations
 
@@ -19,18 +51,16 @@ from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
 
-from . import __version__
-from .schemas import ExportRequest, IForestRequest
-from .services import dataset_store
-from .services.anomaly import detect_iforest
+from . import __version__, schemas
+from .routers import session as session_router
+from .routers import workspace as workspace_router
+from .schemas import ExportRequest
+from .services import dataset_store, exo, explore, features, state_store
 from .services.exporter import build_export
-from .services.parser import parse_table
-
-MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 
 app = FastAPI(
     title="TimeSeries Studio Server",
-    description="时序数据清洗工作台后端（FastAPI · 无数据库）",
+    description="时序数据清洗工作台后端（FastAPI · 服务端工作区 · 无数据库）",
     version=__version__,
 )
 
@@ -43,6 +73,9 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+app.include_router(workspace_router.router)
+app.include_router(session_router.router)
+
 
 @app.get("/api/health")
 def health() -> dict:
@@ -50,28 +83,98 @@ def health() -> dict:
         "status": "ok",
         "version": __version__,
         "capabilities": [
-            "parse:parquet", "parse:feather",
-            "export:parquet", "export:feather",
-            "anomaly:iforest",
-            "datasets:list", "datasets:import", "datasets:open",
+            "workspace:create", "workspace:preset", "workspace:open", "workspace:rows",
+            "workspace:columns", "workspace:overview", "workspace:restore",
+            "workspace:quality", "workspace:series", "workspace:anomaly",
+            "workspace:stats", "workspace:hist", "workspace:series-multi",
+            "workspace:first-complete", "workspace:export",
+            "op:time-format", "op:rename-column", "op:delete-column", "op:convert-unit",
+            "op:derived-column", "op:resample",
+            "op:impute", "op:anomaly-repair", "op:mask-generate", "op:mask-delete",
+            "anomaly:detect",
+            "workspace:value-counts",
+            "op:feature-time", "op:feature-lag", "op:feature-diff", "op:feature-cat",
+            # 期⑤：外生变量三条来源全部在服务端生成，浏览器不再回传整列
+            "op:exo-preset", "op:exo-formula", "op:exo-file", "exo:presets", "exo:inspect",
+            "export:parquet", "export:feather", "export:csv", "export:xlsx",
+            "datasets:list",
+            # 期⑤：历史与会话搬到服务端。reopen 是「进程里没有、按日志重放出来」，
+            # 前端据此判断刷新/重启之后还能不能接着撤销
+            "workspace:reopen", "workspace:list-durable",
+            "session:get", "session:set", "session:clear",
         ],
+        "limits": {
+            "workspaces": workspace_router.ws_store.MAX_WORKSPACES,
+            "cellsPerWorkspace": workspace_router.ws_store.MAX_CELLS,
+            "maxPageRows": workspace_router.MAX_PAGE,
+            "maxUploadBytes": schemas.MAX_UPLOAD_BYTES,
+            "featureColsPerOp": workspace_router.ws_store.MAX_FEATURE_COLS_PER_OP,
+            "onehotLevels": workspace_router.ws_store.MAX_ONEHOT_LEVELS,
+            "featureWindow": features.MAX_WINDOW,
+            "uniqueValuesReported": features.MAX_UNIQUE_VALUES,
+            # 第三步曲线一次最多回这么多点：叠加曲线的抽稀上限，界面按它摆「跨度」按钮
+            "seriesMaxPoints": explore.MAX_POINTS,
+            "histogramBins": explore.DEFAULT_BINS,
+            # 节假日表的天数：界面上的「基于 2024 年法定节假日表（N 天）」必须与后端那份表同源
+            "holidayDays": len(features.HOLIDAYS_2024),
+            # 整份清单也给出：导出的 Python 脚本要能脱离本项目独立运行，节假日集合只能取自后端这一份表
+            "holidayDates2024": sorted(features.HOLIDAYS_2024),
+            # 会话的三条守卫：条数、整列内联长度、总字节
+            "sessionActionLog": schemas.MAX_SESSION_ACTION_LOG,
+            "sessionInlineArray": schemas.MAX_SESSION_INLINE_ARRAY,
+            "sessionBytes": schemas.MAX_SESSION_BYTES,
+            "sessionWorkspaces": schemas.MAX_SESSION_WORKSPACES,
+            "workspaceLogBytes": state_store.MAX_LOG_BYTES,
+            # 外生变量侧表的两条上限
+            "exoColsPerOp": exo.MAX_EXO_COLS,
+            "exoSideRows": exo.MAX_SIDE_ROWS,
+        },
         "datasetDir": dataset_store.dataset_dir(),
+        # 命令日志与会话的位置：界面「状态目录」一栏显示它，用户才找得到历史存在哪
+        "stateDir": str(state_store.state_dir()),
     }
 
 
-@app.post("/api/parse")
-async def parse(file: UploadFile = File(...)) -> dict:
+@app.get("/api/datasets")
+def datasets_list() -> dict:
+    """列举数据集目录中的真实文件；目录不存在时由 dataset_dir() 自动创建。"""
+    try:
+        return dataset_store.list_datasets()
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"读取数据集目录失败：{type(exc).__name__}: {exc}") from exc
+
+
+@app.get("/api/exo/presets")
+def exo_presets() -> dict:
+    """预设外生变量清单：下拉选项由这一份表渲染，前端不再自己抄一遍。"""
+    return {"items": exo.presets_view(),
+            "formulaHelp": exo.FORMULA_HELP,
+            "funcs": sorted(exo._FORMULA_FUNCS),
+            "vars": list(exo._FORMULA_NAMES),
+            "alignModes": [{"mode": "left", "label": "精确时间戳"},
+                           {"mode": "nearest", "label": "就近匹配"}]}
+
+
+@app.post("/api/exo/inspect")
+async def exo_inspect(file: UploadFile = File(..., description="外生变量侧表")) -> dict:
+    """侧表先看后挂：落盘（文件名带内容指纹）并回表头、可用变量名、时间列候选。
+
+    分成两步是为了让「列名转不出合法变量名」这种情况在挂列之前就能改名，而不是像旧版
+    那样静默转写成 ___ 互相覆盖；同时文件已经在这一步落进 dataset/_exo/，提交时只传
+    文件名 + sha，几十 MB 的侧表不用上传第二遍。只看不挂：这条不产生任何命令日志。
+    """
     content = await file.read()
     if not content:
         raise HTTPException(status_code=400, detail="上传文件为空")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="上传文件超过 64MB 上限")
+    if len(content) > schemas.MAX_UPLOAD_BYTES:
+        raise HTTPException(status_code=413, detail=f"侧表文件超过 {schemas.MAX_UPLOAD_MB}MB 上限")
     try:
-        return parse_table(content, file.filename or "data.csv")
-    except HTTPException:
-        raise
+        stored = dataset_store.save_exo_bytes(file.filename or "exo.csv", content)
+        return exo.inspect_side_table(content, stored)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"解析失败：{type(exc).__name__}: {exc}") from exc
+        raise HTTPException(status_code=422, detail=f"侧表解析失败：{type(exc).__name__}: {exc}") from exc
 
 
 @app.post("/api/export")
@@ -93,64 +196,3 @@ def export(payload: ExportRequest) -> Response:
             "Content-Length": str(len(data)),
         },
     )
-
-
-@app.post("/api/anomaly/iforest")
-def iforest(payload: IForestRequest) -> dict:
-    if not payload.columns:
-        raise HTTPException(status_code=400, detail="columns 不能为空")
-    try:
-        return detect_iforest(payload.model_dump())
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"检测失败：{type(exc).__name__}: {exc}") from exc
-
-
-@app.get("/api/datasets")
-def datasets_list() -> dict:
-    """列举数据集目录中的真实文件；目录不存在时由 dataset_dir() 自动创建。"""
-    try:
-        return dataset_store.list_datasets()
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"读取数据集目录失败：{type(exc).__name__}: {exc}") from exc
-
-
-@app.post("/api/datasets")
-async def datasets_import(file: UploadFile = File(...)) -> dict:
-    """导入：把上传文件落盘到数据集目录，再解析返回（因此下次打开即出现在最近列表）。"""
-    content = await file.read()
-    if not content:
-        raise HTTPException(status_code=400, detail="上传文件为空")
-    if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail="上传文件超过 64MB 上限")
-    try:
-        saved = dataset_store.save_bytes(file.filename or "data.csv", content)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        raise HTTPException(status_code=500, detail=f"写入数据集目录失败：{type(exc).__name__}: {exc}") from exc
-    try:
-        parsed = parse_table(content, saved)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"解析失败：{type(exc).__name__}: {exc}") from exc
-    return {**parsed, "saved": saved, "dir": str(dataset_store.dataset_dir())}
-
-
-@app.get("/api/datasets/{filename}/parse")
-def datasets_open(filename: str) -> dict:
-    """打开数据集目录中的已有文件并解析。"""
-    try:
-        content, real_name = dataset_store.read_bytes(filename)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=404, detail=str(exc)) from exc
-    try:
-        return parse_table(content, real_name)
-    except HTTPException:
-        raise
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"解析失败：{type(exc).__name__}: {exc}") from exc

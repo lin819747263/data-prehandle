@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import hashlib
 import os
 import re
 from datetime import datetime
@@ -109,3 +110,44 @@ def save_bytes(filename: str, content: bytes) -> str:
         target = root / name
     target.write_bytes(content)
     return name
+
+
+# ---------------------------------------------------------------- 外生变量侧表
+#
+# 侧表不是"可打开的主数据"，它是某条命令的依赖：外生变量列的内容完全由它决定，命令日志里
+# 只记文件名 + 内容 sha。因此它落在 dataset/_exo/ 子目录（list_datasets 只列顶层，不会混进
+# 「最近打开的数据集」），并且文件名里带内容指纹：
+# 同名但不同内容的两份侧表各自成文件，重放时不会互相覆盖掉对方的历史。
+
+EXO_SUBDIR = "_exo"
+
+
+def exo_dir() -> Path:
+    d = dataset_dir() / EXO_SUBDIR
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
+def exo_sha256(content: bytes) -> str:
+    return hashlib.sha256(content).hexdigest()
+
+
+def save_exo_bytes(filename: str, content: bytes) -> str:
+    """按内容落盘并返回带指纹的真实文件名（同一份内容重复导入只写一次）。"""
+    name = safe_name(filename)
+    stem, ext = Path(name).stem, Path(name).suffix
+    stored = f"{stem}__{exo_sha256(content)[:12]}{ext}"
+    target = exo_dir() / stored
+    if not target.exists():
+        target.write_bytes(content)
+    return stored
+
+
+def read_exo_bytes(filename: str) -> tuple[bytes, str]:
+    root = exo_dir().resolve()
+    target = (root / safe_name(filename)).resolve()
+    if not target.is_relative_to(root):
+        raise ValueError("非法的侧表文件路径")
+    if not target.is_file():
+        raise FileNotFoundError(f"侧表文件 {filename} 已不在 {root} 里，无法重放该外生变量导入命令")
+    return target.read_bytes(), target.name

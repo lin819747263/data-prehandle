@@ -1,105 +1,204 @@
 // ============================================================
 // 全局状态与业务动作（所有数字均来自真实计算）
+//
+// 第①期起：明细表留在后端工作区（timeseries-studio-server /api/ws）。
+// 第④期起：这里每个数据集只保存两样东西——
+//   meta     后端 meta_view()：列/类型/时间列/时间格式/采样频率/版本号/命令序列
+//   page     当前页窗口（默认 50 行，array-of-arrays + columns）
+// 浏览器不再常驻整表视图：整表级的统计、曲线抽稀与导出都在服务端算。
+// 后端不在线时整个工作台转为只读：没有任何浏览器端算法兜底。
 // ============================================================
-import { reactive, markRaw, watch, toRaw } from 'vue'
+import { reactive, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  formatDate, parseTimeValue, convertSingleTime, convertWithCustomFormat,
-  detectTimeFormatOfSamples, columnStats, isMissing, medianOf,
-  calculateMissingRate, calculateDuplicateRate, detectSamplingMinutes,
-  detectMissingSegments, imputeSegment, performResample,
+  detectTimeFormatOfSamples, isMissing,
   RESAMPLE_RATE_MAP, RESAMPLE_RATE_NAMES, RESAMPLE_METHOD_NAMES,
-  buildVarEvaluator, buildExprEvaluator, columnQuantileStats,
   downloadBlob
 } from './utils'
+import * as ws from './api'
 
-// ---- 数据集仓库（非响应式，配合 dataVersion 计数器驱动视图） ----
-export const datasets = {
-  pv: {
-    name: '光伏电站实测出力数据 (PV-15min)',
-    timeCol: 'timestamp',
-    freq: '15 min (96点/天)',
-    unit: 'kW',
-    columns: [
-      { key: 'timestamp', label: '时间戳', type: 'datetime', isTime: true },
-      { key: 'active_power', label: '实际有功出力(kW)', type: 'float', isMain: true, unit: 'kW' },
-      { key: 'irradiance', label: '斜面总辐照度(W/m²)', type: 'float', unit: 'W/m²' },
-      { key: 'temperature', label: '环境温度(°C)', type: 'float', unit: '°C' },
-      { key: 'wind_speed', label: '风速(m/s)', type: 'float', unit: 'm/s' },
-      { key: 'weather_type', label: '天气类型', type: 'category' }
-    ],
-    data: []
-  },
-  load: {
-    name: '区域工商业电力负荷数据 (Load-60min)',
-    timeCol: 'timestamp',
-    freq: '60 min (24点/天)',
-    unit: 'MW',
-    columns: [
-      { key: 'timestamp', label: '时间戳', type: 'datetime', isTime: true },
-      { key: 'load_demand', label: '总负荷需求(MW)', type: 'float', isMain: true, unit: 'MW' },
-      { key: 'temperature', label: '室外气温(°C)', type: 'float', unit: '°C' },
-      { key: 'humidity', label: '相对湿度(%)', type: 'float', unit: '%' },
-      { key: 'price_tier', label: '分时电价区间', type: 'category' }
-    ],
-    data: []
+export const PAGE_SIZE = 50
+
+function blankDataset(key, name) {
+  return {
+    key,
+    name: name || '',
+    wsId: '',
+    meta: null,
+    columns: [],
+    timeCol: '',
+    timeFormat: 'YYYY-MM-DD HH:mm:ss',
+    timeDetect: null,
+    freq: '',
+    freqMinutes: null,
+    format: '',
+    unit: '',
+    page: { offset: 0, limit: PAGE_SIZE, columns: [], rows: [], total: 0 },
+    overview: null
   }
 }
 
-// 生成逼真的时序模拟数据（示例数据集）
-export function generateSyntheticData() {
-  if (datasets.pv.data.length > 0) return
-  const pvData = []
-  const startDate = new Date(2024, 5, 1, 0, 0, 0)
-  const weatherList = ['晴朗', '多云', '少云', '阴天']
-  for (let i = 0; i < 2880; i++) {
-    const t = new Date(startDate.getTime() + i * 15 * 60 * 1000)
-    const hour = t.getHours() + t.getMinutes() / 60
-    let baseIrr = 0
-    if (hour >= 6 && hour <= 19) {
-      baseIrr = Math.sin(((hour - 6) / 13) * Math.PI) * 920
-      baseIrr += (Math.random() - 0.5) * 60
-      if (baseIrr < 0) baseIrr = 0
-    }
-    let power = baseIrr > 0 ? baseIrr * 1.85 + (Math.random() - 0.5) * 30 : 0
-    const temp = 20 + Math.sin(((hour - 4) / 24) * 2 * Math.PI) * 10 + (Math.random() - 0.5) * 2
-    const wind = 2.5 + Math.random() * 3.5
-    const weather = weatherList[Math.floor((i / 96) % weatherList.length)]
-    if (i >= 380 && i <= 388) power = null
-    if (i === 550) power = 3100.0
-    if (i === 820) power = -80.0
-    pvData.push({
-      timestamp: formatDate(t),
-      active_power: power !== null ? parseFloat(power.toFixed(2)) : null,
-      irradiance: parseFloat(baseIrr.toFixed(1)),
-      temperature: parseFloat(temp.toFixed(1)),
-      wind_speed: parseFloat(wind.toFixed(1)),
-      weather_type: weather
-    })
-  }
-  datasets.pv.data = pvData
+// ---- 数据集仓库（非响应式，配合 dataVersion 计数器驱动视图） ----
+export const datasets = { pv: blankDataset('pv'), load: blankDataset('load') }
+export const PRESET_LABELS = {
+  pv: '光伏电站实测出力数据 (PV-15min)',
+  load: '区域工商业电力负荷数据 (Load-60min)'
+}
 
-  const loadData = []
-  const startLoad = new Date(2024, 5, 1, 0, 0, 0)
-  for (let i = 0; i < 720; i++) {
-    const t = new Date(startLoad.getTime() + i * 3600 * 1000)
-    const hour = t.getHours()
-    let baseLoad = 350 + Math.sin(((hour - 3) / 24) * 2 * Math.PI) * 80
-    if ((hour >= 9 && hour <= 11) || (hour >= 19 && hour <= 21)) baseLoad += 110
-    baseLoad += (Math.random() - 0.5) * 25
-    const temp = 22 + Math.sin(((hour - 5) / 24) * 2 * Math.PI) * 8
-    const humidity = 60 + (Math.random() - 0.5) * 20
-    const tier = (hour >= 8 && hour <= 21) ? '高峰电价' : '低谷电价'
-    if (i === 120) baseLoad = 890
-    loadData.push({
-      timestamp: formatDate(t),
-      load_demand: parseFloat(baseLoad.toFixed(2)),
-      temperature: parseFloat(temp.toFixed(1)),
-      humidity: parseFloat(humidity.toFixed(1)),
-      price_tier: tier
-    })
+// ---- 工作区桥接：把后端 meta / page 镜像成界面一直在读的形状 ----
+function applyMeta(d, meta) {
+  if (!meta) return
+  d.wsId = meta.wsId || d.wsId
+  d.meta = meta
+  d.columns = meta.columns || d.columns
+  d.timeCol = meta.timeCol || d.timeCol
+  d.timeFormat = meta.timeFormat || d.timeFormat
+  d.timeDetect = meta.timeDetect || d.timeDetect
+  d.freqMinutes = meta.freqMinutes ?? null
+  d.freq = meta.freqLabel || ''
+  d.name = meta.name || d.name
+  if (meta.unit) d.unit = meta.unit
+  if (meta.format) d.format = meta.format
+  syncHistory(meta)
+  syncFeatureList(d)
+}
+
+// 撤销/重做的全部依据就是服务端游标与命令日志长度：可撤 steps = cursor，
+// 可重做 = opsTotal - cursor，标题取日志里游标两侧的那两条。浏览器不再自己数历史。
+function syncHistory(meta) {
+  const h = state.history
+  h.version = meta.version ?? 0
+  h.opsTotal = meta.opsTotal ?? 0
+  h.undo = Math.max(0, h.version)
+  h.redo = Math.max(0, h.opsTotal - h.version)
+  h.canUndo = !!meta.canUndo
+  h.canRedo = !!meta.canRedo
+  h.undoLabel = meta.undoLabel || ''
+  h.redoLabel = meta.redoLabel || ''
+}
+
+// 第五步的特征清单由后端列注册表派生：带 feature=<族> 标记的列即工程产物。
+// 旧实现里特征只进 state.features、不进 d.columns，两边各记一份列数；
+// 现在改为一处真相，"共计 N 列 / 新增 M 列"和导出宽表、后端帧必然同数。
+function syncFeatureList(d) {
+  state.features = (d.columns || []).map(c => ({
+    key: c.key, label: c.label, isNew: !!c.feature, feature: c.feature || null
+  }))
+}
+
+function applyPage(d, page) {
+  if (!page) return
+  d.page = {
+    offset: page.offset, limit: page.limit, total: page.total,
+    columns: page.columns, rows: page.rows
   }
-  datasets.load.data = loadData
+}
+
+export function rowCount() {
+  const d = ds()
+  return d?.meta?.rowCount ?? 0
+}
+
+export async function refreshPage(offset, limit) {
+  const d = ds()
+  if (!d?.wsId) return null
+  const page = await ws.wsRows(d.wsId, offset ?? d.page.offset, limit ?? d.page.limit)
+  applyPage(d, page.page)
+  applyMeta(d, page.meta)
+  touch()
+  return d.page
+}
+
+// 后端不在线 = 只读。所有会改数据的入口都先过这道闸门，绝不静默降级成本地计算。
+export function requireBackend(action) {
+  if (state.backend.online) return true
+  toast('warning', `${action}需后端在线执行（数据加工全部在后端，浏览器不再算第二套）` +
+    `：在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000`)
+  state.busy = ''
+  return false
+}
+
+async function runOp(kind, params, note, { long = false } = {}) {
+  const d = ds()
+  if (!d?.wsId) { toast('warning', '还没有载入数据集'); return null }
+  if (!requireBackend(note?.title || '该操作')) return null
+  state.busy = `${note?.title || '处理中'}…`
+  try {
+    // 与服务端 apply() 同一步：回退后又执行新命令，那段「等待重做」的记录从此不再成立
+    pruneUndoneLog(d)
+    const r = await ws.wsOp(d.wsId, kind, params, null, { long })
+    applyMeta(d, r.meta)
+    applyPage(d, r.page)
+    touch()
+    // params 是审计链的可复现部分（回放/导出 Python 都读它），少了这条记录就只剩一句人话
+    if (note) {
+      logAction(note.step ?? 2, note.icon ?? 'column', note.title, note.detail(r),
+        note.params ? (typeof note.params === 'function' ? note.params(r) : note.params) : null)
+      // 盖上服务端版本号：这条记录从此挂在游标上，撤销它就该从"当前数据的历史"里消失
+      const last = state.actionLog[state.actionLog.length - 1]
+      if (last) last.v = r.meta?.version ?? null
+    }
+    return r
+  } catch (e) {
+    toast('error', `${note?.title || '操作'}失败：${e.message}`)
+    return null
+  } finally {
+    state.busy = ''
+  }
+}
+
+// ---- 数据集加载（全部在后端建工作区）----
+async function adoptWorkspace(key, resp, { name, format } = {}) {
+  const d = datasets[key] || (datasets[key] = blankDataset(key))
+  Object.assign(d, blankDataset(key), { key })
+  applyMeta(d, resp.meta)
+  applyPage(d, resp.page)
+  if (name) d.name = name
+  if (format) d.format = format
+  state.currentKey = key
+  resetWorkspace()
+  touch()
+  return d
+}
+
+export async function loadPresetData(key) {
+  if (!requireBackend('加载内置示例')) return false
+  state.busy = '正在生成示例数据集…'
+  try {
+    const resp = await ws.wsCreatePreset(key)
+    const d = await adoptWorkspace(key, resp, { name: resp.meta.name, format: 'preset' })
+    logAction(1, 'dataset', '加载数据集',
+      `${d.name} · ${d.meta.rowCount.toLocaleString()}行×${d.meta.colCount}列 · 后端工作区 ${d.wsId}`)
+    toast('success', `已加载内置示例：${d.name}（后端工作区 ${d.wsId}）`)
+    return true
+  } catch (e) {
+    toast('error', `加载示例失败：${e.message}`)
+    return false
+  } finally {
+    state.busy = ''
+  }
+}
+
+// 导入：后端落盘到 dataset 目录 + 建工作区；多文件按行拼接需要整表，
+// 本期仍只支持"首个文件建区"，其余文件明确提示，不再静默塞进同一张表。
+export async function loadFileAsWorkspace(file) {
+  const resp = await ws.wsCreateFile(file, { persist: true, limit: PAGE_SIZE })
+  const key = 'custom'
+  const d = await adoptWorkspace(key, resp, {
+    name: (resp.meta.name || file.name), format: resp.meta.format
+  })
+  const saved = resp.persisted?.filename ? ` · 已落盘 ${resp.persisted.filename}` : ''
+  logAction(1, 'dataset', '导入并加载数据文件',
+    `${file.name} · ${d.meta.rowCount.toLocaleString()}行×${d.meta.colCount}列 · 后端解析${saved}`)
+  return d
+}
+
+export async function openDatasetFile(filename) {
+  const resp = await ws.wsOpenDataset(filename, PAGE_SIZE)
+  const d = await adoptWorkspace('custom', resp, { name: resp.meta.name, format: resp.meta.format })
+  logAction(1, 'dataset', '打开数据集目录文件',
+    `${filename} · ${d.meta.rowCount.toLocaleString()}行×${d.meta.colCount}列 · 后端工作区 ${d.wsId}`)
+  return d
 }
 
 // ---- 响应式状态 ----
@@ -116,21 +215,32 @@ export const state = reactive({
   codeContent: '',
   showExportModal: false,
   pendingFiles: [],     // { name, size, file }
-  exoVars: [],          // { key,label,source,data[] }
   derivedCols: [],      // { key,label,formula }
   masks: [],            // { key,label,startIdx,endIdx,startTime,endTime,onesCount }
   features: [],         // 第五步特征清单 { key,label,isNew }
   imputeSegAlgos: {},   // colKey -> { segIdx -> algo }
-  lastAnomaly: null,    // { algo, expr, time, perColumn: {col:{set,lower,upper}}, summary }
+  // 第四步的诊断结果：GET /quality 的整份回显（缺失统计 + 缺失段 + 重复计数）
+  quality: { wsId: '', version: -1, data: null, loading: false, error: '' },
+  // 图表与刷选用的降采样曲线：GET /series（含每点的行位置 idx，掩码区间靠它换算）
+  series: { key: '', data: null },
+  lastAnomaly: null,    // 后端 detection_view()：{ algo, expr, results, summary, stale, anomalyIndices }
   splitRatio: 70,
-  qualityDirtyVersion: 0,
-  history: { undo: 0, redo: 0, undoLabel: '', redoLabel: '', enabled: true },
-  session: { enabled: true, found: null, savedAt: '' },
-  backend: { online: false, checking: true, version: '', capabilities: [], error: '', checkedAt: '', datasetDir: '' }
+  // 撤销/重做：整份投影自服务端 meta_view()（游标 + 命令日志），浏览器不存历史
+  history: { version: 0, opsTotal: 0, undo: 0, redo: 0, canUndo: false, canRedo: false, undoLabel: '', redoLabel: '' },
+  // 会话：PUT /api/session 存 UI 状态，GET 时服务端按命令日志把引用的工作区当场重建一遍
+  session: {
+    enabled: true, found: null, savedAt: '', stateDir: '', workspaces: [],
+    saving: false, error: ''
+  },
+  busy: '',           // 后端在算 thing，界面据此禁用按钮
+  backend: { online: false, checking: true, version: '', capabilities: [], limits: null, error: '', checkedAt: '', datasetDir: '' }
 })
 
 export function ds() { return datasets[state.currentKey] }
-export function touch() { state.dataVersion++ }
+
+export function touch() {
+  state.dataVersion++
+}
 
 export function toast(type, msg) {
   ElMessage({ type, message: msg, duration: 3200, showClose: true, grouping: true })
@@ -156,6 +266,9 @@ export function logAction(step, icon, title, detail, params) {
   state.actionLog.push({
     id: Date.now() + Math.random().toString(36).slice(2, 6),
     step, icon, title, detail, params: params || null,
+    // 记录挂在哪个后端工作区上：同一份会话里换开第二个数据集时，「本步已完成」这类
+    // 由审计链推出的状态必须只认当前工作区的记录，否则上一个数据集的构建会让新数据集显示 ✓
+    wsId: ds().wsId || '',
     time: `${String(now.getHours()).padStart(2, '0')}:${String(now.getMinutes()).padStart(2, '0')}:${String(now.getSeconds()).padStart(2, '0')}`,
     ts: now.getTime()
   })
@@ -166,285 +279,254 @@ export function switchStep(target) {
   state.currentStep = target
 }
 
+// 审计链是整场会话的（一份日志里可以连着开了好几个数据集），但界面上的「本步已完成」、
+// 导出的流程 JSON 与 Python 脚本都只该描述当前这份数据，所以统一从这里取子集。
+// 导入的流程记录没有 wsId（它就是冲着当前工作区导进来的），缺字段按匹配处理，避免整段消失。
+//
+// 条目上的 v 是「这条命令在服务端落成的那个版本号」，只有经 runOp 执行的数据变更才盖章。
+// 游标（meta.version）之前的条目才是当前这份数据的历史，之后的属于「已撤销、等待重做」，
+// 于是撤销后从界面上消失、重做又回来 —— 与服务端日志的截断规则同一套口径。
+function logVisible(e) {
+  if (!Number.isInteger(e.v)) return true
+  const owner = Object.values(datasets).find(x => x.wsId && x.wsId === e.wsId)
+  if (!owner) return true
+  return e.v <= (owner.meta?.version ?? 0)
+}
+
+export function visibleActionLog() {
+  // datasets 是普通对象（不是 reactive），游标本身追踪不到，靠 dataVersion 这个计数器驱动重算
+  void state.dataVersion
+  return state.actionLog.filter(logVisible)
+}
+
+// 回退后又执行新命令：服务端 apply() 会把那段「等待重做」的日志尾巴截掉，
+// 界面这份记录必须同步截掉，否则它会在那之后被当成"当前数据的历史"重新冒出来。
+function pruneUndoneLog(d) {
+  const cursor = d?.meta?.version
+  if (!Number.isInteger(cursor)) return
+  state.actionLog = state.actionLog.filter(
+    e => e.wsId !== d.wsId || !Number.isInteger(e.v) || e.v <= cursor)
+}
+
+export function wsActionLog() {
+  const wsId = ds().wsId || ''
+  return visibleActionLog().filter(e => (e.wsId ?? wsId) === wsId)
+}
+
 // ---- 数据集加载 ----
 export function resetWorkspace() {
-  state.exoVars = []
   state.derivedCols = []
   state.masks = []
   state.features = []
   state.imputeSegAlgos = {}
   state.lastAnomaly = null
+  state.quality = { wsId: '', version: -1, data: null, loading: false, error: '' }
+  invalidateSeries()
 }
 
-export function loadPresetData(key) {
-  state.currentKey = key
-  resetWorkspace()
-  touch()
-  logAction(1, 'dataset', '加载数据集', `${ds().name} · ${ds().data.length.toLocaleString()}行×${ds().columns.length}列`)
-}
-
-export function loadCustomDataset(parsedList, fileNames, origin = 'upload') {
-  const key = 'custom'
-  if (!datasets.custom) datasets.custom = { name: '', timeCol: 'timestamp', freq: '', unit: '', columns: [], data: [] }
-  const d = datasets.custom
-  d.name = parsedList[0].name + (parsedList.length > 1 ? ` 等 ${parsedList.length} 个文件` : '')
-  d.columns = parsedList[0].columns
-  d.timeCol = parsedList[0].timeCol
-  if (parsedList.length > 1) {
-    // 必须列名与顺序完全一致才能按行拼接：只比列数会把键不同的行塞进来，
-    // 那些行按 d.columns 取值全部落空，预览就变成整片空值。
-    const base = parsedList[0]
-    const baseKeys = base.columns.map(c => c.key).join('\u0000')
-    parsedList.slice(1).forEach(p => {
-      if (p.columns.map(c => c.key).join('\u0000') === baseKeys && p.timeCol === base.timeCol) {
-        base.data.push(...p.data)
-      } else {
-        toast('warning', `文件「${p.name}」列结构与首个文件不一致，已跳过`)
-      }
-    })
-    d.columns = base.columns
-    d.data = base.data
-  } else {
-    d.data = parsedList[0].data
-  }
-  if (!d.timeCol) {
-    d.timeCol = d.columns[0].key
-    d.columns[0].type = 'datetime'
-    d.columns[0].isTime = true
-    toast('warning', '未识别到时间列，已按第一列作为时间列处理')
-  }
-  // 表头与数据行键不一致时不静默展示空表，直接指出是哪一列
-  const orphan = d.data.length ? d.columns.find(c => !(c.key in d.data[0])) : null
-  if (orphan) {
-    toast('error', `列「${orphan.key}」在实际数据行中不存在，表头与数据不匹配。`
-      + `数据行实际字段：${Object.keys(d.data[0]).slice(0, 8).join('、')}`)
-  }
-  const minutes = detectSamplingMinutes(d.data, d.timeCol)
-  d.freq = minutes ? `${minutes} min (${Math.floor(1440 / minutes)}点/天)` : '未知'
-  d.format = parsedList[0].format || 'csv'
-  state.currentKey = key
-  resetWorkspace()
-  touch()
-  const viaBackend = parsedList.filter(p => p.source === 'backend').length
-  const saved = parsedList.filter(p => p.saved).map(p => p.saved)
-  logAction(1, 'dataset', origin === 'dataset' ? '打开数据集目录文件' : '导入并加载数据文件',
-    `${fileNames.join(', ')} · ${d.data.length.toLocaleString()}行×${d.columns.length}列` +
-    (viaBackend ? ` · ${viaBackend} 个文件由后端解析` : ' · 浏览器本地解析') +
-    (saved.length ? ` · 已落盘 ${saved.join(', ')}` : ''))
-}
-
-// ---- 列管理 ----
-export function renameColumn(idx, newName) {
+// ---- 列管理（全部打在服务端工作区）----
+export async function renameColumn(idx, newName) {
   const d = ds()
   const col = d.columns[idx]
-  const safeKey = newName.toLowerCase().replace(/[^a-z0-9_]/g, '_')
-  const oldKey = col.key
-  col.label = newName
-  col.key = safeKey
-  d.data.forEach(row => { row[safeKey] = row[oldKey]; delete row[oldKey] })
-  if (d.timeCol === oldKey) d.timeCol = safeKey
-  // 特征登记表要跟着真实列走，否则第五步预览与导出宽表会留下旧键名的空壳幽灵列
-  const feat = state.features.find(f => f.key === oldKey)
-  if (feat) { feat.key = safeKey; feat.label = newName }
-  touch()
-  logAction(1, 'rename', '重命名列', `"${oldKey}" → "${newName}"`, { type: 'rename_column', oldKey, newKey: safeKey, newLabel: newName })
+  if (!col) return false
+  const r = await runOp('rename-column', { key: col.key, label: newName }, {
+    step: 1, icon: 'rename', title: '重命名列', detail: () => `"${col.key}" → "${newName}"`,
+    params: (res) => ({ type: 'rename_column', oldKey: col.key, newKey: res.newKey, newLabel: newName })
+  })
+  if (!r) return false
+  // 特征清单已在 applyMeta 里按新的列注册表重建，这里只同步第二步的衍生列登记
+  state.derivedCols.forEach(dc => {
+    if (dc.key === r.oldKey) { dc.key = r.newKey; dc.label = newName }
+  })
+  return true
 }
 
-export function deleteColumn(idx) {
+export async function deleteColumn(idx) {
   const d = ds()
   const col = d.columns[idx]
+  if (!col) return false
   if (col.isTime || col.key === d.timeCol) {
     toast('warning', '时间列不可删除')
     return false
   }
-  d.columns.splice(idx, 1)
-  d.data.forEach(row => delete row[col.key])
+  const r = await runOp('delete-column', { key: col.key }, {
+    step: 1, icon: 'delete', title: '删除列', detail: () => `"${col.label}"`,
+    params: { type: 'delete_column', key: col.key, label: col.label }
+  })
+  if (!r) return false
   const fi = state.features.findIndex(f => f.key === col.key)
   if (fi >= 0) state.features.splice(fi, 1)
-  touch()
-  logAction(1, 'delete', '删除列', `"${col.label}"`, { type: 'delete_column', key: col.key, label: col.label })
+  state.derivedCols = state.derivedCols.filter(dc => dc.key !== col.key)
   return true
 }
 
-export function convertColumnUnit(idx, factor, offset, newUnit) {
+export async function convertColumnUnit(idx, factor, offset, newUnit) {
   const d = ds()
   const col = d.columns[idx]
-  d.data.forEach(row => {
-    const v = row[col.key]
-    if (v !== null && v !== undefined && !isNaN(Number(v))) {
-      row[col.key] = Number((Number(v) * factor + offset).toFixed(4))
-    }
+  if (!col) return false
+  const r = await runOp('convert-unit', { key: col.key, factor, offset, newUnit }, {
+    step: 1, icon: 'unit', title: '单位转换',
+    detail: (res) => `${res.label} y=${factor}x+${offset} · 改动 ${res.changed} 个值`,
+    params: { type: 'unit_convert', key: col.key, factor, offset, newUnit, oldUnit: col.unit || '', label: col.label }
   })
-  const baseName = col.label.replace(/\s*\([^)]*\)\s*$/, '').trim()
-  const oldUnit = col.unit || ''
-  col.label = `${baseName}(${newUnit})`
-  col.unit = newUnit
-  touch()
-  logAction(1, 'unit', '单位转换', `${col.label} y=${factor}x+${offset}`,
-    { type: 'unit_convert', key: col.key, factor, offset, newUnit, oldUnit })
+  return !!r
 }
 
-// ---- 时间格式识别与转换 ----
-export function detectTimeFormat(timeCol) {
+// ---- 时间格式（后端只做渲染，内部一律 datetime64）----
+export function detectTimeFormat(timeColKey) {
   const d = ds()
-  const samples = d.data.map(r => r[timeCol]).filter(v => !isMissing(v)).slice(0, 20)
-  if (samples.length === 0) return null
+  if (d.timeDetect && (!timeColKey || timeColKey === d.timeCol)) {
+    return { format: d.timeDetect.displayFormat || d.timeDetect.format, ...d.timeDetect }
+  }
+  const samples = pageColumnValues(timeColKey || d.timeCol).filter(v => !isMissing(v)).slice(0, 20)
+  if (!samples.length) return null
   return detectTimeFormatOfSamples(samples)
 }
 
-export function convertTimeColumn(timeCol, targetFmt, customFmt) {
+// 页窗口是 array-of-arrays，取某一列的显示值统一走这里
+export function pageColumnValues(key) {
   const d = ds()
-  let changed = 0
-  d.data.forEach(row => {
-    const v = row[timeCol]
-    if (isMissing(v)) return
-    const converted = targetFmt === 'custom' ? convertWithCustomFormat(v, customFmt) : convertSingleTime(v, targetFmt)
-    if (converted !== String(v).trim()) changed++
-    row[timeCol] = converted
-  })
-  touch()
-  logAction(2, 'column', '时间格式转换', `${d.data.length}行 → ${targetFmt === 'custom' ? customFmt : targetFmt}`, { type: 'time_convert', timeCol, targetFmt: targetFmt === 'custom' ? customFmt : targetFmt })
-  return changed
+  const idx = d.page.columns.indexOf(key)
+  if (idx < 0) return []
+  return d.page.rows.map(r => r[idx])
 }
 
-// ---- 采样频率推断（真实计算） ----
+export async function convertTimeColumn(timeColKey, targetFmt, customFmt) {
+  const d = ds()
+  const r = await runOp('time-format', { format: targetFmt, customFormat: customFmt || null }, {
+    step: 2, icon: 'column', title: '时间格式转换',
+    detail: (res) => `${rowCount().toLocaleString()}行 → ${targetFmt === 'custom' ? customFmt : targetFmt} · ${res.changed} 个值变化`,
+    params: { type: 'time_convert', timeCol: d.timeCol, targetFmt: targetFmt === 'custom' ? customFmt : targetFmt }
+  })
+  return r ? r.changed : null
+}
+
+// ---- 采样频率（后端按真实时间戳算，与显示格式无关）----
 export function detectedFreqMinutes() {
   const d = ds()
-  return detectSamplingMinutes(d.data, d.timeCol)
+  return d.freqMinutes ?? null
 }
 
-export function resampleDataset(targetRate, method) {
+export async function resamplePreview(targetMinutes) {
   const d = ds()
+  if (!d.wsId || !requireBackend('重采样预演')) return null
+  try {
+    return await ws.wsResamplePreview(d.wsId, targetMinutes)
+  } catch (e) {
+    toast('error', `重采样预演失败：${e.message}`)
+    return null
+  }
+}
+
+export async function resampleDataset(targetRate, method) {
   const targetMinutes = RESAMPLE_RATE_MAP[targetRate]
-  const numericCols = d.columns.filter(c => c.type === 'float').map(c => c.key)
-  const categoryCols = d.columns.filter(c => c.type === 'category').map(c => c.key)
-  const oldCount = d.data.length
-  const newData = performResample(d.data, d.timeCol, numericCols, categoryCols, targetMinutes, method)
-  d.data = newData
-  d.freq = `${RESAMPLE_RATE_NAMES[targetRate]} (${Math.floor(1440 / targetMinutes)}点/天)`
-  touch()
-  logAction(2, 'resample', '重采样确认',
-    `频率→${RESAMPLE_RATE_NAMES[targetRate]} | 方法→${RESAMPLE_METHOD_NAMES[method]} | ${oldCount.toLocaleString()}→${newData.length.toLocaleString()}`,
-    { type: 'resample', targetRate, method, detail: `${RESAMPLE_RATE_NAMES[targetRate]} / ${RESAMPLE_METHOD_NAMES[method]}` })
-  return { oldCount, newCount: newData.length }
+  const r = await runOp('resample', { targetMinutes, method }, {
+    step: 2, icon: 'resample', title: '重采样确认', detail: (res) => res.summary,
+    params: { type: 'resample', targetRate, method, detail: `${RESAMPLE_RATE_NAMES[targetRate]} / ${RESAMPLE_METHOD_NAMES[method]}` }
+  })
+  if (!r) return null
+  return { oldCount: r.oldCount, newCount: r.newCount }
 }
 
-// 实时质量指标（真实计算）
-export function currentMissingRate() {
+// 实时质量指标：来自后端 overview 的真实整表统计
+export async function refreshOverview() {
   const d = ds()
-  return calculateMissingRate(d.data, d.columns.filter(c => c.type === 'float').map(c => c.key))
+  if (!d.wsId) return null
+  try {
+    d.overview = await ws.wsOverview(d.wsId)
+    touch()   // 读的是服务端统计，明细帧没变
+    return d.overview
+  } catch (e) {
+    toast('error', `整表统计失败：${e.message}`)
+    return null
+  }
+}
+
+export function currentMissingRate() {
+  return ds()?.overview?.missingRate ?? 0
 }
 export function currentDuplicateRate() {
-  const d = ds()
-  return calculateDuplicateRate(d.data, d.timeCol)
+  return ds()?.overview?.duplicateRate ?? 0
 }
 
-// ---- 外生变量 ----
-export const EXO_PRESETS = [
-  { value: 'humidity', label: '相对湿度 (%)' },
-  { value: 'pressure', label: '大气压强 (hPa)' },
-  { value: 'cloud_cover', label: '云量 (0-10)' },
-  { value: 'dew_point', label: '露点温度 (°C)' },
-  { value: 'radiation_ghi', label: '水平面总辐照 GHI (W/m²)' },
-  { value: 'radiation_dni', label: '法向直射辐照 DNI (W/m²)' },
-  { value: 'electricity_price', label: '实时电价 (元/kWh)' },
-  { value: 'grid_frequency', label: '电网频率 (Hz)' }
-]
+// ---- 外生变量：三条来源全部打在服务端 ----
+// 下拉选项读 GET /api/exo/presets（后端清单与生成器同一份表，前端不再自己抄）；
+// 生成/对齐在后端函数里完成，浏览器既不碰整列，也没有"先在界面攒一列、再合并进主表"这一步。
+let exoCatalogCache = null
 
-// 预设模板：按时间规律模拟生成（界面已标注为模拟数据）
-const EXO_PRESET_GENERATORS = {
-  humidity: (d) => d.data.map((r) => {
-    const hour = parseTimeValue(r[d.timeCol]).getHours()
-    return parseFloat((60 + 20 * Math.sin((hour - 6) / 24 * 2 * Math.PI) + (Math.random() - 0.5) * 15).toFixed(1))
-  }),
-  pressure: (d) => d.data.map(() => parseFloat((1013.25 + (Math.random() - 0.5) * 8).toFixed(1))),
-  cloud_cover: (d) => d.data.map((_, i) => {
-    const base = [2, 5, 7, 3][Math.floor(i / 96) % 4]
-    return Math.max(0, Math.min(10, Math.round(base + (Math.random() - 0.5) * 4)))
-  }),
-  dew_point: (d) => d.data.map((r) => parseFloat(((Number(r.temperature) || 20) - 5 - Math.random() * 3).toFixed(1))),
-  radiation_ghi: (d) => d.data.map((r) => {
-    const hour = parseTimeValue(r[d.timeCol]).getHours()
-    if (hour < 6 || hour > 19) return 0
-    return parseFloat((Math.sin((hour - 6) / 13 * Math.PI) * 800 + (Math.random() - 0.5) * 50).toFixed(1))
-  }),
-  radiation_dni: (d) => d.data.map((r) => {
-    const hour = parseTimeValue(r[d.timeCol]).getHours()
-    if (hour < 6 || hour > 19) return 0
-    return parseFloat((Math.sin((hour - 6) / 13 * Math.PI) * 650 + (Math.random() - 0.5) * 40).toFixed(1))
-  }),
-  electricity_price: (d) => d.data.map((r) => {
-    const hour = parseTimeValue(r[d.timeCol]).getHours()
-    const peak = hour >= 8 && hour <= 21
-    return parseFloat((peak ? 0.85 + Math.random() * 0.15 : 0.35 + Math.random() * 0.1).toFixed(3))
-  }),
-  grid_frequency: (d) => d.data.map(() => parseFloat((50 + (Math.random() - 0.5) * 0.1).toFixed(3)))
-}
-
-export function addExoPreset(presetKey, alias) {
-  const d = ds()
-  if (state.exoVars.some(v => v.key === (alias || presetKey))) {
-    toast('warning', `变量 [${alias || presetKey}] 已添加`)
-    return false
+export async function loadExoCatalog(force) {
+  if (exoCatalogCache && !force) return exoCatalogCache
+  if (!state.backend.online) await ws.checkBackend()
+  if (!state.backend.online) { toast('warning', '读取外生变量清单需后端在线'); return null }
+  try {
+    exoCatalogCache = await ws.exoCatalog()
+    return exoCatalogCache
+  } catch (e) {
+    toast('error', `读取外生变量清单失败：${e.message}`)
+    return null
   }
-  const preset = EXO_PRESET_GENERATORS[presetKey]
-  const meta = EXO_PRESETS.find(p => p.value === presetKey)
-  const data = preset(d)
-  state.exoVars.push({ key: alias || presetKey, label: alias || meta.label.replace(/\s/g, ''), source: 'preset', data })
-  logAction(2, 'column', `导入外生变量: ${alias || presetKey}`, `预设模板(模拟) · ${data.length} 行`,
-    { type: 'exo_var_add', kind: 'preset', key: alias || presetKey, label: alias || meta.label.replace(/\s/g, ''), presetKey, data })
-  return true
 }
 
-export function addExoFormula(name, expr) {
-  const d = ds()
-  if (state.exoVars.some(v => v.key === name)) {
-    toast('warning', `变量 [${name}] 已存在`)
-    return { ok: false }
+// 已挂上的外生变量列：后端列注册表里的 exo 标记是唯一真相（撤销后列没了，这里就少了）
+export function exoColumns() {
+  return (ds().columns || []).map((c, idx) => ({ ...c, idx })).filter(c => c.exo)
+}
+
+// 移除一列外生变量：走的是通用删列入口，因此同样进审计链、同样可撤销
+export function removeExoColumn(col) { return deleteColumn(col.idx) }
+
+export async function addExoPreset(presetKey, alias, opts = {}) {
+  const name = (alias || '').trim()
+  const params = { presetKey }
+  if (name) { params.key = name; params.label = name }
+  if (opts.seed !== undefined && opts.seed !== null) params.seed = opts.seed
+  // seed 由服务端补齐并钉进命令日志：撤销再重做拿到的是同一串模拟值
+  return runOp('exo-preset', params, {
+    step: 2, icon: 'column', title: `预设模板外生变量: ${name || presetKey}`,
+    detail: (res) => res.summary,
+    params: (res) => ({ type: 'exo-preset', presetKey, key: res.key, label: res.label, seed: res.seed })
+  })
+}
+
+export async function addExoFormula(key, expr) {
+  return runOp('exo-formula', { key, expr }, {
+    step: 2, icon: 'column', title: `公式生成外生变量: ${key}`,
+    detail: (res) => res.summary,
+    params: { type: 'exo-formula', key, expr }
+  })
+}
+
+// 侧表先看后挂：inspect 把文件落进 dataset/_exo/ 并回表头、可用变量名、时间列候选；
+// 列名转不出合法变量名时界面在这里要求改名，而不是静默转写成 ___ 互相覆盖
+export async function inspectSideTable(file) {
+  if (!requireBackend('解析外生变量侧表')) return null
+  state.busy = `正在解析侧表 ${file.name}…`
+  try {
+    return await ws.exoInspect(file)
+  } catch (e) {
+    toast('error', `侧表解析失败：${e.message}`)
+    return null
+  } finally {
+    state.busy = ''
   }
-  let evaluator
-  try { evaluator = buildVarEvaluator(expr) } catch (e) { return { ok: false, error: e.message } }
-  const data = d.data.map((row, idx) => {
-    try {
-      const dt = parseTimeValue(row[d.timeCol])
-      const val = evaluator(dt.getHours() + dt.getMinutes() / 60, dt.getDate(), dt.getMonth() + 1, dt.getDay(), idx)
-      return typeof val === 'number' && !isNaN(val) ? parseFloat(val.toFixed(4)) : null
-    } catch (e) { return null }
-  })
-  state.exoVars.push({ key: name, label: name, source: 'formula', formula: expr, data })
-  logAction(2, 'column', `公式生成外生变量: ${name}`, expr,
-    { type: 'exo_var_add', kind: 'formula', key: name, label: name, expr })
-  return { ok: true }
 }
 
-export function addExoFileVars(fileName, vars) {
-  vars.forEach(v => {
-    if (!state.exoVars.some(x => x.key === v.key)) {
-      state.exoVars.push({ ...v, source: 'file' })
-    }
-  })
-  logAction(2, 'column', `文件导入外生变量: ${fileName}`, `${vars.length} 列 · ${vars[0]?.data.length || 0} 行(对齐后)`,
-    { type: 'exo_var_add', kind: 'file', fileName, vars: vars.map(v => ({ key: v.key, label: v.label, data: v.data.slice() })) })
-}
-
-export function mergeExoVars() {
-  const d = ds()
-  let newCols = 0
-  const names = []
-  const snapshot = state.exoVars.map(v => ({ key: v.key, label: v.label, data: v.data.slice() }))
-  state.exoVars.forEach(exo => {
-    if (!d.columns.some(c => c.key === exo.key)) {
-      d.columns.push({ key: exo.key, label: exo.label, type: 'float' })
-      newCols++
-    }
-    d.data.forEach((row, i) => { row[exo.key] = exo.data[i] !== undefined ? exo.data[i] : null })
-    names.push(exo.key)
-  })
-  const count = state.exoVars.length
-  state.exoVars = []
-  touch()
-  logAction(2, 'column', `合并 ${count} 个外生变量`, names.join(', '), { type: 'exo_merge', vars: snapshot })
-  return { count, newCols }
+export async function attachSideTable(spec) {
+  const r = await runOp('exo-file', {
+    filename: spec.filename, sha: spec.sha, sideTimeCol: spec.sideTimeCol,
+    mode: spec.mode, toleranceMinutes: spec.toleranceMinutes || null,
+    targets: spec.targets || []
+  }, {
+    step: 2, icon: 'column', title: `侧表挂列: ${spec.filename}`,
+    detail: (res) => res.summary,
+    // 未指定目标列时服务端按表头推导并把结果钉进日志，这里取回显的那一份，回放才逐列同名
+    params: (res) => ({
+      type: 'exo-file', filename: spec.filename, sha: spec.sha, sideTimeCol: spec.sideTimeCol,
+      mode: spec.mode, toleranceMinutes: spec.toleranceMinutes || null,
+      targets: res.targets || spec.targets || []
+    })
+  }, { long: true })
+  return r
 }
 
 // ---- 列运算 ----
@@ -465,348 +547,328 @@ export function computeTermChain(terms, row) {
   return result
 }
 
-export function applyDerivedCol(name, terms) {
+export async function applyDerivedCol(name, terms) {
   const d = ds()
   if (d.columns.some(c => c.key === name) || state.derivedCols.some(c => c.key === name)) {
     toast('warning', `列名 [${name}] 已存在，请更换名称`)
     return false
   }
-  const opLabel = { '+': '+', '-': '-', '*': '×', '/': '÷' }
-  d.data.forEach(row => {
-    const v = computeTermChain(terms, row)
-    row[name] = v !== null ? parseFloat(v.toFixed(4)) : null
+  const r = await runOp('derived-column', { name, terms }, {
+    step: 2, icon: 'column', title: `列运算生成: ${name}`, detail: (res) => res.formula,
+    params: { type: 'multi_calc', terms: terms.map(t => ({ ...t })), name }
   })
-  d.columns.push({ key: name, label: name, type: 'float' })
-  const formula = terms.map((t, i) => {
-    const label = d.columns.find(c => c.key === t.col)?.label || t.col
-    return i === 0 ? label : `${opLabel[t.op] || t.op} ${label}`
-  }).join(' ')
-  state.derivedCols.push({ key: name, label: name, formula })
-  touch()
-  logAction(2, 'column', `列运算生成: ${name}`, formula, { type: 'multi_calc', terms: terms.map(t => ({ ...t })), name })
+  if (!r) return false
+  state.derivedCols.push({ key: r.key, label: name, formula: r.formula })
+  return r
+}
+
+export async function deleteDerivedCol(idx) {
+  const dc = state.derivedCols[idx]
+  if (!dc) return false
+  const r = await runOp('delete-column', { key: dc.key }, {
+    step: 2, icon: 'delete', title: `删除派生列: ${dc.key}`, detail: () => dc.formula || dc.key,
+    params: { type: 'delete_column', key: dc.key, label: dc.label || dc.key }
+  })
+  if (!r) return false
+  state.derivedCols.splice(idx, 1)
   return true
 }
 
-export function deleteDerivedCol(idx) {
-  const dc = state.derivedCols[idx]
-  const d = ds()
-  d.data.forEach(row => delete row[dc.key])
-  d.columns = d.columns.filter(c => c.key !== dc.key)
-  state.derivedCols.splice(idx, 1)
-  touch()
-}
-
-export function clearAllDerivedCols() {
-  const d = ds()
-  state.derivedCols.forEach(dc => {
-    d.data.forEach(row => delete row[dc.key])
-    d.columns = d.columns.filter(c => c.key !== dc.key)
-  })
+export async function clearAllDerivedCols() {
+  const keys = state.derivedCols.map(dc => dc.key)
+  for (const key of keys) {
+    const okDel = await runOp('delete-column', { key }, {
+      step: 2, icon: 'delete', title: '清空派生列', detail: () => key,
+      params: { type: 'delete_column', key, label: key }
+    })
+    if (!okDel) return false
+    state.derivedCols = state.derivedCols.filter(dc => dc.key !== key)
+  }
   state.derivedCols = []
-  touch()
+  return true
 }
 
-// ---- 缺失与重复清洗 ----
-export function columnMissingStats() {
+// ============ 第四步：质量诊断与清洗（第②期起全部在后端执行）============
+// 浏览器不再持有任何缺失/异常算法：这一页看到的每个数字都来自 GET /quality 与
+// POST /anomaly-detect，要改数据就发一条加工命令，帧仍留在服务端。
+const IMPUTE_LABELS = { linear: '线性插值', ffill: '前向观测值填充', spline: '三次样条平滑', zero: '常数0置换' }
+const REPAIR_LABELS = { clip: '上下阈值截断', nan_impute: '置缺失并重插值', mask_only: '仅生成布尔掩码' }
+export const ANOMALY_NAMES = {
+  '3sigma': '3-Sigma', iqr: 'IQR 箱线法', iforest: '孤立森林(近似)',
+  iforest_sklearn: '孤立森林(sklearn)', expr: '自定义表达式'
+}
+
+// 诊断快照按 (wsId, version) 认人：任何一条加工命令都会让版本号前进，
+// 旧的缺失段行号从此指向另一颗帧，必须作废而不是继续拿去填补。
+export function qualityData() {
+  const q = state.quality
   const d = ds()
-  const totalRows = d.data.length
-  const stats = d.columns.map(col => {
-    let missing = 0
-    d.data.forEach(row => { if (isMissing(row[col.key])) missing++ })
-    return {
-      key: col.key, label: col.label, type: col.type,
-      total: totalRows, missing, valid: totalRows - missing,
-      rate: totalRows ? (missing / totalRows * 100) : 0
-    }
-  })
-  const timeSet = new Set()
-  let duplicateCount = 0
-  d.data.forEach(row => {
-    const t = row[d.timeCol]
-    if (timeSet.has(t)) duplicateCount++
-    else timeSet.add(t)
-  })
-  return { stats, totalRows, duplicateCount }
+  if (!d?.wsId || q.wsId !== d.wsId || q.version !== (d.meta?.version ?? -1)) return null
+  return q.data
+}
+
+export async function loadQuality({ force = false } = {}) {
+  const d = ds()
+  if (!d?.wsId) return null
+  const version = d.meta?.version ?? -1
+  if (!force && qualityData()) return state.quality.data
+  if (!requireBackend('质量诊断')) return null
+  state.quality = { wsId: d.wsId, version, data: null, loading: true, error: '' }
+  try {
+    const snap = await ws.wsQuality(d.wsId)
+    // 服务端会顺带回最新 meta（含异常缓存的新鲜度），版本在这里对不上就说明帧被改过
+    state.quality = { wsId: snap.wsId || d.wsId, version: snap.version ?? version, data: snap, loading: false, error: '' }
+    if ((snap.version ?? version) !== version) applyMeta(d, await ws.wsMeta(d.wsId))
+    return snap
+  } catch (e) {
+    state.quality = { wsId: d.wsId, version, data: null, loading: false, error: e.message }
+    toast('error', `质量诊断失败：${e.message}`)
+    return null
+  }
+}
+
+export function columnMissingStats() {
+  const q = qualityData()
+  if (!q) return null
+  return {
+    stats: q.columns, totalRows: q.rowCount, totalCells: q.rowCount * q.colCount,
+    totalMissing: q.totalMissingCells, missingRate: q.missingRate,
+    duplicateCount: q.duplicateRows, duplicateGroups: q.duplicateGroups, segmentCap: q.segmentCap
+  }
 }
 
 export function segmentsOf(colKey) {
-  const d = ds()
-  return detectMissingSegments(d.data, colKey, d.timeCol)
+  return qualityData()?.segments?.[colKey] || []
 }
 
-export function applySegmentImpute(colKey, segIdx) {
-  const d = ds()
-  const segments = segmentsOf(colKey)
-  if (segIdx >= segments.length) return 0
-  const seg = segments[segIdx]
-  const algo = state.imputeSegAlgos[colKey]?.[segIdx] || 'linear'
-  imputeSegment(d.data, colKey, seg, algo)
-  touch()
-  const col = d.columns.find(c => c.key === colKey)
-  logAction(4, 'impute', `填补 ${col?.label || colKey} 第${segIdx + 1}段`, `行${seg.startIdx}–${seg.endIdx} · ${seg.count}行`, { type: 'impute_segment', colKey, segments: [{ startIdx: seg.startIdx, endIdx: seg.endIdx, algo }] })
-  return seg.count
+// 超过 /quality 上限的列，浏览器根本拿不到全部缺失段，逐段选算法就是假的
+export function segmentsTruncated(colKey) {
+  return !!qualityData()?.segmentsTruncated?.[colKey]
 }
 
-export function applyAllSegmentsImpute(colKey) {
-  const d = ds()
-  const segments = segmentsOf(colKey)
-  let total = 0
-  for (let i = segments.length - 1; i >= 0; i--) {
-    const algo = state.imputeSegAlgos[colKey]?.[i] || 'linear'
-    imputeSegment(d.data, colKey, segments[i], algo)
-    total += segments[i].count
+export function segAlgo(colKey, idx) {
+  return state.imputeSegAlgos[colKey]?.[idx] || 'linear'
+}
+
+export function setSegAlgo(colKey, idx, algo) {
+  if (!state.imputeSegAlgos[colKey]) state.imputeSegAlgos[colKey] = {}
+  state.imputeSegAlgos[colKey][idx] = algo
+}
+
+function segTargets(colKey, segs, algoOf) {
+  return segs.map((s, i) => ({ key: colKey, startIdx: s.startIdx, endIdx: s.endIdx, algo: algoOf(i) }))
+}
+
+function colLabel(key) {
+  return ds()?.columns?.find(c => c.key === key)?.label || key
+}
+
+async function runImpute(params, note) {
+  return runOp('impute', params, note)
+}
+
+export async function applySegmentImpute(colKey, segIdx) {
+  const seg = segmentsOf(colKey)[segIdx]
+  if (!seg) { toast('warning', '缺失段列表已刷新，请重新选择要填补的段'); return null }
+  const algo = segAlgo(colKey, segIdx)
+  return runImpute({ targets: [{ key: colKey, startIdx: seg.startIdx, endIdx: seg.endIdx, algo }] }, {
+    step: 4, icon: 'impute', title: `填补 ${colLabel(colKey)} 第${segIdx + 1}段`,
+    detail: r => r.summary,
+    params: { type: 'impute_segment', colKey, segments: [{ startIdx: seg.startIdx, endIdx: seg.endIdx, algo }] }
+  })
+}
+
+export async function applyAllSegmentsImpute(colKey) {
+  const segs = segmentsOf(colKey)
+  if (!segs.length) { toast('info', '该列当前没有缺失段'); return null }
+  if (segmentsTruncated(colKey)) {
+    toast('warning', `该列缺失段超过单次返回上限 ${qualityData()?.segmentCap || 300} 段，` +
+      `界面拿不到全部段号，逐段算法无法整列执行：请改用右侧「执行填补与去重」（由服务端扫描全表）`)
+    return null
   }
-  touch()
-  const col = d.columns.find(c => c.key === colKey)
-  logAction(4, 'impute', `一键填补 ${col?.label || colKey}`, `共 ${segments.length} 段，${total} 行`, { type: 'impute_segment', colKey, segments: segments.map((s, i) => ({ startIdx: s.startIdx, endIdx: s.endIdx, algo: state.imputeSegAlgos[colKey]?.[i] || 'linear' })) })
-  return { count: segments.length, total }
+  const targets = segTargets(colKey, segs, i => segAlgo(colKey, i))
+  const used = [...new Set(targets.map(t => t.algo))].map(a => IMPUTE_LABELS[a] || a).join('、')
+  return runImpute({ targets }, {
+    step: 4, icon: 'impute', title: `一键填补 ${colLabel(colKey)}（${used}）`,
+    detail: r => r.summary,
+    params: { type: 'impute_segment', colKey, segments: targets.map(t => ({ startIdx: t.startIdx, endIdx: t.endIdx, algo: t.algo })) }
+  })
 }
 
-export function imputeAllAndDedupe(dupStrategy) {
-  const d = ds()
-  const numericCols = d.columns.filter(c => c.type === 'float')
-  let totalFilled = 0, colsFixed = 0
-  numericCols.forEach(col => {
-    const segments = segmentsOf(col.key)
-    if (segments.length === 0) return
-    for (let i = segments.length - 1; i >= 0; i--) {
-      const algo = state.imputeSegAlgos[col.key]?.[i] || 'linear'
-      imputeSegment(d.data, col.key, segments[i], algo)
-      totalFilled += segments[i].count
-    }
-    colsFixed++
+// 全表扫描填补 + 重复时间戳合并：段号与分组都在服务端算，所以大表也能一次做完
+export async function imputeAllAndDedupe(dupStrategy, defaultAlgo = 'linear') {
+  const q = qualityData() || await loadQuality()
+  const hasMissing = q ? q.columns.some(c => c.imputable && c.missing > 0) : true
+  const hasDup = q ? q.duplicateRows > 0 : true
+  if (q && !hasMissing && !hasDup) {
+    toast('info', '当前没有可填补的缺失值，也没有重复时间戳：本次未执行任何修改')
+    return null
+  }
+  const params = { all: hasMissing, defaultAlgo, dedupe: hasDup ? (dupStrategy || 'mean') : null }
+  const floatCols = q ? q.columns.filter(c => c.imputable).map(c => c.key) : []
+  const r = await runImpute(params, {
+    step: 4, icon: 'impute', title: '一键执行缺失值填补与去重',
+    detail: x => x.summary,
+    // floatCols 进审计参数：导出 Python 时不能靠"事后判断 dtype"猜当时填了哪些列
+    params: { type: 'impute_all', all: hasMissing, defaultAlgo, dedupe: params.dedupe, floatCols }
   })
-
-  // 重复时间戳合并
-  const groups = new Map()
-  d.data.forEach((row, idx) => {
-    const t = row[d.timeCol]
-    if (!groups.has(t)) groups.set(t, [])
-    groups.get(t).push(idx)
-  })
-  const dupKeys = [...groups.entries()].filter(([, idxs]) => idxs.length > 1)
-  const toDelete = new Set()
-  dupKeys.forEach(([, idxs]) => {
-    if (dupStrategy === 'first') idxs.slice(1).forEach(i => toDelete.add(i))
-    else if (dupStrategy === 'last') idxs.slice(0, -1).forEach(i => toDelete.add(i))
-    else {
-      // mean: 数值列取均值写回首行
-      const base = d.data[idxs[0]]
-      numericCols.forEach(col => {
-        const vals = idxs.map(i => d.data[i][col.key]).filter(v => !isMissing(v)).map(Number)
-        if (vals.length > 0) base[col.key] = parseFloat((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(4))
-      })
-      idxs.slice(1).forEach(i => toDelete.add(i))
-    }
-  })
-  const dupCount = toDelete.size
-  if (dupCount > 0) d.data = d.data.filter((_, i) => !toDelete.has(i))
-
-  touch()
-  logAction(4, 'impute', '一键执行缺失值填补与去重', `${colsFixed} 列 · ${totalFilled} 值 · 合并重复 ${dupCount} 条`, { type: 'impute_all' })
-  return { colsFixed, totalFilled, dupCount }
+  if (r) toast('success', r.summary)
+  return r
 }
 
-// ---- 异常检测与修复 ----
+// ---- 异常检测与修复（检测只读、修复是加工命令；判定索引全部留在服务端）----
 export const ANOMALY_ALGOS = {
-  '3sigma': '3-Sigma：假设数据服从正态分布，Z-Score 超过 3 倍标准差的点视为异常。适合检测远离均值的极端尖峰和深谷。',
-  'iqr': '四分位距箱线法：以 Q1-1.5×IQR 和 Q3+1.5×IQR 为边界，超出范围的点视为异常。对偏态分布更加鲁棒。',
-  'iforest': '孤立森林（浏览器近似版）：以滑动窗口 MAD（中位数绝对偏差）近似隔离异常，无需假设分布。完整 Isolation Forest 模型训练需后端支持。',
-  'iforest_sklearn': '孤立森林（sklearn 完整版 · 后端）：FastAPI + scikit-learn IsolationForest 对每列真实拟合并打分，缺失点自动剔除，边界取正常点的 0.5%/99.5% 分位数供截断修复。',
-  'expr': '自定义表达式：使用数学表达式定义异常条件。变量 v 代表当前值，可用统计量 mean/std/median/q1/q3/min/max。表达式返回 true 即为异常。'
+  '3sigma': '3-Sigma：假设数据服从正态分布，Z-Score 超过 3 倍标准差的点视为异常。适合检测远离均值的极端尖峰和深谷。后端 numpy 向量化实现（总体标准差 ÷n）。',
+  'iqr': '四分位距箱线法：以 Q1-1.5×IQR 和 Q3+1.5×IQR 为边界，超出范围的点视为异常。对偏态分布更加鲁棒。分位数取 sorted[int(n·q)]，与后端同一口径。',
+  'iforest': '孤立森林（近似版 · 后端 numpy）：以回看 33 个观测的窗口 MAD（均值绝对偏差）×4 近似隔离异常，无需假设分布。与 sklearn 完整版是两套算法，结果本就不同。',
+  'iforest_sklearn': '孤立森林（sklearn 完整版 · 后端）：服务端 scikit-learn IsolationForest 对每列真实拟合并打分，缺失点自动剔除，边界取正常点的 0.5%/99.5% 分位数供截断修复。',
+  'expr': '自定义表达式：使用数学表达式定义异常条件。变量 v 代表当前值，可用统计量 mean/std/median/q1/q3/min/max。表达式返回 true 即为异常。后端按 AST 白名单编译，逐列向量化求值。'
 }
 export const ANOMALY_REPAIRS = {
   'clip': '截断限制：将超出上下界的数据强制钳位到边界值，保留时间序列连续性，适合传感器饱和场景。',
-  'nan_impute': '缺失值重算：将异常点置为 NaN，再用时序插值方法重算，消除异常影响的同时保持趋势平滑。',
+  'nan_impute': '缺失值重算：将异常点置为 NaN，再用时序线性插值重算，消除异常影响的同时保持趋势平滑。',
   'mask_only': '掩码标记：仅生成布尔掩码列，不修改原始数据。适合需要保留原始观测的分析场景。'
 }
 
-export function detectAnomalies(algo, exprStr) {
+export async function detectAnomalies(algo, exprStr, params = {}) {
   const d = ds()
-  const totalRows = d.data.length
-  const numCols = d.columns.filter(c => c.type === 'float')
-  if (algo === 'expr' && !exprStr) return { error: '请输入异常判定表达式' }
-
-  const perColumn = {}
-  const results = numCols.map(col => {
-    const vals = d.data.map(r => r[col.key])
-    const st = columnQuantileStats(vals)
-    const anomalySet = new Set()
-    let lower, upper
-
-    if (algo === '3sigma') {
-      lower = st.mean - 3 * st.std; upper = st.mean + 3 * st.std
-      vals.forEach((v, i) => { if (!isMissing(v) && (v < lower || v > upper)) anomalySet.add(i) })
-    } else if (algo === 'iqr') {
-      const iqr = st.q3 - st.q1
-      lower = st.q1 - 1.5 * iqr; upper = st.q3 + 1.5 * iqr
-      vals.forEach((v, i) => { if (!isMissing(v) && (v < lower || v > upper)) anomalySet.add(i) })
-    } else if (algo === 'expr') {
-      let evaluator
-      try { evaluator = buildExprEvaluator(exprStr) } catch (e) { return { error: `表达式错误: ${e.message}` } }
-      vals.forEach((v, i) => {
-        if (isMissing(v)) return
-        try { if (evaluator(v, st)) anomalySet.add(i) } catch (e) { /* 单点失败不标记 */ }
-      })
-      const normalVals = vals.filter((v, i) => !anomalySet.has(i) && !isMissing(v))
-      lower = normalVals.length ? Math.min(...normalVals) : st.min
-      upper = normalVals.length ? Math.max(...normalVals) : st.max
-    } else { // iforest 近似（滑窗 MAD）
-      const winSize = 32
-      lower = Infinity; upper = -Infinity
-      for (let i = 0; i < vals.length; i++) {
-        if (isMissing(vals[i])) continue
-        const win = vals.slice(Math.max(0, i - winSize), i + 1).filter(v => !isMissing(v)).map(Number)
-        if (win.length < 5) continue
-        const med = medianOf(win)
-        const mad = win.reduce((s, v) => s + Math.abs(v - med), 0) / win.length
-        const lo = med - 4 * mad, hi = med + 4 * mad
-        if (vals[i] < lo || vals[i] > hi) anomalySet.add(i)
-        if (lo < lower) lower = lo
-        if (hi > upper) upper = hi
-      }
-      if (lower === Infinity) { lower = st.min; upper = st.max }
-    }
-
-    perColumn[col.key] = { set: anomalySet, lower, upper }
-    const rate = totalRows ? anomalySet.size / totalRows * 100 : 0
-    return {
-      key: col.key, label: col.label, total: totalRows,
-      anomalies: anomalySet.size, rate, normal: totalRows - anomalySet.size, lower, upper
-    }
-  })
-  const firstErr = results.find(r => r.error)
-  if (firstErr) return { error: firstErr.error }
-
-  const totalAnomalies = results.reduce((s, r) => s + r.anomalies, 0)
-  const overallRate = totalRows && numCols.length ? totalAnomalies / (totalRows * numCols.length) * 100 : 0
-  const colsAffected = results.filter(r => r.anomalies > 0).length
-  const summary = { totalAnomalies, overallRate, colsAffected, numCols: numCols.length }
-
-  state.lastAnomaly = { algo, expr: exprStr, time: new Date().toLocaleTimeString(), perColumn, results, summary }
-  touch()
-  return { results, summary }
-}
-
-// 把后端 sklearn 孤立森林响应映射为前端 lastAnomaly 结构（散点标注与 clip 修复直接复用）
-export function applyBackendAnomaly(resp, algoKey = 'iforest_sklearn') {
-  const d = ds()
-  const totalRows = d.data.length
-  const numCols = d.columns.filter(c => c.type === 'float')
-  const perColumn = {}
-  const results = numCols.map(col => {
-    const pc = resp.perColumn[col.key] || {}
-    const set = new Set(pc.anomalyIndices || [])
-    let lower = pc.lower
-    let upper = pc.upper
-    if (lower === null || lower === undefined || upper === null || upper === undefined) {
-      const st = columnQuantileStats(d.data.map(r => r[col.key]))
-      lower = st.min; upper = st.max
-    }
-    perColumn[col.key] = { set, lower, upper }
-    return {
-      key: col.key, label: col.label, total: totalRows,
-      anomalies: set.size, rate: totalRows ? set.size / totalRows * 100 : 0,
-      normal: totalRows - set.size, lower, upper
-    }
-  })
-  const totalAnomalies = results.reduce((s, r) => s + r.anomalies, 0)
-  const overallRate = totalRows && numCols.length ? totalAnomalies / (totalRows * numCols.length) * 100 : 0
-  const colsAffected = results.filter(r => r.anomalies > 0).length
-  const summary = { totalAnomalies, overallRate, colsAffected, numCols: numCols.length }
-  state.lastAnomaly = {
-    algo: algoKey, expr: '', time: new Date().toLocaleTimeString(),
-    perColumn, results, summary, engine: resp.engine, params: resp.params
+  if (!d?.wsId) { toast('warning', '还没有载入数据集'); return null }
+  if (!requireBackend('异常检测')) return null
+  const expr = (exprStr || '').trim()
+  if (algo === 'expr' && !expr) { toast('warning', '请输入异常判定表达式'); return null }
+  state.busy = '后端正在扫描异常…'
+  try {
+    const resp = await ws.wsAnomalyDetect(d.wsId, { algo, expr: expr || null, ...params })
+    applyMeta(d, resp.meta)
+    state.lastAnomaly = { ...resp.detection, time: new Date().toLocaleTimeString(), wsId: d.wsId }
+    invalidateSeries()      // 覆盖层换了：曲线必须重取，否则画的是上一次检测的点
+    return resp.detection
+  } catch (e) {
+    toast('error', `检测失败：${e.message}`)
+    return null
+  } finally {
+    state.busy = ''
   }
-  touch()
-  return { results, summary }
 }
 
-export function repairAnomalies(repair) {
+// 撤销/重做/会话恢复之后与后端对齐：检测缓存留在服务端，界面只是它的一份投影
+export async function refreshAnomaly() {
   const d = ds()
-  if (!state.lastAnomaly) return { error: '请先执行检测' }
+  if (!d?.wsId || !state.backend.online) { state.lastAnomaly = null; return null }
+  try {
+    const resp = await ws.wsAnomaly(d.wsId)
+    applyMeta(d, resp.meta)
+    state.lastAnomaly = resp.detection ? { ...resp.detection, time: '', wsId: d.wsId } : null
+    return state.lastAnomaly
+  } catch (e) {
+    state.lastAnomaly = null
+    return null
+  }
+}
+
+export async function repairAnomalies(mode) {
   const la = state.lastAnomaly
-  const { perColumn } = la
-  let touched = 0
-  Object.entries(perColumn).forEach(([colKey, info]) => {
-    if (info.set.size === 0) return
-    if (repair === 'clip') {
-      info.set.forEach(i => {
-        const v = d.data[i][colKey]
-        d.data[i][colKey] = v < info.lower ? parseFloat(info.lower.toFixed(4)) : parseFloat(info.upper.toFixed(4))
-        touched++
-      })
-    } else if (repair === 'nan_impute') {
-      info.set.forEach(i => { d.data[i][colKey] = null; touched++ })
-      segmentsOf(colKey).forEach(seg => imputeSegment(d.data, colKey, seg, 'linear'))
-    } else { // mask_only
-      const maskKey = `anomaly_mask_${colKey}`
-      if (!d.columns.some(c => c.key === maskKey)) {
-        d.columns.push({ key: maskKey, label: `异常掩码:${colKey}`, type: 'binary' })
-      }
-      d.data.forEach((row, i) => { row[maskKey] = info.set.has(i) ? 1 : 0 })
-      touched += info.set.size
+  if (!la) { toast('warning', '请先执行检测：修复要按检测时的行索引执行'); return null }
+  if (la.stale) { toast('warning', '检测之后数据又被改过（行位置已变），请重新检测后再修复'); return null }
+  const r = await runOp('anomaly-repair', { repair: mode }, {
+    step: 4, icon: 'broom', title: '异常修复执行',
+    detail: x => x.summary,
+    // 审计参数必须自足：回放/导出 Python 时没有当时的内存状态可借，只能按这里记的算法重测一遍
+    params: {
+      type: 'anomaly_repair', repair: mode, algo: la.algo, expr: la.expr || '',
+      iforest: la.params || null,
+      columns: (la.results || []).filter(x => x.anomalies > 0)
+        .map(x => ({ key: x.key, lower: x.lower, upper: x.upper, count: x.anomalies }))
     }
   })
-  if (repair !== 'mask_only') state.lastAnomaly = null
-  touch()
-  const snap = {
-    algo: la.algo, engine: la.engine || null, params: la.params || null,
-    columns: Object.entries(perColumn).filter(([, info]) => info.set.size > 0)
-      .map(([key, info]) => ({ key, lower: Number(info.lower), upper: Number(info.upper), count: info.set.size }))
+  if (r) await refreshAnomaly()
+  return r
+}
+
+// ---- 曲线抽稀（画图不再需要整表）----
+const seriesCache = new Map()
+
+export function invalidateSeries() {
+  seriesCache.clear()
+  state.series = { key: '', data: null }
+}
+
+export async function loadSeries(colKey, maxPoints = 1200) {
+  const d = ds()
+  if (!d?.wsId || !colKey) return null
+  if (!state.backend.online) return null
+  const la = state.lastAnomaly
+  const detTag = la && la.wsId === d.wsId ? `${la.version}:${la.stale ? 'stale' : 'fresh'}` : 'none'
+  const key = `${d.wsId}|${d.meta?.version ?? -1}|${colKey}|${maxPoints}|${detTag}`
+  const hit = seriesCache.get(key)
+  if (hit) {
+    if (state.series.key !== key) state.series = { key, data: hit }
+    return hit
   }
-  logAction(4, 'broom', '异常修复执行',
-    `${repair === 'clip' ? '阈值截断' : repair === 'nan_impute' ? '置缺失并重插值' : '生成布尔掩码'} · 处理 ${touched} 点`,
-    { type: 'anomaly_repair', repair, anomaly: snap })
-  return { touched }
+  try {
+    const resp = await ws.wsSeries(d.wsId, colKey, maxPoints)
+    if (seriesCache.size > 24) seriesCache.clear()
+    seriesCache.set(key, resp)
+    state.series = { key, data: resp }
+    return resp
+  } catch (e) {
+    toast('error', `读取曲线失败：${e.message}`)
+    return null
+  }
 }
 
-// ---- 手动掩码 ----
-export function generateMask(maskName, range) {
-  const d = ds()
-  const isNew = !d.columns.some(c => c.key === maskName)
-  if (isNew) d.columns.push({ key: maskName, label: `掩码:${maskName}`, type: 'binary' })
-  let ones = 0
-  d.data.forEach((row, i) => {
-    const inRange = i >= range.startIdx && i <= range.endIdx ? 1 : 0
-    row[maskName] = inRange
-    if (inRange) ones++
+export function currentSeries() {
+  return state.series.data
+}
+
+// ---- 手动掩码列（服务端建列，界面只登记区间）----
+export async function generateMask(maskName, range) {
+  const r = await runOp('mask-generate',
+    { maskName, startIdx: range.startIdx, endIdx: range.endIdx }, {
+    step: 4, icon: 'mask', title: `生成布尔掩码: ${maskName}`,
+    detail: x => x.summary,
+    // onesCount 只有服务端知道（它数了区间内的 1）：记下来导出 Python 时才能自检
+    params: (res) => ({ type: 'mask_generate', maskName, startIdx: range.startIdx, endIdx: range.endIdx, onesCount: res.onesCount })
   })
-  const existIdx = state.masks.findIndex(m => m.key === maskName)
-  const entry = { key: maskName, label: `掩码:${maskName}`, startIdx: range.startIdx, endIdx: range.endIdx, startTime: range.start, endTime: range.end, onesCount: ones }
-  if (existIdx >= 0) state.masks[existIdx] = entry
+  if (!r) return null
+  const entry = {
+    key: r.key, label: r.label, startIdx: r.startIdx, endIdx: r.endIdx,
+    startTime: r.startTime, endTime: r.endTime, onesCount: r.onesCount
+  }
+  const i = state.masks.findIndex(m => m.key === r.key)
+  if (i >= 0) state.masks.splice(i, 1, entry)
   else state.masks.push(entry)
-  touch()
-  logAction(4, 'mask', `生成布尔掩码: ${maskName}`, `行${range.startIdx}–${range.endIdx} · ${ones}个1`, { type: 'mask_generate', maskName, startIdx: range.startIdx, endIdx: range.endIdx, startTime: range.start, endTime: range.end })
-  return ones
+  return r.onesCount
 }
 
-export function deleteMask(idx) {
+export async function deleteMask(idx) {
   const m = state.masks[idx]
-  const d = ds()
-  d.data.forEach(row => delete row[m.key])
-  d.columns = d.columns.filter(c => c.key !== m.key)
-  state.masks.splice(idx, 1)
-  touch()
-  logAction(4, 'mask', `删除掩码列: ${m.key}`, `行${m.startIdx}–${m.endIdx} · ${m.onesCount}个1`, { type: 'mask_delete', maskKey: m.key })
+  if (!m) return null
+  const r = await runOp('mask-delete', { keys: [m.key] }, {
+    step: 4, icon: 'mask', title: `删除掩码列: ${m.key}`,
+    detail: x => x.summary, params: { type: 'mask_delete', maskKey: m.key }
+  })
+  if (!r) return null
+  const i = state.masks.findIndex(x => x.key === m.key)
+  if (i >= 0) state.masks.splice(i, 1)
+  return r
 }
 
-export function deleteAllMasks() {
-  const d = ds()
-  state.masks.forEach(m => {
-    d.data.forEach(row => delete row[m.key])
-    d.columns = d.columns.filter(c => c.key !== m.key)
-  })
-  const count = state.masks.length
+export async function deleteAllMasks() {
   const keys = state.masks.map(m => m.key)
+  if (!keys.length) { toast('info', '当前没有掩码列'); return null }
+  const r = await runOp('mask-delete', { keys }, {
+    step: 4, icon: 'mask', title: '清空全部掩码',
+    detail: x => x.summary, params: { type: 'mask_delete_all', keys }
+  })
+  if (!r) return null
   state.masks = []
-  touch()
-  logAction(4, 'mask', '清空全部掩码', `删除 ${count} 个掩码列`, { type: 'mask_delete_all', keys })
+  return r
 }
 
 // ---- 数据集切分 ----
 export function splitCounts(trainPct) {
-  const total = ds().data.length
+  const total = rowCount()
   const train = Math.floor(total * trainPct / 100)
   const rest = total - train
   const test = Math.floor(rest / 2)
@@ -829,30 +891,10 @@ export function setSplitRatio(ratio) {
   return r
 }
 
-// ---- 第五步：特征工程 ----
+// ---- 第五步：特征工程（构建全部在后端，界面只发命令、读列注册表）----
 export function initFeatureList() {
-  const d = ds()
-  if (state.features.length === 0) {
-    state.features = d.columns.map(c => ({ key: c.key, label: c.label, isNew: false }))
-    return
-  }
-  // 重开数据集会清空登记表，而回放是先补特征再进第五步：只种一次会让原始列从预览里消失，
-  // 于是「当前共计 N 列」和导出宽表的列数对不上。按 d.columns 补漏，列序与主表一致。
-  const missing = d.columns.filter(c => !state.features.some(f => f.key === c.key))
-  if (missing.length) state.features.unshift(...missing.map(c => ({ key: c.key, label: c.label, isNew: false })))
+  syncFeatureList(ds())
 }
-
-// 返回是否真的新增，调用方的「新增 N 列」必须以此计数，重复执行同一构建不能虚报。
-// 注意：第五步产物只登记进 state.features，导出宽表由 App.vue 的 exportDataset
-// 按 features 补齐列；不要写回 d.columns，否则会污染时间列/列运算等选择器。
-function pushFeature(key, label) {
-  if (state.features.some(f => f.key === key)) return false
-  state.features.push({ key, label, isNew: true })
-  return true
-}
-
-// 中国 2024 年部分法定节假日（示例数据集覆盖 2024-06）
-const HOLIDAYS_2024 = new Set(['2024-01-01', '2024-02-10', '2024-02-11', '2024-02-12', '2024-02-13', '2024-02-14', '2024-04-04', '2024-04-05', '2024-05-01', '2024-05-02', '2024-05-03', '2024-06-10', '2024-09-15', '2024-09-16', '2024-10-01', '2024-10-02', '2024-10-03', '2024-10-04', '2024-10-05'])
 
 // 正余弦不是第 7 个日历维度，而是对「已勾选的周期维度」换一种编码方式。
 // 只有周期长度固定的维度能编码；day 每月天数不同（28~31），无固定周期，故不参与。
@@ -883,60 +925,18 @@ export function timePlanLabel(opts) {
   }
 }
 
-export const HOLIDAY_COUNT = HOLIDAYS_2024.size
-
-// 与 pandas dt.dayofweek 对齐：周一 = 0
-function weekdayIndex(dt) {
-  return (dt.getDay() + 6) % 7
-}
-
-// 把维度值归一化到 [0,1) 后映射到单位圆，保证周期首尾相连
-function cyclical(dt, opt) {
-  const raw = opt === 'hour' ? dt.getHours()
-    : opt === 'weekday' ? weekdayIndex(dt)
-    : dt.getMonth()
-  const angle = (raw / CYCLE_PERIOD[opt]) * 2 * Math.PI
-  return {
-    sin: parseFloat(Math.sin(angle).toFixed(3)),
-    cos: parseFloat(Math.cos(angle).toFixed(3))
-  }
-}
-
-export function buildTimeFeatures(opts) {
-  const d = ds()
+// 四个 Tab 的构建命令统一走 runOp：明细留在后端帧上算，响应回带最新列注册表，
+// state.features 由 applyMeta → syncFeatureList 从注册表派生（见上面的注释）。
+export async function buildTimeFeatures(opts) {
   const plan = timeFeaturePlan(opts)
-  if (plan.keys.length === 0) return { cols: 0, created: 0, sinCos: 0 }
-  let created = 0
-  const add = key => {
-    if (pushFeature(key, `时间:${key.slice('feat_'.length)}`)) created++
-  }
-  plan.dims.forEach(opt => add(`feat_${opt}`))
-  plan.cycDims.forEach(opt => { add(`feat_${opt}_sin`); add(`feat_${opt}_cos`) })
-  d.data.forEach(row => {
-    const dt = parseTimeValue(row[d.timeCol])
-    plan.dims.forEach(opt => {
-      const key = `feat_${opt}`
-      if (opt === 'hour') row[key] = dt.getHours()
-      if (opt === 'day') row[key] = dt.getDate()
-      if (opt === 'month') row[key] = dt.getMonth() + 1
-      if (opt === 'weekday') row[key] = weekdayIndex(dt)
-      if (opt === 'is_weekend') row[key] = (dt.getDay() === 0 || dt.getDay() === 6) ? 1 : 0
-      if (opt === 'holiday') {
-        const ymd = `${dt.getFullYear()}-${pad(dt.getMonth() + 1)}-${pad(dt.getDate())}`
-        row[key] = HOLIDAYS_2024.has(ymd) ? 1 : 0
-      }
-    })
-    plan.cycDims.forEach(opt => {
-      const { sin, cos } = cyclical(dt, opt)
-      row[`feat_${opt}_sin`] = sin
-      row[`feat_${opt}_cos`] = cos
-    })
-  })
-  touch()
-  logAction(5, 'wand', '时间日历特征',
-    `${plan.keys.length} 列（新增 ${created}）: ${plan.keys.join(', ')}`,
-    { type: 'feature_build', featureType: 'time', detail: [...plan.dims, ...(plan.cycDims.length ? plan.cycDims.map(o => `cyclical_${o}`) : [])].join(',') })
-  return { cols: plan.keys.length, created, sinCos: plan.cycCols.length }
+  if (plan.keys.length === 0) return null
+  const detail = [...plan.dims, ...plan.cycDims.map(o => `cyclical_${o}`)].join(',')
+  const r = await runOp('feature-time', { dims: plan.dims, cyclical: plan.cycDims.length > 0 }, {
+    step: 5, icon: 'wand', title: '时间日历特征',
+    detail: x => `${x.cols} 列（新增 ${x.created}）: ${x.keys.join(', ')}`,
+    params: { type: 'feature_build', featureType: 'time', detail }
+  }, { long: true })
+  return r && { cols: r.cols, created: r.created, sinCos: plan.cycCols.length }
 }
 
 // 滚动统计量：键是勾选框/日志里的 fn，值是进入列名的简写（median → med 沿用既有命名）
@@ -996,75 +996,20 @@ export function parseLagDetail(detail) {
   }
 }
 
-export function buildLagFeatures(targetCols, params) {
-  const d = ds()
-  const data = d.data
-  const span = normEwmSpan(params.ewmSpan)
+export async function buildLagFeatures(targetCols, params) {
   const keys = lagFeaturePlan(targetCols, params)
-  let created = 0
-  keys.forEach(k => { if (pushFeature(k, k)) created++ })
-  targetCols.forEach(col => {
-    params.lags.forEach(step => {
-      const lagKey = `lag_${col}_t${step}`
-      data.forEach((row, i) => { row[lagKey] = i >= step ? data[i - step][col] : null })
-    })
-    params.windows.forEach(w => {
-      params.stats.forEach(fn => {
-        const rKey = `roll_${ROLL_STATS[fn]}_${col}_w${w}`
-        data.forEach((row, i) => {
-          if (i >= w) {
-            const vals = data.slice(i - w, i).map(x => x[col]).filter(v => !isMissing(v)).map(Number)
-            if (vals.length === 0) { row[rKey] = null; return }
-            if (fn === 'mean') row[rKey] = parseFloat((vals.reduce((a, b) => a + b, 0) / vals.length).toFixed(2))
-            else if (fn === 'std') {
-              // 总体标准差（ddof=0），与导出的 pandas 代码保持一致
-              const m = vals.reduce((a, b) => a + b, 0) / vals.length
-              row[rKey] = parseFloat(Math.sqrt(vals.reduce((a, v) => a + (v - m) ** 2, 0) / vals.length).toFixed(2))
-            }
-            else if (fn === 'max') row[rKey] = Math.max(...vals)
-            else if (fn === 'min') row[rKey] = Math.min(...vals)
-            else row[rKey] = parseFloat(medianOf(vals).toFixed(2))
-          } else row[rKey] = null
-        })
-      })
-    })
-    if (params.expanding) {
-      const exKey = `expanding_mean_${col}`
-      let cumSum = 0, cumCnt = 0
-      data.forEach(row => {
-        row[exKey] = cumCnt > 0 ? parseFloat((cumSum / cumCnt).toFixed(2)) : null
-        const v = row[col]
-        if (!isMissing(v)) { cumSum += Number(v); cumCnt++ }
-      })
-    }
-    if (params.ewm) {
-      const ewmKey = `ewm_${col}_s${span}`
-      const alpha = 2 / (span + 1)
-      let prev = null
-      data.forEach(row => {
-        row[ewmKey] = prev === null ? null : parseFloat(prev.toFixed(2))
-        const v = row[col]
-        if (isMissing(v)) return
-        prev = prev === null ? Number(v) : alpha * Number(v) + (1 - alpha) * prev
-      })
-    }
-  })
-  touch()
+  if (keys.length === 0) return null
   const detail = lagPlanDetail(targetCols, params)
-  logAction(5, 'wand', '滞后与滑动窗口特征',
-    `${keys.length} 列（新增 ${created}）· ${detail}`,
-    { type: 'feature_build', featureType: 'lag_roll', detail })
-  return { cols: keys.length, created }
-}
-
-function computeDFT(x, k) {
-  let re = 0, im = 0
-  for (let n = 0; n < x.length; n++) {
-    const angle = -2 * Math.PI * k * n / x.length
-    re += x[n] * Math.cos(angle)
-    im += x[n] * Math.sin(angle)
-  }
-  return Math.sqrt(re * re + im * im) / x.length
+  const r = await runOp('feature-lag', {
+    cols: targetCols, lags: params.lags || [], windows: params.windows || [],
+    stats: params.stats || [], expanding: !!params.expanding,
+    ewm: !!params.ewm, ewmSpan: normEwmSpan(params.ewmSpan)
+  }, {
+    step: 5, icon: 'wand', title: '滞后与滑动窗口特征',
+    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}`,
+    params: { type: 'feature_build', featureType: 'lag_roll', detail }
+  }, { long: true })
+  return r && { cols: r.cols, created: r.created }
 }
 
 // 差分与频域：同样是「一份计划四处复用」（面板预览 / 构建 / 日志 / 回放 / 代码导出）
@@ -1119,136 +1064,54 @@ export function parseDiffDetail(detail) {
   }
 }
 
-export function diffFeatureLabel(key) {
-  let m = key.match(/^diff_season(\d+)_(.+)$/)
-  if (m) return `ΔS${m[1]}_${m[2]}`
-  m = key.match(/^diff(\d)_(.+)$/)
-  if (m) return `Δ${m[1] === '1' ? '¹' : '²'}_${m[2]}`
-  m = key.match(/^fft_entropy_(.+)$/)
-  if (m) return `spectral_entropy_${m[1]}`
-  m = key.match(/^fft_power_ratio_(.+)$/)
-  if (m) return `power_ratio_${m[1]}`
-  m = key.match(/^fft_top(\d)_(.+)$/)
-  if (m) return `FFT_Top${m[1]}_${m[2]}`
-  return key
-}
-
-export function buildDiffFeatures(targetCols, params) {
-  const d = ds()
-  const data = d.data
+export async function buildDiffFeatures(targetCols, params) {
   const keys = diffFeaturePlan(targetCols, params)
-  let created = 0
-  keys.forEach(k => { if (pushFeature(k, diffFeatureLabel(k))) created++ })
-  targetCols.forEach(col => {
-    if (params.d1) {
-      const k = `diff1_${col}`
-      data.forEach((row, i) => {
-        const cur = Number(row[col]), prev = Number(data[i - 1]?.[col])
-        row[k] = i >= 1 && !isMissing(row[col]) && !isMissing(data[i - 1][col]) ? parseFloat((cur - prev).toFixed(4)) : null
-      })
-    }
-    if (params.d2) {
-      const k = `diff2_${col}`
-      data.forEach((row, i) => {
-        if (i < 2 || isMissing(row[col]) || isMissing(data[i - 1][col]) || isMissing(data[i - 2][col])) { row[k] = null; return }
-        row[k] = parseFloat(((row[col] - data[i - 1][col]) - (data[i - 1][col] - data[i - 2][col])).toFixed(4))
-      })
-    }
-    if (params.seasonal) {
-      const p = params.period
-      const k = `diff_season${p}_${col}`
-      data.forEach((row, i) => {
-        row[k] = i >= p && !isMissing(row[col]) && !isMissing(data[i - p][col]) ? parseFloat((row[col] - data[i - p][col]).toFixed(4)) : null
-      })
-    }
-  })
-
-  const fftCol = targetCols[0]
-  if (fftCol && (params.fftDominant || params.fftEntropy || params.fftPowerRatio)) {
-    const vals = data.map(r => (isMissing(r[fftCol]) ? 0 : Number(r[fftCol])))
-    if (params.fftDominant) {
-      const spectrum = []
-      for (let k = 1; k <= Math.min(50, Math.floor(vals.length / 2)); k++) spectrum.push({ k, energy: computeDFT(vals, k) })
-      spectrum.sort((a, b) => b.energy - a.energy)
-      spectrum.slice(0, 3).forEach((item, rank) => {
-        const key = `fft_top${rank + 1}_${fftCol}`
-        const feat = state.features.find(f => f.key === key)
-        if (feat) feat.label = `FFT_Top${rank + 1}_E${item.energy.toFixed(1)}`
-        const k = item.k
-        data.forEach((row, i) => {
-          row[key] = parseFloat(computeDFT(vals.slice(Math.max(0, i - 64), i + 1), k).toFixed(2))
-        })
-      })
-    }
-    if (params.fftEntropy) {
-      const key = `fft_entropy_${fftCol}`
-      data.forEach((row, i) => {
-        if (i < 64) { row[key] = null; return }
-        const seg = vals.slice(i - 64, i)
-        const energies = []
-        for (let k = 1; k <= 16; k++) energies.push(computeDFT(seg, k))
-        const totalE = energies.reduce((a, b) => a + b, 0) || 1
-        const entropy = energies.map(e => e / totalE).reduce((acc, p) => acc + (p > 0 ? -p * Math.log2(p) : 0), 0)
-        row[key] = parseFloat(entropy.toFixed(4))
-      })
-    }
-    if (params.fftPowerRatio) {
-      const key = `fft_power_ratio_${fftCol}`
-      data.forEach((row, i) => {
-        if (i < 64) { row[key] = null; return }
-        const seg = vals.slice(i - 64, i)
-        const lowE = [1, 2, 3, 4].reduce((a, k) => a + computeDFT(seg, k), 0)
-        const highE = [8, 12, 16].reduce((a, k) => a + computeDFT(seg, k), 0)
-        row[key] = parseFloat((lowE / (highE + 1e-10)).toFixed(2))
-      })
-    }
-  }
-  touch()
+  if (keys.length === 0) return null
   const detail = diffPlanDetail(targetCols, params)
-  logAction(5, 'wand', '差分与频域特征',
-    `${keys.length} 列（新增 ${created}）· ${detail}`,
-    { type: 'feature_build', featureType: 'diff_freq', detail })
-  return { cols: keys.length, created }
+  const r = await runOp('feature-diff', {
+    cols: targetCols,
+    d1: !!params.d1, d2: !!params.d2,
+    seasonal: !!params.seasonal, period: Math.max(1, Math.round(params.period) || 1),
+    fftDominant: !!params.fftDominant, fftEntropy: !!params.fftEntropy, fftPowerRatio: !!params.fftPowerRatio
+  }, {
+    step: 5, icon: 'wand', title: '差分与频域特征',
+    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}`,
+    params: { type: 'feature_build', featureType: 'diff_freq', detail }
+  }, { long: true })
+  return r && { cols: r.cols, created: r.created }
 }
 
-export function catColumnDistribution(selectedKeys, method) {
-  const d = ds()
-  const rows = []
-  selectedKeys.forEach(key => {
-    const col = d.columns.find(c => c.key === key)
-    if (!col) return
-    const valueMap = {}
-    d.data.forEach(row => {
-      const v = row[key]
-      if (!isMissing(v)) valueMap[v] = (valueMap[v] || 0) + 1
-    })
-    const uniqueVals = Object.keys(valueMap)
-    rows.push({
-      label: col.label, key, uniqueVals,
-      topVals: uniqueVals.slice(0, 5).map(v => `${v}(${valueMap[v]})`).join(', '),
-      counts: valueMap, total: d.data.length
-    })
-  })
-  // 预计新增列数与构建函数共用同一份计划，面板上的数字即产物列数
-  return { rows, totalNewCols: catFeaturePlan(selectedKeys, method).length }
-}
+// 类别列的取值分布由后端整表数出（/value-counts）：浏览器不留整表，
+// 「共计多少个取值 / 各占多少行」这类数字必须由持有全量帧的一侧给出。
+const catDistCache = new Map()
 
-// 独热列名来自数据取值，日志只记「选哪些列 + 哪种方法」，回放时按当前数据重算同一份计划
-export function catFeaturePlan(selectedKeys, method) {
+export async function catColumnDistribution(selectedKeys, method) {
   const d = ds()
-  const items = []
-  selectedKeys.forEach(catCol => {
-    if (!d.columns.some(c => c.key === catCol)) return
-    const uniqueVals = [...new Set(d.data.map(r => r[catCol]).filter(v => !isMissing(v)))]
-    if (method === 'onehot') {
-      uniqueVals.forEach((val, i) => items.push({ key: `${catCol}_${val}`, label: `${catCol}=${val}`, col: catCol, val, idx: i }))
-    } else if (method === 'ordinal') {
-      items.push({ key: `${catCol}_ordinal`, label: `${catCol}_序数`, col: catCol })
-    } else {
-      items.push({ key: `${catCol}_target`, label: `${catCol}_目标编码`, col: catCol })
-    }
-  })
-  return [...new Map(items.map(it => [it.key, it])).values()]
+  if (!d?.wsId || selectedKeys.length === 0) return null
+  const cacheKey = `${d.wsId}|${selectedKeys.join(',')}|${method}|v${d.meta?.version ?? -1}`
+  const hit = catDistCache.get(cacheKey)
+  if (hit) return hit
+  try {
+    const r = await ws.wsValueCounts(d.wsId, selectedKeys, method)
+    const rows = r.columns.map(c => ({
+      label: c.label, key: c.key,
+      uniqueVals: c.uniqueVals,
+      topVals: c.uniqueVals.slice(0, 5).map(v => `${v}(${c.counts[v]})`).join(', '),
+      counts: c.counts,
+      total: c.total,
+      uniqueTotal: c.uniqueTotal,
+      nonMissingRows: c.nonMissingRows,
+      restCount: c.restCount,
+      truncated: c.truncated
+    }))
+    const out = { rows, totalNewCols: r.totalNewCols, rowCount: r.rowCount }
+    if (catDistCache.size > 24) catDistCache.clear()   // 键里带版本号，每次改表都会添一条
+    catDistCache.set(cacheKey, out)
+    return out
+  } catch (e) {
+    toast('error', `类别取值分布读取失败：${e.message}`)
+    return null
+  }
 }
 
 export function catPlanDetail(selectedKeys, method) {
@@ -1265,102 +1128,88 @@ export function parseCatDetail(detail) {
   return { cols: (f.cols || '').split(',').filter(Boolean), method }
 }
 
-export function buildCatFeatures(selectedKeys, method) {
-  const d = ds()
-  const items = catFeaturePlan(selectedKeys, method)
-  let created = 0
-  items.forEach(it => { if (pushFeature(it.key, it.label)) created++ })
-  const uniqueOf = {}
-  selectedKeys.forEach(catCol => {
-    uniqueOf[catCol] = [...new Set(d.data.map(r => r[catCol]).filter(v => !isMissing(v)))]
-  })
-  if (method === 'onehot') {
-    items.forEach(it => { d.data.forEach(row => { row[it.key] = row[it.col] === it.val ? 1 : 0 }) })
-  } else if (method === 'ordinal') {
-    selectedKeys.forEach(catCol => {
-      const outKey = `${catCol}_ordinal`
-      const valIdx = {}
-      uniqueOf[catCol].forEach((v, i) => { valIdx[v] = i })
-      d.data.forEach(row => { row[outKey] = isMissing(row[catCol]) ? -1 : (valIdx[row[catCol]] ?? -1) })
-    })
-  } else {
-    const mainFloat = (d.columns.find(c => c.type === 'float' && c.isMain)
-      || d.columns.find(c => c.type === 'float' && !c.key.endsWith('_ordinal') && !c.key.endsWith('_target')))?.key
-    selectedKeys.forEach(catCol => {
-      const outKey = `${catCol}_target`
-      const sums = {}, counts = {}
-      d.data.forEach(row => {
-        const g = row[catCol], v = row[mainFloat]
-        if (!isMissing(g) && !isMissing(v)) { sums[g] = (sums[g] || 0) + Number(v); counts[g] = (counts[g] || 0) + 1 }
-      })
-      d.data.forEach(row => {
-        const g = row[catCol]
-        row[outKey] = !isMissing(g) && counts[g] !== undefined ? parseFloat((sums[g] / counts[g]).toFixed(2)) : null
-      })
-    })
-  }
-  touch()
+export async function buildCatFeatures(selectedKeys, method) {
   const detail = catPlanDetail(selectedKeys, method)
-  logAction(5, 'wand', '类别特征编码',
-    `${items.length} 列（新增 ${created}）· ${detail}`,
-    { type: 'feature_build', featureType: 'cat', detail })
-  return { cols: items.length, created }
+  const r = await runOp('feature-cat', { cols: selectedKeys, method }, {
+    step: 5, icon: 'wand', title: '类别特征编码',
+    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}`,
+    // 独热列名来自数据取值，构建当场把服务端算出的键序记进审计参数：
+    // 整表不再常驻浏览器，导出 Python 时只有这一份记录能复现同一批列名与列序。
+    // targetColumn 同理——目标均值编码的参照列由服务端挑，界面看不到挑中的是哪一个。
+    params: x => ({ type: 'feature_build', featureType: 'cat', detail,
+      onehotKeys: method === 'onehot' ? x.keys : null,
+      targetColumn: x.targetColumn || null })
+  }, { long: true })
+  return r && { cols: r.cols, created: r.created }
 }
 
-function pad(n) { return String(n).padStart(2, '0') }
-
-export function renameFeature(idx, newLabel) {
-  const feat = state.features[idx]
+// 「首个完整行」：长窗口特征在前 N 行必然为空（窗口还没盖到）。整列扫描在后端 /first-complete 做，
+// 浏览器只拿回一个行号——旧写法是 wsColumns 拉 5000 行 × 列数回来自己找。
+export async function firstCompleteRow(newKeys, scanRows = 5000) {
   const d = ds()
+  if (!d?.wsId || newKeys.length === 0) return null
+  if (!requireBackend('定位首个完整行')) return null
+  state.busy = '正在扫描新增特征的取值…'
+  try {
+    const r = await ws.wsFirstComplete(d.wsId, newKeys, scanRows)
+    return { index: r.index, scanned: r.scanned }
+  } catch (e) {
+    toast('error', `定位首个完整行失败：${e.message}`)
+    return null
+  } finally {
+    state.busy = ''
+  }
+}
+
+export async function renameFeature(idx, newLabel) {
+  const feat = state.features[idx]
   const oldKey = feat.key
+  // 原始列的键不能改（只换显示名）；特征列的键由标签推导，冲突时加时间戳后缀，
+  // 键由前端算好显式下发，服务端才不会按自己的 safe_key 规则另起一个名
   let newKey = oldKey
   if (feat.isNew) {
     const safeKey = newLabel.toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_')
     const conflict = state.features.some((f, i) => i !== idx && f.key === safeKey)
     newKey = conflict ? safeKey + '_' + Date.now().toString(36) : safeKey
-    d.data.forEach(row => {
-      if (row[oldKey] !== undefined) { row[newKey] = row[oldKey]; delete row[oldKey] }
-    })
-    const col = d.columns.find(c => c.key === oldKey)
-    if (col) { col.key = newKey; col.label = newLabel }
-    feat.key = newKey
   }
-  feat.label = newLabel
-  touch()
   // 改名会连带换掉导出宽表的列键，不进审计链就复现不出同一张表
-  logAction(5, 'rename', '重命名特征列', `"${oldKey}" → "${newKey}"`,
-    { type: 'feature_rename', oldKey, newKey, newLabel })
+  const r = await runOp('rename-column', { key: oldKey, label: newLabel, newKey }, {
+    step: 5, icon: 'rename', title: '重命名特征列',
+    detail: x => `"${oldKey}" → "${x.newKey}"`,
+    params: { type: 'feature_rename', oldKey, newKey, newLabel }
+  })
+  return r ? newKey : null
 }
 
-// 特征登记表原本是只增不减的：误建的列会一路带进导出宽表、回放与 Python 脚本。
-// 第五步产物只存在于 data 行键与 state.features（不写回 d.columns，见 pushFeature 注释），
-// 所以这里自己清行键，不走 deleteColumn。
-export function dropFeature(idx) {
+// 特征登记表由后端列注册表派生，撤销 = 让服务端删掉那一列（applyMeta 会把清单同步回来）
+export async function dropFeature(idx) {
   const feat = state.features[idx]
   if (!feat.isNew) { toast('warning', '原始数据列请在第一步「列管理」中删除'); return false }
-  const d = ds()
-  d.data.forEach(row => delete row[feat.key])
-  state.features.splice(idx, 1)
-  touch()
-  logAction(5, 'delete', '撤销特征列', `"${feat.label}" (${feat.key})`,
-    { type: 'feature_drop', key: feat.key, label: feat.label })
-  return true
+  const r = await runOp('delete-column', { key: feat.key }, {
+    step: 5, icon: 'delete', title: '撤销特征列',
+    detail: () => `"${feat.label}" (${feat.key})`,
+    params: { type: 'feature_drop', key: feat.key, label: feat.label }
+  })
+  return !!r
 }
 
 // ============================================================
 // 操作日志：导出 / 导入 / 回放
 // ============================================================
 export function exportActionLog() {
-  if (state.actionLog.length === 0) { toast('warning', '当前没有操作记录可导出'); return false }
+  const ops = wsActionLog()
+  if (ops.length === 0) { toast('warning', '当前数据集没有可导出的操作记录'); return false }
   const d = ds()
   const exportData = {
     version: '1.0',
     exportedAt: new Date().toISOString(),
     datasetKey: state.currentKey,
     datasetName: d?.name || '',
-    datasetRows: d?.data?.length || 0,
+    datasetRows: d?.meta?.rowCount || 0,
     datasetCols: d?.columns?.length || 0,
-    operations: state.actionLog.map(e => ({
+    datasetWsId: d?.wsId || null,
+    datasetVersion: d?.meta?.version ?? null,
+    operations: ops.map(e => ({
       step: e.step, icon: e.icon, title: e.title, detail: e.detail, params: e.params, time: e.time
     }))
   }
@@ -1392,107 +1241,96 @@ export function importActionLog(text) {
 }
 
 // 回放单条操作；返回 true=已执行，false=跳过
-function replaySingleOp(op) {
+// 异步：第一步/第二步的操作现在都打在后端工作区上，回放必须走同一个入口才能留下同样的审计记录
+async function replaySingleOp(op) {
   const d = ds()
   if (!d || !op.params) return false
   const p = op.params
+  const relabel = t => { const last = state.actionLog[state.actionLog.length - 1]; if (last) last.title = t }
   switch (p.type) {
     case 'time_convert': {
-      const timeCol = p.timeCol || d.timeCol
       const fmt = p.targetFmt || 'YYYY-MM-DD HH:mm:ss'
-      d.data.forEach(row => {
-        if (!isMissing(row[timeCol])) row[timeCol] = convertSingleTime(row[timeCol], fmt)
-      })
-      touch()
-      logAction(2, 'column', '[回放] 时间格式转换', `${d.data.length}行 → ${fmt}`)
+      const changed = await convertTimeColumn(p.timeCol || d.timeCol, fmt, p.customFmt)
+      if (changed === null) return false
+      relabel('[回放] 时间格式转换')
       return true
     }
     case 'resample': {
       if (!p.targetRate || !p.method) return false
-      resampleDataset(p.targetRate, p.method)
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = '[回放] 重采样'
+      const r = await resampleDataset(p.targetRate, p.method)
+      if (!r) return false
+      relabel('[回放] 重采样')
       return true
     }
     case 'multi_calc': {
       if (!p.terms || !p.name || p.terms.length < 2) return false
       if (d.columns.some(c => c.key === p.name)) return true // 已存在，视为成功
-      applyDerivedCol(p.name, p.terms)
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = `[回放] 多列运算: ${p.name}`
-      return true
-    }
-    case 'exo_merge': {
-      if (!Array.isArray(p.vars)) return false
-      p.vars.forEach(v => {
-        if (!Array.isArray(v.data)) return
-        if (!d.columns.some(c => c.key === v.key)) {
-          d.columns.push({ key: v.key, label: v.label || v.key, type: 'float' })
-        }
-        d.data.forEach((row, i) => { row[v.key] = v.data[i] !== undefined ? v.data[i] : null })
-      })
-      touch()
-      logAction(2, 'column', '[回放] 合并外生变量', p.vars.map(v => v.key).join(', '))
+      const r = await applyDerivedCol(p.name, p.terms)
+      if (!r) return false
+      relabel(`[回放] 多列运算: ${p.name}`)
       return true
     }
     case 'impute_segment': {
-      if (!p.colKey || !Array.isArray(p.segments)) return false
-      p.segments.forEach(seg => {
-        const fresh = segmentsOf(p.colKey).find(s => s.startIdx === seg.startIdx)
-        if (fresh) imputeSegment(d.data, p.colKey, fresh, seg.algo || 'linear')
+      if (!p.colKey || !Array.isArray(p.segments) || p.segments.length === 0) return false
+      // 段号原样打回服务端：填补只动区间内的 NaN，回放顺序与记录顺序一致时结果同一份
+      const r = await runImpute({
+        targets: p.segments.map(s => ({ key: p.colKey, startIdx: s.startIdx, endIdx: s.endIdx, algo: s.algo || 'linear' }))
+      }, {
+        step: 4, icon: 'impute', title: `[回放] 缺失值填补: ${p.colKey}`,
+        detail: x => x.summary, params: p
       })
-      touch()
-      logAction(4, 'impute', `[回放] 缺失值填补: ${p.colKey}`, `${p.segments.length} 段`)
-      return true
+      return !!r
     }
     case 'impute_all': {
-      imputeAllAndDedupe('mean')
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = '[回放] 一键填补去重'
+      const r = await imputeAllAndDedupe(p.dedupe || 'mean', p.defaultAlgo || 'linear')
+      if (!r) return false
+      relabel('[回放] 一键填补去重')
       return true
     }
     case 'anomaly_repair': {
-      // 依据检测时缓存的真实阈值重新检测后修复（无法还原历史视图时跳过）
-      if (!p.repair) return false
-      const res = detectAnomalies(state.lastAnomaly?.algo || '3sigma', state.lastAnomaly?.expr)
-      if (res.error) return false
-      repairAnomalies(p.repair)
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = '[回放] 异常修复'
+      // 修复按检测时的行索引执行，所以回放必须先按记录的算法/表达式/超参重测一遍，
+      // 并且逐列核对异常点数：数目对不上就不是同一份检测，宁可不修也不能修错点
+      if (!p.repair || !p.algo) return false
+      const det = await detectAnomalies(p.algo, p.expr || '', p.iforest || {})
+      if (!det) return false
+      const counted = {}
+      ;(det.results || []).forEach(x => { counted[x.key] = x.anomalies })
+      if ((p.columns || []).some(c => (counted[c.key] || 0) !== c.count)) return false
+      const r = await repairAnomalies(p.repair)
+      if (!r) return false
+      relabel('[回放] 异常修复')
       return true
     }
     case 'mask_generate': {
       if (!p.maskName || p.startIdx === undefined || p.endIdx === undefined) return false
-      generateMask(p.maskName, { startIdx: p.startIdx, endIdx: p.endIdx, start: p.startTime, end: p.endTime })
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = `[回放] 掩码: ${p.maskName}`
+      const ones = await generateMask(p.maskName, { startIdx: p.startIdx, endIdx: p.endIdx })
+      if (ones === null) return false
+      relabel(`[回放] 掩码: ${p.maskName}`)
       return true
     }
     case 'rename_column': {
       if (!p.oldKey || !p.newLabel) return false
-      const idx = d.columns.findIndex(c => c.key === p.oldKey)
+      const idx = ds().columns.findIndex(c => c.key === p.oldKey)
       if (idx < 0) return false
-      renameColumn(idx, p.newLabel)  // 与界面操作走同一函数：键名/时间列/行内数据一起改
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = '[回放] 重命名'
+      // 与界面操作走同一函数：后端改帧 + 特征登记表一起改
+      if (!await renameColumn(idx, p.newLabel)) return false
+      relabel('[回放] 重命名')
       return true
     }
     case 'delete_column': {
       if (!p.key) return false
-      const idx = d.columns.findIndex(c => c.key === p.key)
+      const idx = ds().columns.findIndex(c => c.key === p.key)
       if (idx < 0) return true  // 列已不在，回放后状态与记录一致
-      if (!deleteColumn(idx)) return false
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = '[回放] 删除列'
+      if (!await deleteColumn(idx)) return false
+      relabel('[回放] 删除列')
       return true
     }
     case 'feature_drop': {
       if (!p.key) return false
       const fi = state.features.findIndex(f => f.key === p.key)
       if (fi < 0) return true  // 该列已不在登记表里，回放后状态与记录一致
-      if (!dropFeature(fi)) return false
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = '[回放] 撤销特征列'
+      if (!await dropFeature(fi)) return false
+      relabel('[回放] 撤销特征列')
       return true
     }
     case 'feature_rename': {
@@ -1502,51 +1340,48 @@ function replaySingleOp(op) {
         fi = state.features.findIndex(f => f.key === p.newKey)
         return fi >= 0  // 已按改名后的键存在，视为与记录一致
       }
-      renameFeature(fi, p.newLabel)
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = '[回放] 重命名特征列'
+      if (!await renameFeature(fi, p.newLabel)) return false
+      relabel('[回放] 重命名特征列')
       return true
     }
     case 'unit_convert': {
       if (!p.key || typeof p.factor !== 'number') return false
-      const idx = d.columns.findIndex(c => c.key === p.key)
+      const idx = ds().columns.findIndex(c => c.key === p.key)
       if (idx < 0) return false
-      convertColumnUnit(idx, p.factor, typeof p.offset === 'number' ? p.offset : 0, p.newUnit || '')
-      const last = state.actionLog[state.actionLog.length - 1]
-      last.title = '[回放] 单位转换'
+      if (!await convertColumnUnit(idx, p.factor, typeof p.offset === 'number' ? p.offset : 0, p.newUnit || '')) return false
+      relabel('[回放] 单位转换')
       return true
     }
-    case 'exo_var_add': {
-      if (p.kind === 'formula') {
-        if (!p.key || !p.expr) return false
-        const r = addExoFormula(p.key, p.expr)   // 公式对同一时间轴是确定性的，重算即等价
-        if (!r || !r.ok) return false
-        const last = state.actionLog[state.actionLog.length - 1]
-        last.title = `[回放] 公式生成外生变量: ${p.key}`
-        return true
-      }
-      const items = p.kind === 'preset'
-        ? [{ key: p.key, label: p.label, source: 'preset', data: p.data }]
-        : p.kind === 'file' ? (p.vars || []).map(v => ({ ...v, source: 'file' })) : null
-      if (!items || items.length === 0) return false
-      let added = 0
-      // 预设模板含随机扰动、文件变量来自用户本地文件，两者都只能按导出时记录的数值逐值复原
-      items.forEach(v => {
-        if (!v.key || !Array.isArray(v.data) || state.exoVars.some(x => x.key === v.key)) return
-        // 逐值复制：活数据不能与操作记录共用同一个数组，否则记录会被后续操作改写
-        state.exoVars.push({ ...v, data: v.data.slice() })
-        added++
-      })
-      touch()
-      logAction(2, 'column', `[回放] 登记外生变量: ${items.map(v => v.key).join(', ')}`,
-        `${added} 个 · 按导出记录的数值逐值复原（${p.kind === 'preset' ? '预设模板为模拟数据' : '文件来源'}）`)
+    case 'exo-preset': {
+      // 记录里存的是 presetKey + 服务端补的 seed：重放把同一个 seed 打回去，得到同一串模拟值
+      if (!p.presetKey) return false
+      const alias = p.key && p.key !== p.presetKey ? p.key : ''
+      if (!await addExoPreset(p.presetKey, alias, { seed: p.seed })) return false
+      relabel(`[回放] 预设模板外生变量: ${p.key || p.presetKey}`)
+      return true
+    }
+    case 'exo-formula': {
+      if (!p.key || !p.expr) return false
+      if (!(await addExoFormula(p.key, p.expr)).ok) return false
+      relabel(`[回放] 公式生成外生变量: ${p.key}`)
+      return true
+    }
+    case 'exo-file': {
+      // 侧表在 inspect 那一步已落进服务端数据集目录，重放靠文件名 + 内容指纹重新挂一遍；
+      // 文件被覆盖过会直接报错，不会静默换一列数据
+      if (!p.filename || !p.sha || !p.sideTimeCol) return false
+      if (!await attachSideTable({
+        filename: p.filename, sha: p.sha, sideTimeCol: p.sideTimeCol,
+        mode: p.mode || 'left', toleranceMinutes: p.toleranceMinutes, targets: p.targets || []
+      })) return false
+      relabel(`[回放] 侧表挂列: ${p.filename}`)
       return true
     }
     case 'mask_delete': {
       if (!p.maskKey) return false
       const idx = state.masks.findIndex(m => m.key === p.maskKey)
       if (idx < 0) return true
-      deleteMask(idx)
+      if (!await deleteMask(idx)) return false
       const last = state.actionLog[state.actionLog.length - 1]
       last.title = `[回放] 删除掩码列: ${p.maskKey}`
       return true
@@ -1554,36 +1389,38 @@ function replaySingleOp(op) {
     case 'mask_delete_all': {
       if (!Array.isArray(p.keys)) return false
       if (state.masks.length === 0) return true
-      deleteAllMasks()
+      if (!await deleteAllMasks()) return false
       const last = state.actionLog[state.actionLog.length - 1]
       last.title = `[回放] 清空全部掩码`
       return true
     }
     case 'feature_build': {
+      // 四个 Tab 都打在后端同一批 op 上：回放与界面点构建走的是同一条路
       if (p.featureType === 'lag_roll' && p.detail) {
         // detail 里带完整计划（目标列/阶数/窗口/统计量/expanding/ewm span），复原后走同一个构建函数
         const plan = parseLagDetail(p.detail)
         if (plan.cols.length === 0) return false
-        buildLagFeatures(plan.cols, {
+        if (!await buildLagFeatures(plan.cols, {
           lags: plan.lags, windows: plan.windows, stats: plan.stats,
           expanding: plan.expanding, ewm: plan.ewm, ewmSpan: plan.ewmSpan
-        })
+        })) return false
       } else if (p.featureType === 'time' && p.detail) {
         // 日志记的是展开后的列计划（cyclical_hour 这类），还原成勾选态再复用同一构建函数
         const toks = p.detail.split(',').filter(Boolean)
         const cyc = toks.filter(t => t.startsWith('cyclical_'))
-        buildTimeFeatures([
+        const ok = await buildTimeFeatures([
           ...toks.filter(t => !t.startsWith('cyclical_')),
           ...(cyc.length ? ['cyclical_sincos'] : [])
         ])
+        if (!ok) return false
       } else if (p.featureType === 'diff_freq' && p.detail) {
         const plan = parseDiffDetail(p.detail)
         if (plan.cols.length === 0) return false
-        buildDiffFeatures(plan.cols, plan)
+        if (!await buildDiffFeatures(plan.cols, plan)) return false
       } else if (p.featureType === 'cat' && p.detail) {
         const plan = parseCatDetail(p.detail)
         if (plan.cols.length === 0) return false
-        buildCatFeatures(plan.cols, plan.method)
+        if (!await buildCatFeatures(plan.cols, plan.method)) return false
       } else {
         // 未登记的构建类型一律按「无法回放」处理，绝不写一条假成功日志蒙过去
         return false
@@ -1618,11 +1455,11 @@ export function replayActionLog() {
     `即将回放 ${ops.length} 条操作记录，当前数据将被修改。确认继续？`,
     '回放确认',
     { type: 'warning', confirmButtonText: '开始回放', cancelButtonText: '取消' }
-  ).then(() => {
+  ).then(async () => {
     state.actionLog = []
     let idx = 0, succeeded = 0, failed = 0
     state.replayStatus = { text: `回放中 (1/${ops.length})...` }
-    const runNext = () => {
+    const runNext = async () => {
       if (idx >= ops.length) {
         state.replayStatus = { text: `回放完成：${succeeded} 成功，${failed} 跳过` }
         touch()
@@ -1635,7 +1472,7 @@ export function replayActionLog() {
       state.replayStatus = { text: `回放中 (${idx + 1}/${ops.length}): ${op.title}` }
       const before = state.actionLog.length
       try {
-        if (replaySingleOp(op)) {
+        if (await replaySingleOp(op)) {
           succeeded++
           // 回放补写的记录要带上原参数，否则这条流程再导出 Python 时会整段消失
           if (op.params) {
@@ -1693,7 +1530,7 @@ export function generatePythonCode() {
   const timeCol = d.timeCol || 'timestamp'
   // 时间列可能被改过名：加载段要用文件里的原始列名，后续段落跟着改名时点换名
   let loadTimeCol = timeCol
-  state.actionLog.slice().reverse().forEach(e => {
+  wsActionLog().slice().reverse().forEach(e => {
     const rp = e.params
     if (!rp || rp.type !== 'rename_column') return
     const nk = rp.newKey || String(rp.newLabel || '').toLowerCase().replace(/[^a-z0-9_]/g, '_')
@@ -1723,7 +1560,7 @@ export function generatePythonCode() {
     section++
   }
 
-  const ops = state.actionLog.filter(e => e.params && e.params.type)
+  const ops = wsActionLog().filter(e => e.params && e.params.type)
   const done = new Set()
   // 特征列可以撤销后，同一份构建计划可能出现「建 → 撤 → 再建」。若不去掉重复构建的抑制，
   // pandas 侧就少一次建列、与界面当前列集合不符。dropsSeen 统计自上次建列块以来的撤销次数，
@@ -1731,7 +1568,215 @@ export function generatePythonCode() {
   let dropsSeen = 0
   let rebuildRound = 0
   let dftHelpers = false
-  ops.forEach(entry => {
+  // 第四步的产物（逐段填补、按解析时间戳去重、异常修复）在 pandas 里要有同一套语义，
+  // 否则脚本跑出来的数字与界面显示的不会是同一份数据。这段辅助函数只在出现第四步操作时发出。
+  let qualityHelpers = false
+  const ensureQualityHelpers = () => {
+    if (qualityHelpers) return
+    qualityHelpers = true
+    lines.push('')
+    lines.push('# ---- 质量清洗辅助函数：与后端 app/services/quality.py 逐条对齐 ----')
+    lines.push('from decimal import Decimal, ROUND_HALF_UP')
+    lines.push('')
+    lines.push('def _r4(x):')
+    lines.push('    """等价于后端 round4 / JS parseFloat(v.toFixed(4))：按二进制精确值远离 0 进位。"""')
+    lines.push("    return float(Decimal(float(x)).quantize(Decimal('0.0001'), rounding=ROUND_HALF_UP))")
+    lines.push('')
+    lines.push('def _col(series):')
+    lines.push('    """列 → list（缺失为 None），非数值单元格按缺失处理，同后端 numeric_array。"""')
+    lines.push("    return [None if pd.isna(v) else float(v) for v in pd.to_numeric(series, errors='coerce').tolist()]")
+    lines.push('')
+    lines.push('def _fill_run(vals, start, end, algo):')
+    lines.push('    """就地填补 vals[start..end] 内的空位，返回填补个数。')
+    lines.push('')
+    lines.push('    与后端 quality.fill_run 同语义：左右观测值从区间外侧查找，所以区间内的观测值不动；')
+    lines.push('    左侧没有观测值时以 0 起算（不外推也不留空），spline 用 smoothstep -2t^3+3t^2。')
+    lines.push('    """')
+    lines.push('    n = len(vals)')
+    lines.push('    start, end = max(0, start), min(n - 1, end)')
+    lines.push('    targets = [i for i in range(start, end + 1) if vals[i] is None]')
+    lines.push('    if not targets:')
+    lines.push('        return 0')
+    lines.push('    left = [i for i in range(0, start) if vals[i] is not None]')
+    lines.push('    right = [i for i in range(end + 1, n) if vals[i] is not None]')
+    lines.push('    before = left[-1] if left else None')
+    lines.push('    after = right[0] if right else None')
+    lines.push('    v_before = 0.0 if before is None else float(vals[before])')
+    lines.push('    v_after = v_before if after is None else float(vals[after])')
+    lines.push(`    if algo == 'zero':`)
+    lines.push('        for i in targets:')
+    lines.push('            vals[i] = 0.0')
+    lines.push('        return len(targets)')
+    lines.push(`    if algo == 'ffill':`)
+    lines.push('        for i in targets:')
+    lines.push('            vals[i] = v_before if before is not None else 0.0')
+    lines.push('        return len(targets)')
+    lines.push(`    if algo == 'spline':`)
+    lines.push('        length = end - start + 1')
+    lines.push('        for i in targets:')
+    lines.push('            t = (i - start + 1) / (length + 1)')
+    lines.push('            vals[i] = _r4(v_before + (v_after - v_before) * (-2 * t ** 3 + 3 * t * t))')
+    lines.push('        return len(targets)')
+    lines.push('    left_edge = before if before is not None else start - 1')
+    lines.push('    right_edge = after if after is not None else end + 1')
+    lines.push('    span = right_edge - left_edge')
+    lines.push('    for i in targets:')
+    lines.push('        pos = (i - before) if before is not None else (i - start + 1)')
+    lines.push('        ratio = pos / span if span > 1 else 0.5')
+    lines.push('        vals[i] = _r4(v_before + (v_after - v_before) * ratio)')
+    lines.push('    return len(targets)')
+    lines.push('')
+    lines.push('def _fill_all(vals, algo):')
+    lines.push('    """整列扫描缺失段并逐段填补（对应服务端 all=true 与修复时的重插值）。"""')
+    lines.push('    filled, i = 0, 0')
+    lines.push('    while i < len(vals):')
+    lines.push('        if vals[i] is None:')
+    lines.push('            j = i')
+    lines.push('            while j < len(vals) and vals[j] is None:')
+    lines.push('                j += 1')
+    lines.push('            filled += _fill_run(vals, i, j - 1, algo)')
+    lines.push('            i = j')
+    lines.push('        else:')
+    lines.push('            i += 1')
+    lines.push('    return filled')
+    lines.push('')
+    lines.push('def _dedupe(frame, time_col, keys, strategy):')
+    lines.push(`    \"\"\"重复时间戳合并：按【解析后的时间戳】分组（与后端 merge_duplicates 一致，`)
+    lines.push('    不是按显示字符串），均值写回该组首行后只保留首行；NaT 之间互相算重复。\"\"\"')
+    lines.push(`    ts = pd.to_datetime(frame[time_col], errors='coerce')`)
+    lines.push('    if not ts.duplicated().any():')
+    lines.push('        return frame, 0')
+    lines.push('    first = ~ts.duplicated()')
+    lines.push('    removed = int(frame.shape[0] - first.sum())')
+    lines.push(`    if strategy == 'mean' and keys:`)
+    lines.push('        num = pd.DataFrame({k: pd.to_numeric(frame[k], errors=\"coerce\").astype(\"float64\") for k in keys})')
+    lines.push('        means = num.groupby(ts.to_numpy(), sort=False, dropna=False).mean()')
+    lines.push('        out = frame.loc[first].copy()')
+    lines.push('        positions = list(np.flatnonzero(first.to_numpy()))')
+    lines.push('        for row, pos in enumerate(positions):')
+    lines.push('            vals = means.iloc[row]')
+    lines.push('            for key in keys:')
+    lines.push('                v = vals[key]')
+    lines.push('                if pd.isna(v):')
+    lines.push('                    continue   # 整组皆缺失：保留原值（后端同样不写）')
+    lines.push('                out.iat[pos, out.columns.get_loc(key)] = _r4(v)')
+    lines.push('        return out.reset_index(drop=True), removed')
+    lines.push(`    keep = 'first' if strategy == 'first' else 'last'`)
+    lines.push(`    return frame.loc[~ts.duplicated(keep=keep)].reset_index(drop=True), removed`)
+    lines.push('')
+    lines.push('def _threshold_mask(series, lower, upper):')
+    lines.push('    """缺失点不参与判定（与后端一致）。"""')
+    lines.push(`    arr = pd.to_numeric(series, errors='coerce').to_numpy(dtype='float64')`)
+    lines.push('    return ~np.isnan(arr) & ((arr < lower) | (arr > upper))')
+    lines.push('')
+    lines.push('def _mad_mask(series, window=33, min_periods=5, k=4.0):')
+    lines.push('    """孤立森林（近似版）= 回看窗口 MAD 判据，与后端 _mad_mask 同一段 numpy 代码。"""')
+    lines.push(`    arr = pd.to_numeric(series, errors='coerce').to_numpy(dtype='float64')`)
+    lines.push('    n = arr.size')
+    lines.push('    pad = np.concatenate((np.full(window - 1, np.nan), arr))')
+    lines.push('    windows = np.lib.stride_tricks.sliding_window_view(pad, window)[:n]')
+    lines.push('    counts = np.sum(~np.isnan(windows), axis=1)')
+    lines.push('    med = np.nanmedian(windows, axis=1)')
+    lines.push('    mad = np.nanmean(np.abs(windows - med[:, None]), axis=1)')
+    lines.push('    anchors = (counts >= min_periods) & ~np.isnan(arr)')
+    lines.push('    return anchors & ((arr < med - k * mad) | (arr > med + k * mad))')
+  }
+  // 窗口聚合与类别编码不能直接套 pandas 现成算子：rolling(min_periods) 会因窗口内有缺失而传播 NaN
+  // （后端与迁移前的浏览器实现都是「剔除缺失后按有效值聚合」）；内置 round 是银行家舍入；
+  // groupby.transform('mean') 的求和顺序也不是后端那套逐行累加。三者都会在 .005 边界上翻一个百分位，
+  // 导出的脚本就会和界面各说一遍数字，所以这里发一份与 app/services/features.py 同口径的辅助函数。
+  let featureHelpers = false
+  const ensureFeatureHelpers = () => {
+    if (featureHelpers) return
+    featureHelpers = true
+    lines.push('')
+    lines.push('# ---- 特征辅助函数：与后端 app/services/features.py 的 rolling_agg / expanding_mean / ewm_prev / build_cat 逐条对齐 ----')
+    lines.push('import math')
+    lines.push('from decimal import Decimal, ROUND_HALF_UP')
+    lines.push('')
+    lines.push('def _rh(x, nd):')
+    lines.push('    """JS 的 parseFloat(x.toFixed(nd))：按二进制精确值远离 0 进位（内置 round 是银行家舍入，不可用）。"""')
+    lines.push("    return float(Decimal(float(x)).quantize(Decimal(1).scaleb(-nd), rounding=ROUND_HALF_UP))")
+    lines.push('')
+    lines.push('def _vals(series):')
+    lines.push("    \"\"\"列 → list（缺失为 None）：非数值单元格按缺失处理，同后端 numeric_column。\"\"\"")
+    lines.push("    return [None if pd.isna(v) else float(v) for v in pd.to_numeric(series, errors='coerce').to_numpy(dtype='float64')]")
+    lines.push('')
+    lines.push('def _roll(series, w, fn):')
+    lines.push('    """窗口 = 当前行之前的 w 行（不含当前行），先剔除缺失再聚合；有效值 0 个 → NaN。"""')
+    lines.push('    vals = _vals(series)')
+    lines.push('    out = [None] * len(vals)')
+    lines.push('    for i in range(w, len(vals)):')
+    lines.push('        win, total = [], 0.0')
+    lines.push('        for v in vals[i - w:i]:')
+    lines.push('            if v is not None:')
+    lines.push('                win.append(v)')
+    lines.push('                total += v   # 逐项朴素累加：Python 3.12 的 sum() 走补偿求和，与后端 seq_sum 不等价')
+    lines.push('        cnt = len(win)')
+    lines.push('        if cnt == 0:')
+    lines.push('            continue')
+    lines.push("        if fn == 'mean':")
+    lines.push('            out[i] = _rh(total / cnt, 2)')
+    lines.push("        elif fn == 'std':")
+    lines.push('            m = total / cnt')
+    lines.push('            dev = 0.0')
+    lines.push('            for x in win:')
+    lines.push('                dev += (x - m) ** 2')
+    lines.push('            out[i] = _rh(math.sqrt(dev / cnt), 2)   # 总体标准差 ÷n')
+    lines.push("        elif fn == 'med':")
+    lines.push('            s = sorted(win)')
+    lines.push('            out[i] = _rh(s[cnt // 2] if cnt % 2 else (s[cnt // 2 - 1] + s[cnt // 2]) / 2.0, 2)')
+    lines.push("        elif fn == 'max':")
+    lines.push('            out[i] = max(win)')
+    lines.push('        else:')
+    lines.push('            out[i] = min(win)')
+    lines.push('    return out')
+    lines.push('')
+    lines.push('def _expanding_mean(series):')
+    lines.push('    """到上一行为止的全部有效值均值（不含当前行），累加顺序同后端 cumsum / JS 顺序求和。"""')
+    lines.push('    out, acc, cnt = [], 0.0, 0')
+    lines.push('    for v in _vals(series):')
+    lines.push('        out.append(_rh(acc / cnt, 2) if cnt else None)')
+    lines.push('        if v is not None:')
+    lines.push('            acc += v')
+    lines.push('            cnt += 1')
+    lines.push('    return out')
+    lines.push('')
+    lines.push('def _ewm_prev(series, span):')
+    lines.push('    """α=2/(span+1) 的递推指数加权，输出上一行的状态；缺失不衰减已有状态（等价 ignore_na=True）。"""')
+    lines.push('    alpha = 2.0 / (span + 1)')
+    lines.push('    out, prev = [], None')
+    lines.push('    for v in _vals(series):')
+    lines.push('        out.append(_rh(prev, 2) if prev is not None else None)')
+    lines.push('        if v is None:')
+    lines.push('            continue')
+    lines.push('        prev = v if prev is None else alpha * v + (1.0 - alpha) * prev')
+    lines.push('    return out')
+    lines.push('')
+    lines.push('def _cat_key(v):')
+    lines.push('    """类别取值 → 分组键：空白/缺失 → ""（不参与统计），整数值不保留 .0（同 JS String(v)）。"""')
+    lines.push("    if v is None or v is pd.NaT or v == '':")
+    lines.push("        return ''")
+    lines.push('    if isinstance(v, float) and math.isnan(v):')
+    lines.push("        return ''")
+    lines.push('    if isinstance(v, float) and v.is_integer():')
+    lines.push('        return str(int(v))')
+    lines.push('    return str(v)')
+    lines.push('')
+    lines.push('def _target_mean(frame, cat_col, target_col):')
+    lines.push('    """目标均值编码：按行序累加求均值后 _rh(...,2)，空白类别与缺失目标不参与（同后端 build_cat）。"""')
+    lines.push('    keys = [_cat_key(v) for v in frame[cat_col].to_numpy(dtype=object, copy=False)]')
+    lines.push("    tvals = [None if pd.isna(v) else float(v) for v in pd.to_numeric(frame[target_col], errors='coerce').to_numpy(dtype='float64')]")
+    lines.push('    sums, cnts = {}, {}')
+    lines.push('    for g, v in zip(keys, tvals):')
+    lines.push("        if g == '' or v is None:")
+    lines.push('            continue')
+    lines.push('        sums[g] = sums.get(g, 0.0) + v')
+    lines.push('        cnts[g] = cnts.get(g, 0) + 1')
+    lines.push('    means = {g: _rh(sums[g] / cnts[g], 2) for g in cnts}')
+    lines.push('    return [means.get(g) for g in keys]')
+  }
+  ops.forEach((entry, opNum) => {
     const p = entry.params
     if (p.type === 'rename_column' || p.type === 'feature_rename') {
       const newKey = p.newKey || String(p.newLabel || '').toLowerCase().replace(/[^a-z0-9_]/g, '_')
@@ -1777,32 +1822,49 @@ export function generatePythonCode() {
       lines.push(`# ${p.oldUnit || '无单位'} → ${p.newUnit || '新单位'}：y = ${p.factor}x${off}`)
       lines.push(`df['${p.key}'] = np.round(df['${p.key}'] * ${p.factor}${off}, 4)  # 前端用 toFixed(4)（远离 0 进位），np.round 为银行家舍入，半数值末位可能差 0.0001`)
     }
-    if (p.type === 'exo_var_add') {
-      if (!done.has('exoadd_header')) {
-        done.add('exoadd_header')
-        nextHeader('外生变量登记')
+    if (p.type === 'exo-preset' || p.type === 'exo-formula' || p.type === 'exo-file') {
+      if (!done.has('exo_header')) {
+        done.add('exo_header')
+        nextHeader('外生变量（由服务端生成/对齐，明细不经过浏览器）')
       } else {
         lines.push('')
       }
-      if (p.kind === 'formula') {
+      if (p.type === 'exo-preset') {
+        lines.push(`# 预设模板 ${p.presetKey} → 列 ${p.key}：服务端按主表时间列生成，随机源 numpy.random.default_rng(${p.seed})`)
+        lines.push(`# 生成器在 timeseries-studio-server/app/services/exo.py 的 generate_preset（模拟序列，界面上已标注）。`)
+        lines.push(`# 本脚本不复制那份生成器；需要同一列请取「导出处理结果」的宽表，从里面读 ${p.key} 列。`)
+      }
+      if (p.type === 'exo-formula') {
         const vec = pyVarFormula(p.expr, tc)
+        lines.push(`# 公式列 ${p.key} = ${p.expr}（服务端向量化求值；hour 为小数小时，weekday 按 JS 语义 0=周日）`)
         if (vec) {
-          lines.push(`# 公式 ${p.expr}（hour 为小数小时，weekday 按 JS 语义 0=周日）`)
-          lines.push(`df['${p.key}'] = np.round(${vec}, 4)  # 前端对不可得值置空，pandas 表现为 NaN`)
+          lines.push(`df['${p.key}'] = np.round(${vec}, 4)  # 不可得值置空，pandas 表现为 NaN`)
         } else {
-          lines.push(`# 公式列 ${p.key} = ${p.expr}`)
-          lines.push(`# 该公式含 &&、||、! 或三元运算，JS 的短路语义无法安全向量化，pandas 端未复现，数值请按界面为准`)
+          lines.push(`# 该公式含 &&、||、! 或三元运算，JS 的短路语义无法安全向量化，pandas 端未复现，数值请以界面为准`)
         }
-      } else if (p.kind === 'preset') {
-        lines.push(`# 预设模板列 ${p.key}（模板 ${p.presetKey}）· ${(p.data || []).length} 行`)
-        lines.push(`# 该列由前端按时间规律 + 随机扰动模拟生成（界面上已标注「模拟」），随机序列不随工程导出，`)
-        lines.push(`# pandas 端无法复现同一数值；如需保留请先在界面导出结果宽表 CSV，再从该 CSV 读取此列。`)
-      } else if (p.kind === 'file') {
-        const vars = p.vars || []
-        lines.push(`# 文件导入列：${p.fileName || '未命名文件'} → ${vars.map(v => v.key).join(', ')}（每列 ${(vars[0]?.data || []).length} 行）`)
-        lines.push(`# 数值来自用户本地文件、并按时间戳与主表对齐后的结果，原始文件不在本脚本旁边时 pandas 无法复现。`)
-        lines.push(`# 若要复现请补：other = pd.read_csv("<原文件>.csv"); other['${tc}'] = pd.to_datetime(other['${tc}'])`)
-        lines.push(`#            df = df.merge(other, on='${tc}', how='left')`)
+      }
+      if (p.type === 'exo-file') {
+        const targets = (p.targets || []).filter(t => t && t.from && t.key)
+        const mode = p.mode === 'nearest' ? 'nearest' : 'left'
+        lines.push(`# 侧表 ${p.filename}（内容指纹 sha=${p.sha}，落在后端 dataset/_exo/ 下），时间列 ${p.sideTimeCol}，对齐方式 ${mode}`)
+        if (!targets.length) {
+          lines.push(`# 日志没有记录侧表列名与主表列名的对应关系，这一列无法在脚本里复现，请从导出宽表取`)
+        } else {
+          lines.push(`side = pd.read_csv('dataset/_exo/${p.filename}')`)
+          lines.push(`side['_t'] = pd.to_datetime(side['${p.sideTimeCol}'], errors='coerce').dt.floor('s')`)
+          lines.push(`side = side.dropna(subset=['_t']).sort_values('_t').drop_duplicates('_t', keep='last')  # 同一时刻后写的行胜出`)
+          targets.forEach(t => lines.push(`side['${t.key}'] = pd.to_numeric(side['${t.from}'], errors='coerce')`))
+          lines.push(`df['_t'] = pd.to_datetime(df['${tc}'], errors='coerce').dt.floor('s')`)
+          if (mode === 'left') {
+            lines.push(`df = df.merge(side[['_t', ${targets.map(t => `'${t.key}'`).join(', ')}]], on='_t', how='left')  # 未命中的主表行留空`)
+          } else {
+            const tol = p.toleranceMinutes ? `, tolerance=pd.Timedelta('${p.toleranceMinutes}min')` : ''
+            lines.push(`df = pd.merge_asof(df.sort_values('_t'), side[['_t', ${targets.map(t => `'${t.key}'`).join(', ')}]].sort_values('_t'),`)
+            lines.push(`              left_on='_t', right_on='_t', direction='nearest'${tol})`)
+            lines.push(`# 服务端是「左右各取一个候选、距离相同取行号更小的主表行」，merge_asof 的平手规则不保证相同，边界行可能差一行`)
+          }
+          lines.push(`df = df.drop(columns=['_t'])`)
+        }
       }
     }
     if (p.type === 'mask_delete' || p.type === 'mask_delete_all') {
@@ -1832,14 +1894,6 @@ export function generatePythonCode() {
       lines.push(`df = df.set_index('${tc}').resample('${p.targetRate}').${agg}()`)
       lines.push(`df = df.reset_index().dropna(subset=['${tc}'])`)
     }
-    if (p.type === 'exo_merge' && !done.has('exo_merge')) {
-      done.add('exo_merge')
-      nextHeader('合并外生变量')
-      lines.push(`# 已合并列: ${p.vars.map(v => v.key).join(', ')}`)
-      lines.push(`# （外生变量数据已随主表合并，此处保留列）`)
-      lines.push(`exo_cols = [${p.vars.map(v => `'${v.key}'`).join(', ')}]`)
-      lines.push(`df = df[[c for c in df.columns if c in exo_cols or c == '${tc}'] + [c for c in df.columns if c not in exo_cols and c != '${tc}']]`)
-    }
     if (p.type === 'multi_calc') {
       const key = 'multi_calc:' + p.name
       if (done.has(key)) return
@@ -1853,62 +1907,112 @@ export function generatePythonCode() {
       if (p.type === 'impute_all') {
         if (done.has('impute')) return
         done.add('impute')
-        nextHeader('缺失值填补与去重')
-        lines.push(`num_cols = [c for c in df.columns if pd.api.types.is_numeric_dtype(df[c])]`)
-        lines.push(`df[num_cols] = df[num_cols].interpolate(method='linear').bfill().ffill()`)
-        lines.push(`df = df.drop_duplicates(subset=['${tc}'], keep='first')`)
+        ensureQualityHelpers()
+        nextHeader('缺失值填补与去重（服务端扫描全表）')
+        // 列清单取操作当时的数值列：事后 dtype 判断可能与界面上「可填补的列」不一致
+        const cols = (p.floatCols || []).filter(Boolean)
+        if (cols.length) lines.push(`impute_cols = [${cols.map(c => `'${c}'`).join(', ')}]`)
+        else lines.push(`impute_cols = [c for c in df.columns if c != '${tc}' and pd.api.types.is_numeric_dtype(df[c])]`)
+        lines.push(`for _c in impute_cols:`)
+        lines.push(`    _v = _col(df[_c])`)
+        lines.push(`    _fill_all(_v, '${p.defaultAlgo || 'linear'}')`)
+        lines.push(`    df[_c] = _v`)
+        if (p.dedupe) {
+          lines.push(`df, _removed = _dedupe(df, '${tc}', impute_cols, '${p.dedupe}')`)
+          lines.push(`print(f'重复时间戳合并（${p.dedupe}）：删除 {_removed} 行')`)
+        } else {
+          lines.push(`# 本次没有执行重复时间戳合并：界面勾选时服务端扫到 0 行重复`)
+        }
       } else {
         const key = 'impute:' + p.colKey
         if (done.has(key)) return
         done.add(key)
+        ensureQualityHelpers()
         if (section === 1) nextHeader('缺失值时序填补')
-        const algo = p.segments[0]?.algo || 'linear'
-        const pdMethod = algo === 'ffill' ? 'ffill' : algo === 'zero' ? 'zero' : 'linear'
-        if (pdMethod === 'zero') lines.push(`df['${p.colKey}'] = df['${p.colKey}'].fillna(0)`)
-        else if (pdMethod === 'ffill') lines.push(`df['${p.colKey}'] = df['${p.colKey}'].ffill()`)
-        else lines.push(`df['${p.colKey}'] = df['${p.colKey}'].interpolate(method='linear')`)
+        lines.push(`_v = _col(df['${p.colKey}'])`)
+        ;(p.segments || []).forEach(s => lines.push(`_fill_run(_v, ${s.startIdx}, ${s.endIdx}, '${s.algo || 'linear'}')`))
+        lines.push(`df['${p.colKey}'] = _v`)
       }
     }
-    if (p.type === 'anomaly_repair' && !done.has('anomaly')) {
-      done.add('anomaly')
-      nextHeader(`异常检测与修复（${p.repair}）`)
-      const an = p.anomaly || (state.lastAnomaly ? {
-        algo: state.lastAnomaly.algo,
-        engine: state.lastAnomaly.engine || null,
-        params: state.lastAnomaly.params || null,
-        columns: Object.entries(state.lastAnomaly.perColumn).filter(([, info]) => info.set.size > 0)
-          .map(([key, info]) => ({ key, lower: Number(info.lower), upper: Number(info.upper), count: info.set.size }))
-      } : null)
-      if (!an || an.columns.length === 0) {
-        lines.push('# 本次修复未留存检测边界数据，无可复现的判定条件')
+    // 一条修复记录 = pandas 侧一个独立步骤。不能用"整场只发一次异常块"的去重：
+    // 界面允许「检测→截断→再检测→再生成掩码」连着做，只发第一条会让导出脚本少算一步，
+    // 跑出来的列集合与界面当前帧不符。
+    if (p.type === 'anomaly_repair' && !done.has('anomaly:' + opNum)) {
+      done.add('anomaly:' + opNum)
+      const an = p.anomaly || {
+        algo: p.algo, params: p.iforest || null,
+        columns: Array.isArray(p.columns) ? p.columns : []
+      }
+      const algo = an.algo || p.algo || '3sigma'
+      const cols = (an.columns || []).filter(c => c && c.key)
+      ensureQualityHelpers()
+      nextHeader(`异常检测（${algo}）与修复（${p.repair}）`)
+      if (cols.length === 0) {
+        lines.push('# 这条记录没有留存逐列判定结果（旧版本的操作日志），无法在 pandas 端复现判定条件')
       } else {
-        const sklearn = an.engine === 'sklearn.IsolationForest'
-        if (sklearn) {
-          const contam = typeof an.params.contamination === 'number' ? an.params.contamination : "'auto'"
-          lines.push('# 检测模型与后端 /api/anomaly/iforest 完全同款（scikit-learn IsolationForest）')
+        if (algo === 'iforest_sklearn') {
+          const ip = an.params || {}
+          const contam = typeof ip.contamination === 'number' ? ip.contamination : "'auto'"
+          lines.push('# 检测模型与后端同款：scikit-learn IsolationForest 逐列一维拟合')
           lines.push('from sklearn.ensemble import IsolationForest')
           lines.push('')
-          lines.push(`def _iforest_mask(series, n_estimators=${an.params.n_estimators}, contamination=${contam}, random_state=${an.params.random_state}):`)
-          lines.push('    valid = series.dropna().to_frame()')
+          lines.push(`def _iforest_mask(series, n_estimators=${Number(ip.nEstimators) || 200}, contamination=${contam}, random_state=${Number(ip.randomState) || 42}):`)
+          lines.push(`    \"\"\"返回 (异常布尔数组, 下界, 上界)；边界取正常点的分位数，同后端 _iforest_column_mask。\"\"\"`)
+          lines.push(`    arr = pd.to_numeric(series, errors='coerce').to_numpy(dtype='float64')`)
+          lines.push('    valid = ~np.isnan(arr)')
+          lines.push('    values = arr[valid]')
           lines.push('    model = IsolationForest(n_estimators=n_estimators, contamination=contamination,')
-          lines.push('                            random_state=random_state, bootstrap=False).fit(valid)')
-          lines.push('    mask = pd.Series(False, index=series.index)')
-          lines.push('    mask.loc[valid.index] = model.predict(valid) == -1')
-          lines.push('    return mask')
-        } else {
-          lines.push(`# 检测算法：${an.algo}（以下界/上界阈值复现）`)
+          lines.push('                            random_state=random_state, bootstrap=False)')
+          lines.push('    pred = model.fit_predict(values.reshape(-1, 1))')
+          lines.push('    mask = np.zeros(arr.size, dtype=bool)')
+          lines.push('    mask[valid] = pred == -1')
+          lines.push('    normal = values[pred == 1]')
+          lines.push('    if normal.size:')
+          lines.push(`        lower, upper = float(np.quantile(normal, ${Number(ip.normalLowerQ) || 0.005})), float(np.quantile(normal, ${Number(ip.normalUpperQ) || 0.995}))`)
+          lines.push('    else:')
+          lines.push('        lower, upper = float(values.min()), float(values.max())')
+          lines.push('    return mask, _r4(lower), _r4(upper)')
+          lines.push('')
         }
-        an.columns.forEach((c, i) => {
+        if (algo === 'expr') {
+          lines.push(`# 自定义表达式：${p.expr || an.expr || '(未留存)'} —— 后端按表达式逐点判定，`)
+          lines.push('# 这里只能按检测记录到的「正常值区间」近似；表达式不是单一阈值时两者可能不同，')
+          lines.push(`# 每列注释里给出当时真实检出的点数，跑完请与之核对。`)
+        } else if (algo === 'iforest') {
+          lines.push('# 孤立森林（近似版）= 回看 33 个观测的窗口 MAD ×4，与后端 _mad_mask 同一段 numpy 代码')
+        } else {
+          lines.push(`# 判定阈值由检测时的列统计量得出（后端 ${algo}），下方为记录值`)
+        }
+        let totalRecorded = 0
+        let emitted = 0
+        cols.forEach((c, i) => {
+          totalRecorded += Number(c.count) || 0
+          const hasBounds = Number.isFinite(Number(c.lower)) && Number.isFinite(Number(c.upper)) && c.lower !== null && c.upper !== null
+          if (!hasBounds) {
+            lines.push(`# 列 ${c.key}：检测未给出可用边界（当时检出 ${c.count} 点），无法在 pandas 端复现，已跳过`)
+            return
+          }
           const lo = Number(c.lower).toFixed(4)
           const up = Number(c.upper).toFixed(4)
-          if (sklearn) lines.push(`mask_${i} = _iforest_mask(df['${c.key}'])   # 检出 ${c.count} 点`)
-          else lines.push(`mask_${i} = (df['${c.key}'] < ${lo}) | (df['${c.key}'] > ${up})   # 检出 ${c.count} 点`)
-          if (p.repair === 'clip') lines.push(`df.loc[mask_${i}, '${c.key}'] = df['${c.key}'].clip(lower=${lo}, upper=${up})`)
-          else if (p.repair === 'nan_impute') lines.push(`df.loc[mask_${i}, '${c.key}'] = np.nan`)
-          else lines.push(`df['anomaly_mask_${c.key}'] = mask_${i}.astype(int)`)
+          emitted++
+          if (algo === 'iforest_sklearn') lines.push(`mask_${i}, lo_${i}, up_${i} = _iforest_mask(df['${c.key}'])   # 检出 ${c.count} 点`)
+          else if (algo === 'iforest') lines.push(`mask_${i} = _mad_mask(df['${c.key}'])   # 检出 ${c.count} 点 · 记录边界 [${lo}, ${up}]`)
+          else lines.push(`mask_${i} = _threshold_mask(df['${c.key}'], ${lo}, ${up})   # 检出 ${c.count} 点`)
+          if (p.repair === 'clip') {
+            lines.push(`_a = pd.to_numeric(df['${c.key}'], errors='coerce').to_numpy(dtype='float64')`)
+            lines.push(`_a[mask_${i}] = np.where(_a[mask_${i}] < ${algo === 'iforest_sklearn' ? `lo_${i}` : lo}, ${algo === 'iforest_sklearn' ? `lo_${i}` : lo}, ${algo === 'iforest_sklearn' ? `up_${i}` : up})`)
+            lines.push(`df['${c.key}'] = _a`)
+          } else if (p.repair === 'nan_impute') {
+            lines.push(`_a = _col(df['${c.key}'])`)
+            lines.push(`for _i in np.flatnonzero(mask_${i}): _a[int(_i)] = None`)
+            lines.push(`_fill_all(_a, 'linear')   # 置缺失后整列重插值：该列原有的缺失段也会一起被填`)
+            lines.push(`df['${c.key}'] = _a`)
+          } else {
+            lines.push(`df['anomaly_mask_${c.key}'] = mask_${i}.astype('int64')`)
+          }
         })
-        if (p.repair === 'nan_impute') lines.push(`df = df.interpolate(method='linear')`)
-        if (p.repair === 'mask_only') lines.push(`# mask_only：仅生成布尔掩码列，原始数据未被修改`)
+        if (p.repair === 'mask_only') lines.push(`# mask_only：只加 anomaly_mask_* 列，原始数值未被修改`)
+        lines.push(`print('异常修复（${p.repair}）：本次涉及 ${totalRecorded} 个点，pandas 侧复现了 ${emitted} 列')`)
       }
     }
     if (p.type === 'mask_generate') {
@@ -1917,7 +2021,8 @@ export function generatePythonCode() {
       done.add(key)
       nextHeader(`布尔掩码 ${p.maskName}`)
       lines.push(`df['${p.maskName}'] = 0`)
-      lines.push(`df.loc[${p.startIdx}:${p.endIdx}, '${p.maskName}'] = 1`)
+      lines.push(`df.iloc[${p.startIdx}:${Number(p.endIdx) + 1}, df.columns.get_loc('${p.maskName}')] = 1`)
+      if (typeof p.onesCount === 'number') lines.push(`assert int(df['${p.maskName}'].sum()) === ${p.onesCount}   # 界面上报的置 1 行数`)
     }
     if (p.type === 'feature_build') {
       const key = 'feat:' + p.featureType + ':' + (p.detail || '')
@@ -1948,7 +2053,16 @@ export function generatePythonCode() {
         }
         dims.forEach(opt => {
           if (opt === 'holiday') {
-            lines.push(`HOLIDAYS = {${[...HOLIDAYS_2024].map(h => `'${h}'`).join(', ')}}`)
+            // 节假日表已从前端迁到后端（features.HOLIDAYS_2024 是唯一真相），脚本要能脱离本项目独立运行，
+            // 所以把 /api/health  limits 里那份清单原样抄进生成的代码；没连过后端就如实标注，不编日期。
+            const days = (state.backend.limits && state.backend.limits.holidayDates2024) || []
+            if (days.length === 0) {
+              lines.push(`# feat_holiday 依赖后端 2024 节假日表（app/services/features.py 的 HOLIDAYS_2024），当前会话未取到该表，无法生成日期集合`)
+              lines.push(`# 请先连上后端并重新探测（GET /api/health → limits.holidayDates2024），再导出本脚本`)
+              return
+            }
+            lines.push(`# 与后端 app/services/features.py 的 HOLIDAYS_2024 同一份表（${days.length} 天）`)
+            lines.push(`HOLIDAYS = {${days.map(h => `'${h}'`).join(', ')}}`)
             lines.push(`df['feat_holiday'] = df['${tc}'].dt.strftime('%Y-%m-%d').isin(HOLIDAYS).astype(int)`)
             return
           }
@@ -1967,18 +2081,18 @@ export function generatePythonCode() {
         }
       }
       if (p.featureType === 'lag_roll') {
+        ensureFeatureHelpers()
         nextHeader(`滞后与滑动窗口特征（${p.detail}）`)
         const plan = parseLagDetail(p.detail)
-        lines.push(`# 窗口类特征统一 .shift(1)：只使用当前时刻之前的数据，防止标签泄漏`)
-        lines.push(`# 注：滚动窗口内含缺失时 pandas 会传播 NaN，请先完成缺失值填补再执行本段`)
+        lines.push(`# 窗口类特征只看当前行之前的数据（等价 .shift(1)）：防止标签泄漏`)
+        lines.push(`# 窗口内有缺失时按有效值个数聚合（同后端 rolling_agg），不是 pandas rolling 的 NaN 传播`)
         plan.cols.forEach(col => {
           plan.lags.forEach(s => lines.push(`df['lag_${col}_t${s}'] = df['${col}'].shift(${s})`))
           plan.windows.forEach(w => plan.stats.forEach(fn => {
-            const agg = fn === 'std' ? '.std(ddof=0)' : `.${fn}()`
-            lines.push(`df['roll_${ROLL_STATS[fn]}_${col}_w${w}'] = df['${col}'].rolling(${w}, min_periods=${w})${agg}.shift(1)`)
+            lines.push(`df['roll_${ROLL_STATS[fn]}_${col}_w${w}'] = _roll(df['${col}'], ${w}, '${ROLL_STATS[fn]}')`)
           }))
-          if (plan.expanding) lines.push(`df['expanding_mean_${col}'] = df['${col}'].expanding().mean().shift(1)`)
-          if (plan.ewm) lines.push(`df['ewm_${col}_s${plan.ewmSpan}'] = df['${col}'].ewm(span=${plan.ewmSpan}, adjust=False).mean().shift(1)`)
+          if (plan.expanding) lines.push(`df['expanding_mean_${col}'] = _expanding_mean(df['${col}'])`)
+          if (plan.ewm) lines.push(`df['ewm_${col}_s${plan.ewmSpan}'] = _ewm_prev(df['${col}'], ${plan.ewmSpan})`)
         })
       }
       if (p.featureType === 'diff_freq') {
@@ -2050,26 +2164,35 @@ export function generatePythonCode() {
           return
         }
         if (plan.method === 'onehot') {
-          const names = catFeaturePlan(cols, 'onehot').map(it => it.key)
+          if (!Array.isArray(p.onehotKeys) || p.onehotKeys.length === 0) {
+            // 独热列名来自数据取值，浏览器不再留整表就算不出来了；构建那一次记下的键序是唯一真相
+            lines.push('# 这条记录没有留存独热列名清单（旧版本的操作日志），无法复现本次编码的列集合')
+            return
+          }
           lines.push(`# 独热列名 = <列名>_<取值>；前端保留原类别列并追加 0/1 列，所以只对副本做 get_dummies 再拼回`)
           lines.push(`# astype('object') 保证只对选中的列编码（数值型类别列也会被当作离散取值处理），缺失行全为 0，与前端一致`)
           lines.push(`_dummies = pd.get_dummies(df[[${cols.map(c => `'${c}'`).join(', ')}]].astype('object'), prefix_sep='_').astype(int)`)
-          lines.push(`df = pd.concat([df, _dummies[[${names.map(x => `'${x}'`).join(', ')}]]], axis=1)  # 按取值首次出现顺序排列，与前端宽表同序`)
+          lines.push(`df = pd.concat([df, _dummies[[${p.onehotKeys.map(x => `'${x}'`).join(', ')}]]], axis=1)  # 按取值首次出现顺序排列，与前端宽表同序`)
         } else if (plan.method === 'ordinal') {
-          lines.push(`# categories 按取值首次出现顺序编号（与前端一致，非字典序）；未登记取值 → -1`)
+          // categories 直接由 pandas 按取值首次出现顺序现算，与后端 unique_in_order 同一条规则，
+          // 不必把整列取值抄进脚本（高基数列会让导出的代码变成几千个字符串的字面量）
+          lines.push(`# 序数编号按取值首次出现顺序（非字典序）；缺失与未登记取值 → -1，与 Categorical.codes 一致`)
           cols.forEach(catCol => {
-            const uniq = [...new Set(d.data.map(r => r[catCol]).filter(v => !isMissing(v)))]
-            lines.push(`df['${catCol}_ordinal'] = df['${catCol}'].astype(pd.CategoricalDtype([${uniq.map(v => `'${v}'`).join(', ')}])).cat.codes`)
+            lines.push(`_cats_${catCol.replace(/[^0-9a-zA-Z]/g, '_')} = df['${catCol}'].dropna().drop_duplicates().tolist()`)
+            lines.push(`df['${catCol}_ordinal'] = df['${catCol}'].astype(pd.CategoricalDtype(_cats_${catCol.replace(/[^0-9a-zA-Z]/g, '_')})).cat.codes`)
           })
         } else {
-          const mainFloat = (d.columns.find(c => c.type === 'float' && c.isMain)
-            || d.columns.find(c => c.type === 'float' && !c.key.endsWith('_ordinal') && !c.key.endsWith('_target')))?.key
+          // 参照列取构建当场服务端用的那一列（isMain 优先），旧记录没有这个字段时退回同一份挑选规则
+          const mainFloat = p.targetColumn || (d.columns.find(c => c.type === 'float' && c.isMain && !c.feature)
+            || d.columns.find(c => c.type === 'float' && !c.feature && !c.key.endsWith('_ordinal') && !c.key.endsWith('_target')))?.key
           if (!mainFloat) {
             lines.push('# 目标编码需要数值目标列，当前数据无可用浮点列，前端该次构建未产出有效值')
           } else {
+            ensureFeatureHelpers()
             lines.push(`# 目标编码 = 该类别下 ${mainFloat} 的均值（有标签泄漏风险，仅供探索）`)
+            lines.push(`# 组均值按行序累加后再取 2 位（同后端 build_cat）；pandas 的 groupby.transform('mean') 求和顺序不同，边界上会差一个百分位`)
             cols.forEach(catCol => {
-              lines.push(`df['${catCol}_target'] = df.groupby('${catCol}')['${mainFloat}'].transform('mean').round(2)`)
+              lines.push(`df['${catCol}_target'] = _target_mean(df, '${catCol}', '${mainFloat}')`)
             })
           }
         }
@@ -2079,7 +2202,7 @@ export function generatePythonCode() {
   })
 
   // 切分是收尾动作：按最后一次真实设置的比例，在最终矩阵上发射
-  const splits = state.actionLog.filter(e => e.params && e.params.type === 'split')
+  const splits = ops.filter(e => e.params.type === 'split')
   if (splits.length > 0) {
     const ratio = splits[splits.length - 1].params.ratio
     nextHeader(`训练/验证/测试切分（训练 ${ratio}%，时序不打乱）`)
@@ -2089,7 +2212,7 @@ export function generatePythonCode() {
     lines.push(`test  = df.iloc[${s.train + s.val}:]`)
   }
 
-  const exported = state.actionLog.filter(e => e.params && e.params.type === 'export')
+  const exported = ops.filter(e => e.params.type === 'export')
   if (exported.length > 0) {
     nextHeader('导出清洗结果')
     exported.forEach(e => {
@@ -2115,260 +2238,264 @@ function pyStrftime(fmt) {
 }
 
 // ============================================================
-// 撤销 / 重做 / 会话持久化（快照式）
+// 撤销 / 重做：服务端命令日志的游标就是历史
 // ============================================================
-// 为什么是快照而不是逐条逆操作：本工作区过半动作不可逆（重采样、批量填补、撤销特征列、
-// 掩码抹除），给每个操作补 inverse 一定会漏，漏掉的那条就是"撤销完数据悄悄错掉"。
-// 代价是内存，所以设了单元格护栏：超限的数据集不建撤销点，并把这个决定当面告诉用户。
-const HISTORY_LIMIT = 25
-const SNAPSHOT_CELL_LIMIT = 400000
-// 撤销栈双重限长：只按条数限的话，25 份 40 万格快照就是千万格，内存会失控，
-// 所以再加一条总单元格预算，超预算从最旧的撤销点开始丢。
-const HISTORY_CELL_BUDGET = 1500000
-const SESSION_KEY = 'tss.session.v1'
-
-let undoStack = []
-let redoStack = []
-let baseline = null      // 永远等于"当前状态"的快照；下一次变更时它就是撤销目标
-let baselineCells = 0
-let applying = false     // 还原快照自身会 bump dataVersion，必须让 watcher 跳过这一次
-let lastLogLen = 0
-
-function trimHistory(stack) {
-  while (stack.length > HISTORY_LIMIT) stack.shift()
-  let total = stack.reduce((n, e) => n + (e.cells || 0), 0)
-  while (stack.length > 1 && total > HISTORY_CELL_BUDGET) total -= (stack.shift().cells || 0)
-}
-
-function cellCount() {
+// 旧做法是在浏览器压快照栈（每步一份元数据 + 页窗口 + 审计记录）。搬到服务端后它既没必要、
+// 也留不住：明细帧与命令日志都在后端工作区里，游标本身就是历史。于是
+//   · 撤销 = POST /restore {version: cursor-1}，重做 = cursor+1，一次网络请求换一步；
+//   · 撤销跨页面刷新、甚至跨后端重启都成立（日志落盘 + 按日志重放，重启后第一次 GET 就把帧重建出来）；
+//   · 大表上的快照内存与 localStorage 配额问题（审计项 7）连根消失。
+async function restoreTo(version, verb) {
   const d = ds()
-  return d && d.data ? d.data.length * d.columns.length : 0
-}
-
-// 不能用 structuredClone：state 是 reactive 的，取出来的 features/masks/... 是 Proxy，
-// 浏览器会以 DataCloneError 拒绝克隆（实测会让 mounted 与 watcher 双双抛错、撤销点全丢）。
-// 这里自己按层 toRaw 解开，顺带保住 Set / Date 这两类 JSON 存不下的值。
-function deepClone(v) {
-  const raw = toRaw(v)
-  if (raw === null || typeof raw !== 'object') return raw
-  if (raw instanceof Date) return new Date(raw.getTime())
-  if (raw instanceof Set) return new Set(Array.from(raw, deepClone))
-  if (raw instanceof Map) return new Map(Array.from(raw, ([k, x]) => [deepClone(k), deepClone(x)]))
-  if (Array.isArray(raw)) return raw.map(deepClone)
-  const o = {}
-  for (const k of Object.keys(raw)) o[k] = deepClone(raw[k])
-  return o
-}
-
-function takeSnapshot() {
-  return deepClone({
-    currentKey: state.currentKey,
-    splitRatio: state.splitRatio,
-    datasets,
-    exoVars: state.exoVars,
-    derivedCols: state.derivedCols,
-    masks: state.masks,
-    features: state.features,
-    imputeSegAlgos: state.imputeSegAlgos,
-    lastAnomaly: state.lastAnomaly,
-    actionLog: state.actionLog
-  })
-}
-
-// 还原时一律再克隆一份：活数据不能与快照共用同一个对象，否则下一次修改会改写历史
-function restoreSnapshot(s) {
-  const restored = deepClone(s)
-  Object.keys(datasets).forEach(k => { delete datasets[k] })
-  Object.assign(datasets, restored.datasets)
-  state.currentKey = restored.currentKey
-  state.splitRatio = restored.splitRatio
-  lastLoggedSplit = restored.splitRatio
-  state.exoVars = restored.exoVars
-  state.derivedCols = restored.derivedCols
-  state.masks = restored.masks
-  state.features = restored.features
-  state.imputeSegAlgos = restored.imputeSegAlgos
-  state.lastAnomaly = restored.lastAnomaly
-  state.actionLog = restored.actionLog
-}
-
-function syncHistoryCounters() {
-  state.history.undo = undoStack.length
-  state.history.redo = redoStack.length
-  state.history.undoLabel = undoStack.length ? undoStack[undoStack.length - 1].label : ''
-  state.history.redoLabel = redoStack.length ? redoStack[redoStack.length - 1].label : ''
-}
-
-// flush: 'sync' 是必需的——applying 标志只在 touch() 的那一帧有效，
-// 默认的 pre 调度会在标志复位之后才回调，撤销自身就会被记成一个新的撤销点
-let coalescing = false
-
-// 一次用户操作的收尾（微任务）：store 里 touch() 与 logAction() 的先后顺序不统一（重命名就是
-// 先改数据再记录），所以撤销点的标题要等记录写完再取，baseline 也要等到这一刻才是"操作结束态"。
-// 若沿用同步重取 baseline，下一个撤销点会少掉上一条操作，撤销时会连带丢审计记录。
-function finalizeHistoryPoint() {
-  coalescing = false
-  const top = undoStack[undoStack.length - 1]
-  if (top && top.fromLogLen <= state.actionLog.length) {
-    const written = state.actionLog.slice(top.fromLogLen)
-    if (written.length) top.label = written[written.length - 1].title
+  if (!d?.wsId) { toast('warning', '还没有载入数据集'); return false }
+  if (!requireBackend(verb)) return false
+  const target = Number(version)
+  if (!Number.isInteger(target) || target < 0) return false
+  const label = verb === '撤销' ? state.history.undoLabel : state.history.redoLabel
+  // 服务端按日志把帧重放到目标版本，浏览器只换一份 meta + 页窗口，绝不保留另一套历史
+  state.busy = `${verb}：正在把后端工作区重放到第 ${target} 版…`
+  try {
+    const resp = await ws.wsRestore(d.wsId, target, d.page?.limit ?? PAGE_SIZE)
+    applyMeta(d, resp.meta)
+    applyPage(d, resp.page)
+    // restore 会清掉服务端的检测结果与诊断缓存：界面这两份投影必须同步作废，
+    // 否则第四步会拿着"上一版帧"的缺失段继续画图
+    state.lastAnomaly = null
+    state.quality = { wsId: '', version: -1, data: null, loading: false, error: '' }
+    invalidateSeries()
+    touch()
+    toast('success', `${verb}${label ? `：${label}` : ''} · 工作区 ${d.wsId} 现在在第 ${resp.meta.version} 版` +
+      `（${resp.meta.rowCount.toLocaleString()} 行 × ${resp.meta.colCount} 列）`)
+    return true
+  } catch (e) {
+    toast('error', `${verb}失败：${e.message}`)
+    return false
+  } finally {
+    state.busy = ''
   }
-  baseline = takeSnapshot()
-  baselineCells = cellCount()
-  lastLogLen = state.actionLog.length
-  syncHistoryCounters()
-  scheduleSessionSave()
 }
-
-watch(() => state.dataVersion, () => {
-  if (applying) return
-  const cells = cellCount()
-  if (cells > SNAPSHOT_CELL_LIMIT) {
-    if (state.history.enabled) {
-      state.history.enabled = false
-      toast('warning', `当前 ${cells.toLocaleString()} 单元格超过撤销快照上限 ${SNAPSHOT_CELL_LIMIT.toLocaleString()}，` +
-        `本数据集不再记录撤销点（大数组的增量快照需另做，见性能项）`)
-    }
-    undoStack = []; redoStack = []; baseline = null; baselineCells = 0
-    syncHistoryCounters()
-    return
-  }
-  state.history.enabled = true
-  // 一次用户操作里可能连着多次 touch（多列批量处理），撤销粒度必须是"操作"而不是"touch 次数"，
-  // 否则会出现按一次撤销什么都没变。微任务结束前都算同一次操作。
-  if (coalescing) return
-  if (!baseline) { finalizeHistoryPoint(); return }
-  undoStack.push({ label: '数据变更', fromLogLen: lastLogLen, snap: baseline, cells })
-  trimHistory(undoStack)
-  redoStack = []
-  coalescing = true
-  queueMicrotask(finalizeHistoryPoint)
-}, { flush: 'sync' })
 
 export function undo() {
-  const entry = undoStack.pop()
-  if (!entry) { toast('info', '没有可撤销的变更'); return false }
-  // 用当前活状态开一份"重做用"快照，不能拿 baseline 顶替：baseline 是上一次操作结束时的状态，
-  // 对先改数据后写记录的操作来说，它还缺这条操作的审计记录。
-  const current = takeSnapshot(), currentCells = cellCount()
-  applying = true
-  restoreSnapshot(entry.snap)
-  // 快照可能来自"第五步还没打开过"的时刻，登记表要按真实列补齐，否则特征预览会显示 0 列
-  initFeatureList()
-  touch()
-  applying = false
-  redoStack.push({ label: entry.label, snap: current, cells: currentCells })
-  trimHistory(redoStack)
-  baseline = entry.snap
-  baselineCells = entry.cells
-  lastLogLen = state.actionLog.length
-  syncHistoryCounters()
-  scheduleSessionSave()
-  toast('success', `已撤销：${entry.label}`)
-  return true
+  if (!state.history.canUndo) { toast('info', '没有可撤销的变更'); return Promise.resolve(false) }
+  return restoreTo(state.history.version - 1, '撤销')
 }
 
 export function redo() {
-  const entry = redoStack.pop()
-  if (!entry) { toast('info', '没有可重做的变更'); return false }
-  const current = takeSnapshot(), currentCells = cellCount()
-  applying = true
-  restoreSnapshot(entry.snap)
-  initFeatureList()
-  touch()
-  applying = false
-  undoStack.push({ label: entry.label, snap: current, cells: currentCells })
-  trimHistory(undoStack)
-  baseline = entry.snap
-  baselineCells = entry.cells
-  lastLogLen = state.actionLog.length
-  syncHistoryCounters()
-  scheduleSessionSave()
-  toast('success', `已重做：${entry.label}`)
-  return true
+  if (!state.history.canRedo) { toast('info', '没有可重做的变更'); return Promise.resolve(false) }
+  return restoreTo(state.history.version + 1, '重做')
 }
 
-// ---- 会话持久化：浏览器本地存储，重启页面后询问是否恢复 ----
-// 只存"当前状态"，不存撤销栈（体积翻倍且跨会话无意义）；
-// lastAnomaly 里有 Set 与检测结果，JSON 存不下，因此不随会话恢复，重跑一次检测即可。
-let saveTimer = null
-function scheduleSessionSave() {
-  if (!state.session.enabled) return
-  clearTimeout(saveTimer)
-  saveTimer = setTimeout(saveSession, 800)
-}
+// ============================================================
+// 会话：上次打开了什么、停在哪一步，由服务端记住
+// ============================================================
+// 浏览器只交出 UI 层状态（步骤、切分比例、审计记录、掩码/填补配置）和它引用了哪些 wsId；
+// "这些工作区此刻还活着吗、在第几版"由 GET /api/session 当场按命令日志重建出来。
+// 于是横幅上那句「上次会话」是一句有依据的陈述，而不是本地一份可能早就过期的承诺。
+const SESSION_SAVE_DEBOUNCE = 700
 
-export function saveSession() {
-  if (!state.session.enabled || !baseline) return false
-  // 存"当前活状态"而不是 baseline：baseline 可能是上一次操作结束时的快照，
-  // 对先改数据后写记录的操作会少一条审计记录。
-  const snap = takeSnapshot()
-  snap.lastAnomaly = null
+function sessionPayload() {
   const d = ds()
-  const payload = JSON.stringify({
-    version: 1,
-    savedAt: new Date().toISOString(),
+  const loaded = Object.entries(datasets).filter(([, x]) => x?.wsId)
+  return {
+    step: state.currentStep,
+    currentKey: state.currentKey,
+    // 服务端按 0..1 校验切分比例，界面这一份是百分数
+    splitRatio: (state.splitRatio || 70) / 100,
+    workspaces: loaded.map(([key, x]) => ({ key, wsId: x.wsId, version: x.meta?.version ?? null })),
+    actionLog: state.actionLog,
     meta: {
-      name: d?.name || '', rows: d?.data?.length || 0, cols: d?.columns?.length || 0,
-      ops: snap.actionLog.length, step: state.currentStep
+      name: d?.name || '', rows: d?.meta?.rowCount || 0, cols: d?.columns?.length || 0,
+      wsId: d?.wsId || '', version: d?.meta?.version ?? null,
+      ops: state.actionLog.length, step: state.currentStep
     },
-    snap
-  })
+    derivedCols: state.derivedCols,
+    masks: state.masks,
+    imputeSegAlgos: state.imputeSegAlgos,
+    // 纯界面状态：服务端不理解，只在 GET 时原样回吐
+    ui: {
+      names: Object.fromEntries(loaded.map(([k, x]) => [k, x.name])),
+      formats: Object.fromEntries(loaded.map(([k, x]) => [k, x.format])),
+      page: d?.page ? { key: state.currentKey, offset: d.page.offset, limit: d.page.limit } : null
+    }
+  }
+}
+
+let sessionTimer = null
+
+export function scheduleSessionSave() {
+  if (!state.session.enabled || !state.backend.online) return
+  clearTimeout(sessionTimer)
+  sessionTimer = setTimeout(() => { saveSession() }, SESSION_SAVE_DEBOUNCE)
+}
+
+export async function saveSession() {
+  if (!state.session.enabled || !state.backend.online) return false
+  const payload = sessionPayload()
+  if (!payload.workspaces.length && !payload.actionLog.length) return false
+  state.session.saving = true
   try {
-    localStorage.setItem(SESSION_KEY, payload)
-    state.session.savedAt = new Date().toLocaleTimeString()
+    const r = await ws.sessionSet(payload)
+    state.session.savedAt = r.savedAt || ''
+    state.session.error = ''
     return true
   } catch (e) {
-    state.session.enabled = false
-    toast('warning', e.name === 'QuotaExceededError'
-      ? '浏览器本地存储配额已满，会话持久化已关闭；请改用「导出流程」JSON + 重新导入数据集复现'
-      : `会话持久化写入失败：${e.message}`)
+    // 服务端的三条守卫（条数 / 体积 / 不许携带整列）拒绝时必须说清楚，
+    // 不能像旧版配额写满那样静默关掉持久化——那样用户会以为自己已经存过了
+    state.session.error = e.message || '写入失败'
+    toast('warning', `会话未保存：${state.session.error}`)
     return false
+  } finally {
+    state.session.saving = false
   }
 }
 
 let pendingSession = null
 
-// 页面启动时调用：只读出元信息挂成一条询问，不擅自把工作区替换掉
-export function initHistoryAndSession() {
-  baseline = cellCount() <= SNAPSHOT_CELL_LIMIT ? takeSnapshot() : null
-  baselineCells = baseline ? cellCount() : 0
-  lastLogLen = state.actionLog.length
-  syncHistoryCounters()
-  let raw = null
-  try { raw = localStorage.getItem(SESSION_KEY) } catch (e) { state.session.enabled = false; return }
-  if (!raw) return
-  let parsed
-  try { parsed = JSON.parse(raw) } catch (e) { clearSession(); return }
-  if (!parsed || !parsed.snap || parsed.version !== 1) { clearSession(); return }
-  pendingSession = parsed
-  state.session.found = { ...parsed.meta, savedAt: parsed.savedAt }
+// 页面启动时调用：只问不擅自替换。GET 会顺带把会话引用的工作区按日志重建/核对一遍。
+export async function initSession() {
+  if (!state.backend.online) await ws.checkBackend()
+  if (!state.backend.online) {
+    state.session.enabled = false
+    state.session.error = `后端未连接（${ws.API_BASE}），会话存在服务端，此时无从查询`
+    return
+  }
+  let doc
+  try {
+    doc = await ws.sessionGet()
+  } catch (e) {
+    state.session.error = e.message || '读取失败'
+    return
+  }
+  state.session.enabled = true
+  state.session.stateDir = doc.stateDir || ''
+  state.session.workspaces = doc.workspaces || []
+  if (!doc.exists) { pendingSession = null; state.session.found = null; return }
+  const list = doc.workspaces || []
+  // GET 的响应分两层：外层是服务端当场核对出来的（exists/savedAt/meta/workspaces/stateDir），
+  // 界面状态整体躺在 snap 里。恢复要读的是 snap 那一份，混着取会拿到 undefined。
+  const snap = doc.snap || {}
+  pendingSession = { ...snap, savedAt: doc.savedAt, meta: doc.meta || {},
+                     workspaces: list, stateDir: doc.stateDir || '' }
+  const main = list.find(w => w.wsId === (doc.meta?.wsId)) || list[0] || {}
+  state.session.savedAt = doc.savedAt || ''
+  state.session.found = {
+    name: main.name || doc.meta?.name || '未知数据集',
+    rows: main.rowCount ?? doc.meta?.rows ?? 0,
+    cols: doc.meta?.cols ?? 0,
+    ops: doc.meta?.ops ?? (snap.actionLog || []).length,
+    step: snap.step || 1,
+    savedAt: doc.savedAt || '',
+    wsId: main.wsId || '',
+    version: main.version ?? null,
+    alive: !!main.alive,
+    reason: main.reason || '',
+    drift: main.versionDrift || null,
+    workspaces: list,
+    stateDir: doc.stateDir || ''
+  }
 }
 
-export function restoreSession() {
-  if (!pendingSession) return false
-  const s = pendingSession
-  applying = true
-  restoreSnapshot({ ...s.snap, lastAnomaly: null })
-  initFeatureList()
+function applySessionUi(doc) {
+  const ui = doc.ui || {}
+  Object.entries(ui.names || {}).forEach(([k, name]) => {
+    if (datasets[k]) datasets[k].name = name
+  })
+  state.actionLog = (doc.actionLog || []).map(e => ({ ...e }))
+  state.derivedCols = doc.derivedCols || []
+  state.masks = doc.masks || []
+  state.imputeSegAlgos = doc.imputeSegAlgos || {}
+  // 直接赋值而不是走 setSplitRatio：恢复不是用户拖动滑杆，不该凭空多一条审计记录
+  state.splitRatio = Math.round((doc.splitRatio ?? 0.7) * 100)
+  lastLoggedSplit = state.splitRatio
+  if (doc.currentKey && datasets[doc.currentKey]) state.currentKey = doc.currentKey
+  state.currentStep = doc.step || 1
+}
+
+// 工作区在后端日志里没了（被淘汰、或那份来源文件已删）：UI 状态照旧恢复，
+// 但绝不能留着旧行号旧统计冒充"还有数据"——那是把不存在的工作区画在屏幕上。
+function detachDeadWorkspace(key) {
+  const d = datasets[key]
+  if (!d) return
+  d.wsId = ''
+  d.overview = null
+  d.meta = null
+  d.page = { offset: 0, limit: PAGE_SIZE, total: 0, columns: d.page?.columns || [], rows: [] }
+}
+
+export async function restoreSession() {
+  if (!pendingSession) {
+    await initSession()
+    if (!pendingSession) { toast('info', '没有可恢复的服务端会话'); return false }
+  }
+  const doc = pendingSession
+  const list = doc.workspaces || []
+  const alive = list.filter(w => w.alive)
+  applySessionUi(doc)
+  state.busy = '正在按服务端命令日志恢复工作区…'
+  const restored = []
+  const failed = []
+  try {
+    for (const w of list) {
+      if (!w.alive) { detachDeadWorkspace(w.key); failed.push(w); continue }
+      const d = datasets[w.key] || (datasets[w.key] = blankDataset(w.key))
+      const pg = doc.ui?.page
+      const offset = pg && pg.key === w.key ? pg.offset : 0
+      const limit = pg && pg.key === w.key ? pg.limit : PAGE_SIZE
+      try {
+        // /rows 一次拿回 meta + 页窗口：meta 里的游标就是服务端此刻的真实版本
+        const resp = await ws.wsRows(w.wsId, offset, limit)
+        d.name = w.name || d.name
+        applyMeta(d, resp.meta)
+        applyPage(d, resp.page)
+        restored.push({ w, meta: resp.meta })
+      } catch (e) {
+        detachDeadWorkspace(w.key)
+        failed.push({ ...w, reason: e.message })
+      }
+    }
+  } finally {
+    state.busy = ''
+  }
+  state.lastAnomaly = null
+  state.quality = { wsId: '', version: -1, data: null, loading: false, error: '' }
+  invalidateSeries()
   touch()
-  applying = false
-  baseline = takeSnapshot()
-  baselineCells = cellCount()
-  undoStack = []; redoStack = []
-  lastLogLen = state.actionLog.length
-  syncHistoryCounters()
-  switchStep(s.meta?.step || 1)
-  const t = new Date(s.savedAt)
-  toast('success', `已恢复上次会话：${s.meta.name} · ${s.meta.rows.toLocaleString()} 行 × ${s.meta.cols} 列 · ${s.meta.ops} 条操作` +
-    `（保存于 ${isNaN(t.getTime()) ? '' : t.toLocaleString()}，异常检测结果与撤销栈不跨会话）`)
+  const drift = restored.find(r => r.w.versionDrift)
+  const m = doc.meta || {}
+  if (restored.length) {
+    const main = restored.find(r => r.w.key === state.currentKey) || restored[0]
+    toast('success', `已恢复服务端会话：${main.w.name} · 第 ${main.meta.version} 版 · ` +
+      `${main.meta.rowCount.toLocaleString()} 行 × ${main.meta.colCount} 列 · ${m.ops ?? 0} 条操作` +
+      (drift ? `（会话记的是第 ${drift.w.versionDrift.sessionSays} 版，服务端日志已走到第 ${drift.w.versionDrift.serverSays} 版，` +
+        `以服务端为准；撤销栈就是那段日志，照旧可用）` : '') +
+      (failed.length ? `；${failed.length} 个工作区已不在服务端` : '') +
+      `（会话与命令日志都在 ${doc.stateDir || '服务端状态目录'}）`)
+  } else {
+    toast('warning', `已恢复会话配置（${m.ops ?? 0} 条操作 · ${m.name || '未知数据集'}），` +
+      `但服务端已经没有这些工作区的命令日志：${failed.map(f => `${f.wsId}（${f.reason || '已不存在'}）`).join('、') || '（无）'}，` +
+      `请回第一步重新载入数据后再继续`)
+  }
   pendingSession = null
   state.session.found = null
   return true
 }
 
-export function clearSession() {
+export async function clearSession() {
   pendingSession = null
   state.session.found = null
-  try { localStorage.removeItem(SESSION_KEY) } catch (e) { /* 隐私模式下写入本就不可用 */ }
+  state.session.workspaces = []
+  if (!state.backend.online) { state.session.error = '后端未连接，无法清除服务端会话'; return false }
+  try {
+    await ws.sessionClear()
+    state.session.error = ''
+    return true
+  } catch (e) {
+    state.session.error = e.message || '清除失败'
+    toast('error', `清除服务端会话失败：${state.session.error}`)
+    return false
+  }
 }
+
+// 界面状态一变（执行命令、翻页、换数据集）就 Debounce 存一次会话。
+// 撤销/重做同样走这里：服务端游标变了，会话记的 version 就该跟着变。
+watch(() => state.dataVersion, () => scheduleSessionSave())

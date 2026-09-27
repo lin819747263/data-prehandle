@@ -2,13 +2,12 @@
 import { computed, ref, onMounted, onUnmounted } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import {
-  state, ds, touch, switchStep, toast, generateSyntheticData, logAction,
+  state, ds, touch, switchStep, toast, logAction, rowCount,
   LOG_STEP_META, LOG_ICONS, exportActionLog, importActionLog,
-  replayActionLog, clearImportedLog, generatePythonCode,
-  undo, redo, initHistoryAndSession, restoreSession, clearSession
+  replayActionLog, clearImportedLog, generatePythonCode, visibleActionLog,
+  undo, redo, initSession, restoreSession, clearSession
 } from './store'
-import { exportDatasetCSV, exportDatasetExcel } from './utils'
-import { checkBackend, exportViaBackend, API_BASE } from './api'
+import { checkBackend, wsExport, API_BASE } from './api'
 import Step1Load from './components/Step1Load.vue'
 import Step2Config from './components/Step2Config.vue'
 import Step3Explore from './components/Step3Explore.vue'
@@ -28,7 +27,15 @@ const currentComponent = computed(() => stepComponents[state.currentStep])
 
 // 依赖 dataVersion 使大数据变化后表头指标刷新
 const dsName = computed(() => { void state.dataVersion; return ds()?.name || '未加载数据' })
-const logCount = computed(() => state.actionLog.length)
+// 整表行数来自后端 meta，不依赖浏览器是否缓存了明细
+const dsTag = computed(() => {
+  void state.dataVersion
+  const d = ds()
+  if (!d?.wsId) return '未加载数据'
+  return `${d.name} · 整表 ${rowCount().toLocaleString()} 行 × ${d.columns.length} 列 · 工作区 ${d.wsId} v${d.meta?.version ?? 0}`
+})
+const logCount = computed(() => visibleActionLog().length)
+const hasWorkspace = computed(() => { void state.dataVersion; return !!ds()?.wsId })
 
 // ---- 操作记录抽屉 ----
 const filters = [
@@ -39,11 +46,13 @@ const filters = [
   { key: '4', label: '④ 清洗' },
   { key: '5', label: '⑤ 特征' }
 ]
+// 审计链是服务端命令日志在界面上的投影：撤销掉的条目（游标之后）不该继续显示成"当前数据的历史"
 const groupedLog = computed(() => {
   void state.dataVersion
+  const all = visibleActionLog()
   const filtered = state.logFilter === 'all'
-    ? state.actionLog
-    : state.actionLog.filter(a => String(a.step) === state.logFilter)
+    ? all
+    : all.filter(a => String(a.step) === state.logFilter)
   const groups = {}
   filtered.forEach(e => { (groups[e.step] = groups[e.step] || []).push(e) })
   return Object.keys(groups).map(Number).sort((a, b) => a - b).map(n => ({ n, meta: LOG_STEP_META[n], items: groups[n] }))
@@ -53,12 +62,13 @@ function iconOf(name) { return LOG_ICONS[name] || 'fa-circle-dot' }
 function setFilter(k) { state.logFilter = k }
 
 async function clearLog() {
-  if (state.actionLog.length === 0) return
+  const shown = visibleActionLog().length
+  if (shown === 0) return
   try {
-    await ElMessageBox.confirm('确定清空全部操作历史？', '清空确认', { type: 'warning' })
+    await ElMessageBox.confirm(`确定清空界面上的 ${shown} 条操作记录？服务端工作区的命令日志与撤销栈不受影响`, '清空确认', { type: 'warning' })
     state.actionLog = []
     clearImportedLog()
-    // 不 touch 的话抽屉不会刷新（列表依赖 dataVersion），而且这次清空也进不了撤销链
+    // 不 touch 的话抽屉不会刷新（列表依赖 dataVersion），会话也不会跟着瘦身
     touch()
   } catch (e) { /* 取消 */ }
 }
@@ -82,28 +92,62 @@ function copyCode() {
 }
 
 // ---- 后端连接状态 ----
-const backendTitle = computed(() => state.backend.online
+const backendTitle = computed(() => (state.backend.online
   ? `FastAPI 后端在线：${API_BASE} · 能力 ${state.backend.capabilities.join(' / ')} · 最近探测 ${state.backend.checkedAt}（点击重新探测）`
-  : `后端未连接（${API_BASE}）：${state.backend.error || '未知原因'} · Parquet/Feather 解析导出与 sklearn 完整版孤立森林不可用（点击重试）`)
+  : `后端未连接（${API_BASE}）：${state.backend.error || '未知原因'} · 整表计算、数据加工与四种格式的宽表导出都在服务端，工作台此时只读（点击重试）`)
+  + ` · 会话：${sessionLine.value}`)
+// 会话存在服务端（PUT /api/session），这里这一句必须说清它此刻到底在不在
+const sessionLine = computed(() => {
+  if (!state.session.enabled) return `未启用（${state.session.error || '后端未连接'}）`
+  if (state.session.saving) return '写入中…'
+  if (state.session.error) return `上次写入被服务端拒绝：${state.session.error}`
+  return state.session.savedAt
+    ? `已写入 ${state.session.stateDir || '服务端状态目录'} · ${state.session.savedAt}`
+    : '尚无写入（做过一步操作后自动保存）'
+})
 
-// ---- 撤销 / 重做 ----
-const canUndo = computed(() => state.history.enabled && state.history.undo > 0)
-const canRedo = computed(() => state.history.enabled && state.history.redo > 0)
+// ---- 撤销 / 重做：按纽上的计数就是服务端命令日志的游标 ----
+const canUndo = computed(() => state.history.canUndo)
+const canRedo = computed(() => state.history.canRedo)
 const undoTitle = computed(() => canUndo.value
-  ? `撤销「${state.history.undoLabel}」（Ctrl+Z），当前 ${state.history.undo} 步可撤销`
-  : (state.history.enabled ? '没有可撤销的变更' : '撤销已关闭：当前数据量超过快照上限，见提示'))
+  ? `撤销「${state.history.undoLabel}」（Ctrl+Z）：让后端工作区回到第 ${state.history.version - 1} 版（按命令日志重放），` +
+    `重做栈还有 ${state.history.redo} 步`
+  : '后端工作区已在第 0 版（原始数据），没有可撤销的变更')
 const redoTitle = computed(() => canRedo.value
-  ? `重做「${state.history.redoLabel}」（Ctrl+Y），当前 ${state.history.redo} 步可重做`
-  : (state.history.enabled ? '没有可重做的变更' : '撤销已关闭：当前数据量超过快照上限，见提示'))
+  ? `重做「${state.history.redoLabel}」（Ctrl+Y）：后端工作区回到第 ${state.history.version + 1} 版，共 ${state.history.opsTotal} 条命令日志`
+  : '没有可重做的变更')
 
 // 输入框里的 Ctrl+Z 是原生文字撤销，不能被工作区撤销抢走
+// 撤销/重做要向后端回滚工作区帧，是网络操作，必须防连点
+const histBusy = ref(false)
+async function runUndo() {
+  if (histBusy.value) return
+  histBusy.value = true
+  try { await undo() } finally { histBusy.value = false }
+}
+async function runRedo() {
+  if (histBusy.value) return
+  histBusy.value = true
+  try { await redo() } finally { histBusy.value = false }
+}
+async function runRestoreSession() {
+  if (histBusy.value) return
+  histBusy.value = true
+  try { await restoreSession() } finally { histBusy.value = false }
+}
+async function runClearSession() {
+  if (histBusy.value) return
+  histBusy.value = true
+  try { await clearSession() } finally { histBusy.value = false }
+}
+
 function onKeydown(ev) {
   if (!(ev.ctrlKey || ev.metaKey) || ev.altKey) return
   const t = ev.target
   if (t && (t.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(t.tagName))) return
   const k = ev.key.toLowerCase()
-  if (k === 'z' && !ev.shiftKey) { ev.preventDefault(); undo() }
-  else if (k === 'y' || (k === 'z' && ev.shiftKey)) { ev.preventDefault(); redo() }
+  if (k === 'z' && !ev.shiftKey) { ev.preventDefault(); runUndo() }
+  else if (k === 'y' || (k === 'z' && ev.shiftKey)) { ev.preventDefault(); runRedo() }
 }
 
 // ---- 本地会话恢复 ----
@@ -113,49 +157,42 @@ const sessionWhen = computed(() => {
 })
 
 // ---- 导出结果模态 ----
-const exportDataset = computed(() => {
-  void state.dataVersion
-  const d = ds()
-  if (!d) return null
-  const extra = state.features
-    .filter(f => !d.columns.some(c => c.key === f.key))
-    .map(f => ({ key: f.key, label: f.label, type: 'float' }))
-  return { ...d, columns: [...d.columns, ...extra] }
-})
-const exportRows = computed(() => exportDataset.value?.data?.length || 0)
-const exportCols = computed(() => exportDataset.value?.columns?.length || 0)
+// 宽表直出：明细留在后端工作区，浏览器只触发下载并记下真实字节数（不再有整表物化这一层）
+const EXPORT_FORMATS = { csv: 'CSV', xlsx: 'EXCEL', parquet: 'PARQUET', feather: 'FEATHER' }
+const exportCols = computed(() => { void state.dataVersion; return ds()?.columns?.length || 0 })
 const exporting = ref('')
+
 async function doExport(kind) {
-  const d = exportDataset.value
-  if (!d || d.data.length === 0) { toast('warning', '当前没有可导出的数据'); return }
-  if (kind === 'csv') { exportDatasetCSV(d, 'cleaned'); return }
-  if (kind === 'xlsx') { exportDatasetExcel(d, 'features'); return }
   if (kind === 'py') { state.showCodeModal = true; state.showExportModal = false; return }
-  if (kind !== 'parquet' && kind !== 'feather') return
+  if (!EXPORT_FORMATS[kind]) return
+  if (exporting.value) return
   if (!state.backend.online) {
-    toast('info', 'Parquet / Feather 二进制格式需要后端支持（浏览器单文件无法可靠编码列式压缩），请使用 CSV 或 Excel')
+    toast('info', `导出需要后端在线（${API_BASE}）：宽表由服务端从工作区直出，浏览器端不再保留整表编码兜底`)
     return
   }
+  const d = ds()
+  if (!d?.wsId) { toast('warning', '还没有载入数据集'); return }
   exporting.value = kind
   try {
-    const r = await exportViaBackend(kind, d, `timeseries_${d.name}`)
-    toast('success', `后端 pyarrow 已编码 ${(r.bytes / 1024).toFixed(1)} KB ${kind.toUpperCase()}：${r.name}`)
-    logAction(5, 'dataset', `导出 ${kind.toUpperCase()} 宽表`,
-      `${d.data.length.toLocaleString()} 行 × ${d.columns.length} 列 · ${(r.bytes / 1024).toFixed(1)} KB · 后端 pyarrow 编码`,
-      { type: 'export', format: kind, bytes: r.bytes })
+    const rows = rowCount()
+    const r = await wsExport(d.wsId, kind)
+    toast('success', `后端已从工作区导出 ${(r.bytes / 1024).toFixed(1)} KB ${EXPORT_FORMATS[kind]}：${r.name}`)
+    logAction(5, 'dataset', `导出 ${EXPORT_FORMATS[kind]} 宽表`,
+      `${rows.toLocaleString()} 行 × ${exportCols.value} 列 · ${(r.bytes / 1024).toFixed(1)} KB · 后端工作区直出`,
+      { type: 'export', format: kind, bytes: r.bytes, rows, cols: exportCols.value })
     state.showExportModal = false
   } catch (e) {
-    toast('error', `后端导出失败：${e.message}`)
+    toast('error', `导出失败：${e.message}`)
   } finally {
     exporting.value = ''
   }
 }
 
-onMounted(() => {
-  generateSyntheticData()
-  initHistoryAndSession()
-  checkBackend()
+onMounted(async () => {
   window.addEventListener('keydown', onKeydown)
+  // 先探活再查会话：会话存在服务端，离线时无从查询（initSession 内部也会自己补一次探测）
+  await checkBackend()
+  initSession()
 })
 onUnmounted(() => window.removeEventListener('keydown', onKeydown))
 </script>
@@ -195,18 +232,19 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <i class="fa-solid fa-server text-[10px]" :class="state.backend.online ? 'text-emerald-600' : 'text-slate-400'"></i>
         <span :class="state.backend.online ? 'text-emerald-700' : 'text-slate-500'">{{ state.backend.online ? '后端 v' + state.backend.version : '后端离线' }}</span>
       </button>
-      <span class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md flex items-center gap-1.5 max-w-[240px]">
+      <span class="bg-emerald-50 text-emerald-700 border border-emerald-200 px-2.5 py-1 rounded-md flex items-center gap-1.5 max-w-[300px]" :title="dsTag">
         <span class="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse shrink-0"></span>
         <span class="truncate">{{ dsName }}</span>
+        <span v-if="hasWorkspace" class="font-mono text-[10px] text-emerald-600 shrink-0">{{ rowCount().toLocaleString() }} 行·后端</span>
       </span>
       <div class="flex items-center gap-1">
-        <button @click="undo()" :disabled="!canUndo" :title="undoTitle"
+        <button @click="runUndo()" :disabled="!canUndo || histBusy" :title="undoTitle"
                 class="px-2 py-1 rounded-md border border-slate-200 bg-white text-slate-600 hover:text-indigo-600 hover:border-indigo-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-1">
-          <i class="fa-solid fa-rotate-left text-[10px]"></i>
+          <i class="fa-solid text-[10px]" :class="histBusy ? 'fa-spinner fa-spin' : 'fa-rotate-left'"></i>
           <span>撤销</span>
           <span v-if="state.history.undo > 0" class="min-w-[16px] h-4 px-1 rounded-full bg-slate-100 text-slate-500 text-[10px] font-bold flex items-center justify-center">{{ state.history.undo }}</span>
         </button>
-        <button @click="redo()" :disabled="!canRedo" :title="redoTitle"
+        <button @click="runRedo()" :disabled="!canRedo || histBusy" :title="redoTitle"
                 class="px-2 py-1 rounded-md border border-slate-200 bg-white text-slate-600 hover:text-indigo-600 hover:border-indigo-300 disabled:opacity-40 disabled:cursor-not-allowed transition-colors flex items-center gap-1">
           <i class="fa-solid fa-rotate-right text-[10px]"></i>
           <span>重做</span>
@@ -220,21 +258,27 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
     </div>
   </header>
 
-  <!-- 本地会话恢复提示：只询问，不擅自替换当前工作区 -->
+  <!-- 服务端会话恢复提示：GET /api/session 会当场按命令日志把工作区重建/核对一遍，这里只询问，不擅自替换当前工作区 -->
   <div v-if="state.session.found" class="bg-amber-50 border-b border-amber-200 px-6 py-2 flex items-center gap-2.5 text-xs shrink-0 z-20">
     <i class="fa-solid fa-clock-rotate-left text-amber-600"></i>
     <span class="text-amber-800 min-w-0">
-      检测到浏览器本地保存的上次会话：<b class="font-semibold">{{ state.session.found.name }}</b>
-      · {{ state.session.found.rows.toLocaleString() }} 行 × {{ state.session.found.cols }} 列
+      服务端记着上次会话：<b class="font-semibold">{{ state.session.found.name }}</b>
+      · {{ (state.session.found.rows || 0).toLocaleString() }} 行 × {{ state.session.found.cols }} 列
       · {{ state.session.found.ops }} 条操作 · 保存于 {{ sessionWhen }}
-      <span class="text-amber-600">（撤销栈与异常检测结果不跨会话）</span>
+      <span v-if="state.session.found.wsId" class="text-amber-700">
+        （工作区 {{ state.session.found.wsId }} 此刻在第 {{ state.session.found.version }} 版<template v-if="!state.session.found.alive">，但服务端已没有它的命令日志：恢复后需回第一步重新载入</template>）
+      </span>
+      <span v-if="state.session.found.drift" class="text-rose-600">
+        （会话记的是第 {{ state.session.found.drift.sessionSays }} 版，服务端日志已走到第 {{ state.session.found.drift.serverSays }} 版 —— 以服务端为准）
+      </span>
+      <span v-if="state.session.found.alive" class="text-amber-600">（撤销栈就是这段服务端日志，刷新与后端重启都还在；异常检测结果会随回退失效）</span>
     </span>
     <div class="ml-auto flex items-center gap-2 shrink-0">
-      <button @click="restoreSession()"
-              class="px-2.5 py-1 bg-amber-600 text-white rounded hover:bg-amber-700 font-medium transition-colors">
-        <i class="fa-solid fa-arrow-rotate-left mr-1 text-[10px]"></i>恢复会话
+      <button @click="runRestoreSession()" :disabled="histBusy"
+              class="px-2.5 py-1 bg-amber-600 text-white rounded hover:bg-amber-700 font-medium transition-colors disabled:opacity-50">
+        <i class="fa-solid text-[10px] mr-1" :class="histBusy ? 'fa-spinner fa-spin' : 'fa-arrow-rotate-left'"></i>恢复会话
       </button>
-      <button @click="clearSession()"
+      <button @click="runClearSession()"
               class="px-2.5 py-1 bg-white border border-amber-300 text-amber-700 rounded hover:bg-amber-100 transition-colors">
         忽略并清除
       </button>
@@ -353,7 +397,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       </div>
       <pre class="p-4 bg-slate-950 text-emerald-400 font-mono text-xs overflow-auto flex-1 leading-relaxed whitespace-pre">{{ codeContent }}</pre>
       <div class="p-3 bg-slate-100 border-t border-slate-200 flex justify-between">
-        <span class="text-[11px] text-slate-500 self-center">仅包含本次会话真实执行过的 {{ state.actionLog.length }} 条操作</span>
+        <span class="text-[11px] text-slate-500 self-center">仅包含本次会话真实执行过的 {{ logCount }} 条操作（撤销掉的条目会跟着游标一起隐去，重做后回来）</span>
         <div class="flex gap-2">
           <button @click="copyCode()" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium">复制代码</button>
           <button @click="state.showCodeModal = false" class="px-4 py-1.5 bg-slate-800 text-white rounded text-xs font-medium">关闭</button>
@@ -370,22 +414,25 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <button @click="state.showExportModal = false" class="text-slate-400 hover:text-slate-700"><i class="fa-solid fa-xmark"></i></button>
       </div>
       <div class="p-5 space-y-2.5">
-        <div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 font-mono">
-          {{ dsName }} · {{ exportRows.toLocaleString() }} 行 × {{ exportCols }} 列
+        <div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 font-mono leading-relaxed">
+          {{ dsName }} · 后端工作区 {{ rowCount().toLocaleString() }} 行 × {{ exportCols }} 列
+          <span class="text-emerald-600">· 明细不过网络，四种格式均由服务端直出</span>
         </div>
-        <button @click="doExport('csv')" class="w-full flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/40 text-left transition-all">
+        <button @click="doExport('csv')" :disabled="!state.backend.online || !!exporting"
+                class="w-full flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/40 disabled:opacity-60 text-left transition-all">
           <span class="w-9 h-9 rounded-lg bg-emerald-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-csv text-emerald-600"></i></span>
           <span class="flex-1 min-w-0">
             <span class="block text-xs font-bold text-slate-700">CSV 宽表 (.csv)</span>
-            <span class="block text-[11px] text-slate-400">含全部清洗结果、外生变量与衍生特征列，浏览器内真实生成</span>
+            <span class="block text-[11px] text-slate-400">含全部清洗结果、外生变量与衍生特征列，后端直出（UTF-8 BOM，Excel 直接双击不乱码）</span>
           </span>
           <i class="fa-solid fa-chevron-right text-slate-300 text-xs"></i>
         </button>
-        <button @click="doExport('xlsx')" class="w-full flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/40 text-left transition-all">
+        <button @click="doExport('xlsx')" :disabled="!state.backend.online || !!exporting"
+                class="w-full flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/40 disabled:opacity-60 text-left transition-all">
           <span class="w-9 h-9 rounded-lg bg-green-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-excel text-green-600"></i></span>
           <span class="flex-1 min-w-0">
             <span class="block text-xs font-bold text-slate-700">Excel 工作簿 (.xlsx)</span>
-            <span class="block text-[11px] text-slate-400">SheetJS 本地生成，单表全量数据</span>
+            <span class="block text-[11px] text-slate-400">后端 openpyxl 生成，单表全量数据</span>
           </span>
           <i class="fa-solid fa-chevron-right text-slate-300 text-xs"></i>
         </button>
@@ -425,7 +472,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-columns text-orange-500"></i></span>
           <span class="flex-1 min-w-0">
             <span class="block text-xs font-bold text-slate-600">Parquet / Feather</span>
-            <span class="block text-[11px] text-rose-500">后端未连接（{{ API_BASE }}）· 浏览器端不提供列式压缩编码，避免产出损坏文件</span>
+            <span class="block text-[11px] text-rose-500">后端未连接（{{ API_BASE }}）· 四种格式都要由服务端从工作区直出，浏览器端不再兜底编码</span>
           </span>
           <button @click="checkBackend()" class="text-[10px] px-2 py-1 rounded border border-slate-300 text-slate-500 hover:text-indigo-600 hover:border-indigo-300 shrink-0">重试</button>
         </div>

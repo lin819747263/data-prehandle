@@ -1,10 +1,10 @@
 <script setup>
 import { ref, computed, onActivated, watch } from 'vue'
-import { state, datasets, loadPresetData, loadCustomDataset, switchStep, toast } from '../store'
-import { parseDataFile, formatFileSize, getFileIconMeta, fileExt } from '../utils'
-import { importViaBackend, openDataset, listDatasets, checkBackend, API_BASE } from '../api'
+import { state, loadPresetData, loadFileAsWorkspace, openDatasetFile, switchStep, toast } from '../store'
+import { formatFileSize, getFileIconMeta } from '../utils'
+import { listDatasets, checkBackend, API_BASE } from '../api'
 
-// 内置合成示例（非 dataset 目录文件，独立入口）
+// 内置合成示例（由后端 preset 接口生成，非 dataset 目录文件）
 const BUILTIN = [
   { key: 'pv', label: '光伏电站实测出力 PV-15min', icon: 'fa-solar-panel' },
   { key: 'load', label: '区域工商业负荷 Load-60min', icon: 'fa-bolt' }
@@ -15,10 +15,7 @@ const fileInput = ref(null)
 const loading = ref(false)
 const opening = ref('')
 
-// Parquet/Feather 是列式压缩二进制，浏览器无法解码；CSV/Excel 在线时也统一走后端以便落盘
-const NEEDS_BACKEND = ['parquet', 'feather', 'ft']
-const acceptAttr = computed(() =>
-  state.backend.online ? '.csv,.xlsx,.xls,.txt,.tsv,.parquet,.feather,.ft' : '.csv,.xlsx,.xls,.txt,.tsv')
+const acceptAttr = '.csv,.xlsx,.xls,.txt,.tsv,.parquet,.feather,.ft'
 
 // ---- 最近打开的数据集：后端 dataset 目录的真实文件 ----
 const recent = ref([])
@@ -59,79 +56,43 @@ function addFiles(list) {
 function removeFile(idx) { state.pendingFiles.splice(idx, 1) }
 function clearFiles() { state.pendingFiles.splice(0, state.pendingFiles.length) }
 
-// 单文件解析入口：后端在线时统一走导入接口（落盘 + 解析），否则浏览器本地解析
-async function parseOne(file) {
-  const ext = fileExt(file.name)
-  if (state.backend.online) {
-    try {
-      const r = await importViaBackend(file)
-      if (!r.data || r.data.length === 0) throw new Error('后端未解析出任何数据行')
-      return {
-        source: 'backend', format: r.format, saved: r.saved,
-        name: r.name.replace(/\.[^.]+$/, ''), columns: r.columns, timeCol: r.timeCol, data: r.data
-      }
-    } catch (e) {
-      if (NEEDS_BACKEND.includes(ext)) throw e
-      toast('warning', `后端导入失败（${e.message}），${file.name} 已改用浏览器解析，未写入 dataset 目录`)
-    }
-  }
-  if (NEEDS_BACKEND.includes(ext)) {
-    throw new Error(`.${ext} 需后端 pyarrow 解析，但 ${API_BASE} 不可达（请在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000）`)
-  }
-  return { source: 'browser', format: ext, ...(await parseDataFile(file)) }
-}
-
 async function confirmLoad() {
   if (state.pendingFiles.length === 0) { toast('warning', '请先选择或上传数据文件！'); return }
-  loading.value = true
-  if (!state.backend.online && state.pendingFiles.some(p => NEEDS_BACKEND.includes(fileExt(p.name)))) {
-    await checkBackend()
-  }
-  const parsed = []
-  const failed = []
-  let viaBackend = 0
-  for (const p of state.pendingFiles) {
-    try {
-      const r = await parseOne(p.file)
-      if (r.source === 'backend') viaBackend++
-      parsed.push({ name: p.name, ...r })
-    } catch (e) {
-      failed.push(`${p.name}: ${e.message}`)
-    }
-  }
-  loading.value = false
-  if (parsed.length === 0) {
-    toast('error', `没有文件解析成功\n${failed.join('\n')}`.slice(0, 200))
+  if (!state.backend.online) await checkBackend()
+  if (!state.backend.online) {
+    toast('error', `解析与加工已全部改由后端执行，${API_BASE} 不可达时无法载入数据` +
+      `：请在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000`)
     return
   }
-  loadCustomDataset(parsed, parsed.map(p => p.name))
-  if (failed.length > 0) toast('warning', `${failed.length} 个文件未能解析：${failed.join('；')}`.slice(0, 220))
-  clearFiles()
-  const saved = parsed.filter(p => p.saved)
-  const via = viaBackend > 0 ? `（其中 ${viaBackend} 个由后端解析）` : ''
-  const savedMsg = saved.length ? `，已写入 dataset 目录：${saved.map(p => p.saved).join('、')}` : ''
-  toast('success', `已成功解析 ${parsed.length} 个数据文件${via}${savedMsg}`)
-  refreshRecent()
-  switchStep(2)
+  const first = state.pendingFiles[0]
+  if (state.pendingFiles.length > 1) {
+    toast('warning', `多文件按行拼接需要后端合并（阶段②提供），本次只载入第 1 个：${first.name}`)
+  }
+  loading.value = true
+  try {
+    const d = await loadFileAsWorkspace(first.file)
+    clearFiles()
+    toast('success', `已由后端解析 ${first.name}：${d.meta.rowCount.toLocaleString()} 行 × ${d.meta.colCount} 列` +
+      `（工作区 ${d.wsId}，浏览器只缓存前 ${d.page.rows.length} 行）`)
+    refreshRecent()
+    switchStep(2)
+  } catch (e) {
+    toast('error', `导入失败：${e.message}`)
+  } finally {
+    loading.value = false
+  }
 }
 
-function loadSample(key) {
-  loadPresetData(key)
-  toast('success', `已加载内置示例数据集：${datasets[key].name}`)
-  switchStep(2)
+async function loadSample(key) {
+  if (await loadPresetData(key)) switchStep(2)
 }
 
 async function openRecent(item) {
   if (opening.value) return
   opening.value = item.filename
   try {
-    const r = await openDataset(item.filename)
-    if (!r.data || r.data.length === 0) throw new Error('未解析出任何数据行')
-    loadCustomDataset([{
-      source: 'backend', format: r.format, name: r.name.replace(/\.[^.]+$/, ''),
-      columns: r.columns, timeCol: r.timeCol, data: r.data
-    }], [item.filename], 'dataset')
-    toast('success', `已打开 ${item.filename}（${r.rowCount.toLocaleString()} 行 × ${r.columns.length} 列）`)
+    const d = await openDatasetFile(item.filename)
+    toast('success', `已打开 ${item.filename}：${d.meta.rowCount.toLocaleString()} 行 × ${d.meta.colCount} 列（工作区 ${d.wsId}）`)
     switchStep(2)
   } catch (e) {
     toast('error', `打开失败：${e.message}`)
@@ -157,7 +118,7 @@ function relTime(mtime) {
         <i class="fa-solid fa-database text-indigo-600"></i>
         数据加载
       </h2>
-      <p class="text-xs text-slate-500 mt-1">导入的数据集会落盘到后端 dataset 目录，下次可直接从下方打开</p>
+      <p class="text-xs text-slate-500 mt-1">解析与加工全部在后端执行：导入即落盘 dataset 目录并建立服务端工作区，浏览器只保留当前页窗口</p>
     </div>
 
     <div class="flex-1 flex flex-col gap-4 min-h-0">
@@ -178,13 +139,12 @@ function relTime(mtime) {
             <h3 class="text-base font-semibold text-slate-700 mb-1">拖拽文件到此处上传</h3>
             <p class="text-xs text-slate-500 mb-3">或点击下方按钮选择文件</p>
             <div class="flex items-center justify-center gap-2 mb-3">
-              <span class="px-2.5 py-1 bg-slate-100 rounded text-[11px] font-mono text-slate-600">.csv</span>
-              <span class="px-2.5 py-1 bg-slate-100 rounded text-[11px] font-mono text-slate-600">.xlsx</span>
-              <span v-for="ext in ['parquet', 'feather']" :key="ext"
+              <span v-for="ext in ['.csv', '.xlsx', '.xls']" :key="ext" class="px-2.5 py-1 bg-slate-100 rounded text-[11px] font-mono text-slate-600">{{ ext }}</span>
+              <span v-for="ext in ['.parquet', '.feather']" :key="ext"
                     class="px-2.5 py-1 rounded text-[11px] font-mono border"
                     :class="state.backend.online ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-orange-50 border-orange-200 text-orange-600'"
-                    :title="state.backend.online ? `由后端 pyarrow 真实解码 · ${API_BASE}` : '需后端支持（当前未连接）'">
-                .{{ ext }} <i v-if="state.backend.online" class="fa-solid fa-circle-check text-[9px]"></i><template v-else>(需后端)</template>
+                    :title="`由后端 pyarrow 真实解码 · ${API_BASE}`">
+                {{ ext }} <i v-if="state.backend.online" class="fa-solid fa-circle-check text-[9px]"></i><template v-else>(后端解码)</template>
               </span>
             </div>
             <div class="flex items-center justify-center gap-2">
@@ -197,8 +157,8 @@ function relTime(mtime) {
               </button>
             </div>
             <p class="text-[11px] text-slate-400 mt-3 flex items-center justify-center gap-1">
-              <i class="fa-solid fa-circle-info"></i>支持多文件同时上传 · 单文件建议 ≤ 64MB ·
-              {{ state.backend.online ? '导入即落盘 dataset 目录，Parquet/Feather 由后端 pyarrow 解码' : '后端未连接：仅浏览器解析 CSV/Excel，且不写入数据集目录' }}
+              <i class="fa-solid fa-circle-info"></i>单文件建议 ≤ 64MB · 多文件按行拼接需后端合并（阶段②）·
+              {{ state.backend.online ? '导入即落盘 dataset 目录，整表留在服务端，界面只取当前页' : '后端未连接：工作台只读，无法解析或加工数据' }}
             </p>
             <div class="mt-3 flex items-center justify-center">
               <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] border"
@@ -220,7 +180,10 @@ function relTime(mtime) {
                 {{ state.pendingFiles.length }} 个文件 · {{ formatFileSize(totalSize) }}
               </span>
               <span v-if="state.backend.online" class="text-[10px] text-teal-600 bg-teal-50 border border-teal-200 rounded px-1.5 py-0.5">
-                <i class="fa-solid fa-floppy-disk mr-0.5"></i>确认后将写入 dataset 目录
+                <i class="fa-solid fa-floppy-disk mr-0.5"></i>确认后将写入 dataset 目录并在后端建工作区
+              </span>
+              <span v-else class="text-[10px] text-rose-600 bg-rose-50 border border-rose-200 rounded px-1.5 py-0.5">
+                <i class="fa-solid fa-lock mr-0.5"></i>后端离线：只能浏览，不能导入
               </span>
             </div>
             <div class="flex items-center gap-2">

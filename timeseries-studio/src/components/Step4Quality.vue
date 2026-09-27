@@ -3,13 +3,15 @@ import { ref, reactive, computed, onMounted, onActivated, onBeforeUnmount, nextT
 import * as echarts from 'echarts'
 import { ElMessageBox } from 'element-plus'
 import {
-  state, ds, switchStep, toast,
-  columnMissingStats, applySegmentImpute, applyAllSegmentsImpute,
-  imputeAllAndDedupe, detectAnomalies, applyBackendAnomaly, repairAnomalies,
-  ANOMALY_ALGOS, ANOMALY_REPAIRS, generateMask, deleteMask, deleteAllMasks
+  state, ds, switchStep, toast, requireBackend,
+  loadQuality, qualityData, columnMissingStats, segmentsOf, segmentsTruncated,
+  segAlgo, setSegAlgo, applySegmentImpute, applyAllSegmentsImpute, imputeAllAndDedupe,
+  detectAnomalies, repairAnomalies, loadSeries,
+  ANOMALY_ALGOS, ANOMALY_REPAIRS, ANOMALY_NAMES,
+  generateMask, deleteMask, deleteAllMasks
 } from '../store'
-import { isMissing, detectMissingSegments, buildExprEvaluator } from '../utils'
-import { iforestViaBackend } from '../api'
+import { buildExprEvaluator } from '../utils'
+import { checkBackend } from '../api'
 
 const IMPUTE_ALGOS = [
   { value: 'linear', label: '时序线性插值' },
@@ -17,10 +19,19 @@ const IMPUTE_ALGOS = [
   { value: 'spline', label: '三次样条平滑' },
   { value: 'zero', label: '常数0置换' }
 ]
-const ALGO_NAMES = { '3sigma': '3-Sigma', iqr: 'IQR 箱线法', iforest: '孤立森林(近似)', iforest_sklearn: '孤立森林(sklearn·后端)', expr: '自定义表达式' }
 
 // 换新引用才能失效下游 computed（见 Step2Config 同款注释）
 const d = computed(() => { void state.dataVersion; return { ...ds() } })
+// 本步的每个数字都来自后端：诊断走 GET /quality，曲线走 GET /series，
+// 浏览器不再持有整表，所以 40 万格的表也能开这一页。
+const stats = computed(() => { void state.dataVersion; return columnMissingStats() })
+const diagError = computed(() => {
+  void state.dataVersion
+  if (!state.backend.online) return '后端未连接：本步的缺失扫描、填补、异常检测与掩码全部在后端执行，浏览器不再算第二套，页面转为只读。'
+  if (!d.value.wsId) return '还没有载入数据集：请回第一步加载数据后再做质量诊断。'
+  if (state.quality.error) return `诊断读取失败：${state.quality.error}`
+  return ''
+})
 const tab = ref('impute')
 const TAB_COLORS = {
   impute: 'border-amber-500 text-amber-700 bg-white',
@@ -28,34 +39,28 @@ const TAB_COLORS = {
   mask: 'border-teal-500 text-teal-700 bg-white'
 }
 
-// ============ 图表 ============
+// ============ 图表（服务端抽稀曲线）============
 const chartEl = ref(null)
 let chart = null
 const brushActive = ref(false)
 const brushRange = ref(null)
+const sd = ref(null)          // 当前绘图列的 /series 响应
 
-const qualityCol = computed(() => d.value.columns.find(c => c.type === 'float')?.key)
+const floatCols = computed(() => d.value.columns.filter(c => c.type === 'float'))
+const chosenCol = ref(null)
+const plotCol = computed(() => (chosenCol.value && floatCols.value.some(c => c.key === chosenCol.value)
+  ? chosenCol.value : floatCols.value[0]?.key))
 
-function renderChart() {
+async function renderChart() {
   if (!chart) return
-  const data = d.value.data
-  const colKey = qualityCol.value
-  if (!colKey) { chart.clear(); return }
-  const timestamps = data.map(r => r[d.value.timeCol])
-  const values = data.map(r => r[colKey])
-
-  const anomalyScatter = []
-  const missingMarks = []
-  const la = state.lastAnomaly
-  const set = la?.perColumn?.[colKey]?.set
-  values.forEach((v, i) => {
-    if (isMissing(v)) missingMarks.push({ xAxis: timestamps[i] })
-    else if (set && set.has(i)) anomalyScatter.push([timestamps[i], v])
-  })
-
+  const s = sd.value
+  const colKey = plotCol.value
+  if (!s || !colKey || !s.x?.length) { chart.clear(); return }
+  const det = detection.value
   chart.setOption({
     title: {
-      text: `数据质量图示与异常探针 (${colKey})${la ? ` · ${ALGO_NAMES[la.algo] || la.algo}` : ' · 尚未执行异常检测'}`,
+      text: `数据质量图示与异常探针 (${colKey})` +
+        `${det ? ` · ${ANOMALY_NAMES[det.algo] || det.algo}` : ' · 尚未执行异常检测'}`,
       left: 10, top: 5, textStyle: { fontSize: 12, color: '#334155' }
     },
     tooltip: { trigger: 'axis' },
@@ -63,16 +68,18 @@ function renderChart() {
     brush: { toolbox: ['lineX', 'clear'], xAxisIndex: 0 },
     grid: { top: 40, right: 25, bottom: 50, left: 55 },
     dataZoom: [{ type: 'inside' }, { type: 'slider', bottom: 5, height: 20 }],
-    xAxis: { type: 'category', data: timestamps },
+    xAxis: { type: 'category', data: s.x },
     yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
     series: [
       {
-        name: '原始时序', type: 'line', data: values,
+        name: '原始时序', type: 'line', data: s.y,
         lineStyle: { color: '#6366f1', width: 1.5 },
-        markLine: { symbol: 'none', data: missingMarks.slice(0, 40), lineStyle: { color: '#f43f5e', type: 'dotted', width: 1.5 } }
+        // 缺失标记由服务端给出（最多 80 条），折线本身在空洞处断开而不是连过去
+        markLine: { symbol: 'none', data: (s.missingMarks || []).map(t => ({ xAxis: t })),
+                    lineStyle: { color: '#f43f5e', type: 'dotted', width: 1.5 } }
       },
       {
-        name: '检测到的异常点', type: 'scatter', data: anomalyScatter,
+        name: '检测到的异常点', type: 'scatter', data: s.anomalies || [],
         symbolSize: 10, itemStyle: { color: '#ef4444', borderColor: '#fff', borderWidth: 2 }
       }
     ]
@@ -96,66 +103,82 @@ function clearBrush() {
   brushRange.value = null
 }
 
+// 刷选给出的是抽稀序列里的下标，必须换算回真实行号才能喂给服务端掩码
 function onBrushSelected(params) {
   const batch = params.batch && params.batch[0]
   if (!batch || !batch.areas || batch.areas.length === 0) return
+  const s = sd.value
+  if (!s || !s.idx || s.idx.length === 0) return
   const range = batch.areas[0].coordRange
-  const data = d.value.data
-  const startIdx = Math.max(0, Math.floor(Math.min(range[0], range[1])))
-  const endIdx = Math.min(data.length - 1, Math.ceil(Math.max(range[0], range[1])))
+  const first = Math.max(0, Math.min(s.idx.length - 1, Math.floor(Math.min(range[0], range[1]))))
+  const last = Math.max(0, Math.min(s.idx.length - 1, Math.ceil(Math.max(range[0], range[1]))))
   brushRange.value = {
-    startIdx, endIdx,
-    start: data[startIdx][d.value.timeCol],
-    end: data[endIdx][d.value.timeCol]
+    startIdx: s.idx[first], endIdx: s.idx[last],
+    start: s.x[first], end: s.x[last]
   }
 }
 
+// ============ 诊断数据刷新 ============
+let refreshing = null
+async function refreshAll() {
+  if (refreshing) return refreshing
+  refreshing = (async () => {
+    await loadQuality()
+    await ensureSeries()
+    await nextTick()
+    renderChart()
+  })().finally(() => { refreshing = null })
+  return refreshing
+}
+
+async function ensureSeries() {
+  const colKey = plotCol.value
+  sd.value = colKey ? await loadSeries(colKey, 1200) : null
+}
+
 // ============ Tab1 缺失与重复 ============
-const missingStats = computed(() => { void state.dataVersion; return columnMissingStats() })
 const cards = computed(() => {
-  const { stats, totalRows, duplicateCount } = missingStats.value
-  const cols = d.value.columns.length
-  const totalCells = totalRows * cols
-  const totalMissing = stats.reduce((s, c) => s + c.missing, 0)
-  const overallRate = totalCells > 0 ? totalMissing / totalCells * 100 : 0
+  const m = stats.value
+  if (!m) return []
+  const overallRate = m.missingRate
   return [
-    { icon: 'fa-table', bg: 'bg-slate-100', color: 'text-slate-600', label: '总行数', value: totalRows.toLocaleString() },
-    { icon: 'fa-cells', bg: 'bg-slate-100', color: 'text-slate-600', label: '总单元格', value: totalCells.toLocaleString() },
-    { icon: 'fa-circle-question', bg: 'bg-rose-50', color: 'text-rose-600', label: '缺失单元格', value: totalMissing.toLocaleString() },
+    { icon: 'fa-table', bg: 'bg-slate-100', color: 'text-slate-600', label: '总行数', value: m.totalRows.toLocaleString() },
+    { icon: 'fa-cells', bg: 'bg-slate-100', color: 'text-slate-600', label: '总单元格', value: m.totalCells.toLocaleString() },
+    { icon: 'fa-circle-question', bg: 'bg-rose-50', color: 'text-rose-600', label: '缺失单元格', value: m.totalMissing.toLocaleString() },
     { icon: 'fa-percent', bg: overallRate > 5 ? 'bg-rose-50' : 'bg-emerald-50', color: overallRate > 5 ? 'text-rose-600' : 'text-emerald-600', label: '整体缺失率', value: overallRate.toFixed(2) + '%' },
-    { icon: 'fa-copy', bg: 'bg-amber-50', color: 'text-amber-600', label: '重复时间戳', value: duplicateCount.toLocaleString() + ' 条' }
+    { icon: 'fa-copy', bg: 'bg-amber-50', color: 'text-amber-600', label: '重复时间戳', value: m.duplicateCount.toLocaleString() + ' 条' }
   ]
 })
-const maxMissing = computed(() => Math.max(...missingStats.value.stats.map(s => s.missing), 1))
+const maxMissing = computed(() => Math.max(...(stats.value?.stats || []).map(s => s.missing), 1))
 
 const segCol = ref(null)
 const segList = computed(() => {
-  if (!segCol.value) return []
-  return detectMissingSegments(d.value.data, segCol.value, d.value.timeCol)
+  void state.dataVersion
+  return segCol.value ? segmentsOf(segCol.value) : []
 })
-function algoFor(idx) {
-  return state.imputeSegAlgos[segCol.value]?.[idx] || 'linear'
-}
-function setAlgo(idx, ev) {
-  if (!state.imputeSegAlgos[segCol.value]) state.imputeSegAlgos[segCol.value] = {}
-  state.imputeSegAlgos[segCol.value][idx] = ev.target.value
-}
+const segTruncated = computed(() => {
+  void state.dataVersion
+  return segCol.value ? segmentsTruncated(segCol.value) : false
+})
+function algoFor(idx) { return segAlgo(segCol.value, idx) }
+function setAlgoAt(idx, ev) { setSegAlgo(segCol.value, idx, ev.target.value) }
 function segTotalRows() { return segList.value.reduce((s, g) => s + g.count, 0) }
 function colLabel(key) { return d.value.columns.find(c => c.key === key)?.label || key }
 
-function doSegmentImpute(idx) {
-  const n = applySegmentImpute(segCol.value, idx)
-  toast('success', `已填补 ${n} 行`)
+async function doSegmentImpute(idx) {
+  const r = await applySegmentImpute(segCol.value, idx)
+  if (r) toast('success', r.summary)
 }
-function doAllSegments() {
-  const r = applyAllSegmentsImpute(segCol.value)
-  toast('success', `已填补 ${r.count} 个缺失段，共 ${r.total} 行`)
+async function doAllSegments() {
+  const r = await applyAllSegmentsImpute(segCol.value)
+  if (r) toast('success', r.summary)
 }
 
 const dupStrategy = ref('mean')
-function doImputeAll() {
-  const r = imputeAllAndDedupe(dupStrategy.value)
-  toast('success', `缺失值填补完成：${r.colsFixed} 列、${r.totalFilled} 个缺失值，合并重复时间戳 ${r.dupCount} 条。`)
+const defaultAlgo = ref('linear')
+async function doImputeAll() {
+  // store 内的 imputeAllAndDedupe 已经把服务端 summary 作为 toast 发出来了
+  await imputeAllAndDedupe(dupStrategy.value, defaultAlgo.value)
 }
 
 // ============ Tab2 异常检测 ============
@@ -163,17 +186,31 @@ const algo = ref('3sigma')
 const repair = ref('clip')
 const exprInput = ref('')
 const exprFeedback = ref(null)
-const anomalyResults = computed(() => state.lastAnomaly?.results || null)
-const anomalySummary = computed(() => state.lastAnomaly?.summary || null)
+const detection = computed(() => {
+  void state.dataVersion
+  const la = state.lastAnomaly
+  return la && la.wsId === d.value.wsId ? la : null
+})
+const anomalyResults = computed(() => detection.value?.results || null)
+const anomalySummary = computed(() => detection.value?.summary || null)
 
 const summaryPill = computed(() => {
-  const segCols = d.value.columns.filter(c => c.type === 'float')
-    .reduce((s, c) => s + detectMissingSegments(d.value.data, c.key, d.value.timeCol).length, 0)
-  const totalMissingCells = missingStats.value.stats.reduce((s, c) => s + c.missing, 0)
-  if (anomalySummary.value) {
-    return `检测到 ${anomalySummary.value.totalAnomalies} 处异常 · 整体异常率 ${anomalySummary.value.overallRate.toFixed(2)}% · ${segCols} 段缺失(${totalMissingCells} 单元格)`
+  const m = stats.value
+  if (!m) return '诊断数据待从后端读取'
+  const q = qualityData()
+  const runs = Object.values(q.segments || {})
+  const segCols = runs.length
+  const segRuns = runs.reduce((s, r) => s + r.length, 0)          // 段数
+  const segCells = runs.reduce((s, r) => s + r.reduce((n, x) => n + x.count, 0), 0)  // 段内行数
+  // segmentsTruncated 对每个有缺失的列都会建一个键（值可能是 false），只数 true 才是真的被截断
+  const trunc = Object.values(q.segmentsTruncated || {}).filter(Boolean).length
+  const capNote = trunc ? `（${trunc} 列超过 ${m.segmentCap} 段已截断）` : ''
+  const missingPart = `缺失 ${m.totalMissing} 单元格 · ${segCols} 列共 ${segRuns} 段(${segCells} 行)${capNote}`
+  const s = anomalySummary.value
+  if (s) {
+    return `检测到 ${s.totalAnomalies} 处异常 · 整体异常率 ${s.overallRate.toFixed(2)}% · ${missingPart}`
   }
-  return `${segCols} 处缺失段（${totalMissingCells} 个缺失单元格）· 异常检测待执行`
+  return `异常检测待执行 · ${missingPart}`
 })
 
 function validateExpr() {
@@ -193,79 +230,72 @@ function validateExpr() {
     return false
   }
 }
-// 复用 store 的白名单编译（表达式错误会抛异常）
+// 本地白名单编译只用于「验证」按钮；真正生效的判定在后端按同一份表达式向量化求值
 function buildExprFn(expr) { return buildExprEvaluator(expr) }
 
 const detecting = ref(false)
 const iforestParams = reactive({ nEstimators: 200, contamination: 'auto' })
 
-async function detectViaBackend() {
-  if (!state.backend.online) {
-    toast('error', '后端未连接：sklearn 完整版孤立森林需要 FastAPI 服务（默认 http://127.0.0.1:8000）。可先使用浏览器近似版。')
-    return
-  }
-  const numCols = d.value.columns.filter(c => c.type === 'float')
-  if (numCols.length === 0) { toast('warning', '没有数值列可检测'); return }
+async function doDetect() {
+  if (!requireBackend('异常检测')) return
+  if (algo.value === 'expr' && !validateExpr()) return
   detecting.value = true
   try {
-    const payload = numCols.map(col => ({
-      key: col.key,
-      values: d.value.data.map(r => (isMissing(r[col.key]) ? null : Number(r[col.key])))
-    }))
-    const resp = await iforestViaBackend(payload, {
-      n_estimators: Number(iforestParams.nEstimators) || 200,
-      contamination: iforestParams.contamination === 'auto' ? 'auto' : Number(iforestParams.contamination),
-      random_state: 42
-    })
-    const r = applyBackendAnomaly(resp)
-    toast('success', `后端 ${resp.engine} 检测完成：${r.summary.totalAnomalies} 个异常点，涉及 ${r.summary.colsAffected}/${r.summary.numCols} 列`)
-  } catch (e) {
-    toast('error', `后端检测失败：${e.message}`)
+    const params = algo.value === 'iforest_sklearn'
+      ? {
+        nEstimators: Number(iforestParams.nEstimators) || 200,
+        contamination: iforestParams.contamination === 'auto' ? 'auto' : Number(iforestParams.contamination),
+        randomState: 42
+      }
+      : {}
+    const r = await detectAnomalies(algo.value, exprInput.value.trim(), params)
+    if (r) {
+      toast('success', `检测完成：${r.summary.totalAnomalies} 个异常点，涉及 ${r.summary.colsAffected}/${r.summary.numCols} 列`)
+      await ensureSeries()
+      renderChart()
+    }
   } finally {
     detecting.value = false
   }
 }
 
-function doDetect() {
-  if (algo.value === 'iforest_sklearn') { detectViaBackend(); return }
-  const r = detectAnomalies(algo.value, exprInput.value.trim())
-  if (r.error) { toast('error', r.error); return }
-  toast('success', `检测完成：${r.summary.totalAnomalies} 个异常点，涉及 ${r.summary.colsAffected}/${r.summary.numCols} 列`)
-}
 async function doRepair() {
-  if (!state.lastAnomaly) { toast('warning', '请先执行检测'); return }
+  const la = detection.value
+  if (!la) { toast('warning', '请先执行检测：修复按服务端留存的行索引执行'); return }
+  if (la.stale) { toast('warning', '检测之后数据又被改过（行位置已变），请重新检测后再修复'); return }
   try {
     await ElMessageBox.confirm(
-      `将按 ${ANOMALY_REPAIRS[repair.value].split('：')[0]} 方案处理 ${state.lastAnomaly.summary.totalAnomalies} 个异常点，数据会被修改。确认继续？`,
+      `将按 ${ANOMALY_REPAIRS[repair.value].split('：')[0]} 方案处理 ${la.summary.totalAnomalies} 个异常点，数据会被修改。确认继续？`,
       '执行修复', { type: 'warning' }
     )
   } catch (e) { return }
-  const r = repairAnomalies(repair.value)
-  if (r.error) { toast('error', r.error); return }
-  toast('success', `修复完成：处理 ${r.touched} 个数据点`)
+  const r = await repairAnomalies(repair.value)
+  if (r) toast('success', `修复完成：处理 ${r.touched} 个数据点`)
 }
+
 const anomalyCards = computed(() => {
   const s = anomalySummary.value
-  const r = anomalyResults.value
-  if (!s || !r) return null
-  const totalCells = d.value.data.length * s.numCols
+  if (!s) return null
   return [
-    { icon: 'fa-microscope', bg: 'bg-slate-100', fg: 'text-slate-600', label: '检测算法', value: ALGO_NAMES[state.lastAnomaly.algo] || state.lastAnomaly.algo },
-    { icon: 'fa-database', bg: 'bg-slate-100', fg: 'text-slate-600', label: '检测行数', value: d.value.data.length.toLocaleString() },
+    { icon: 'fa-microscope', bg: 'bg-slate-100', fg: 'text-slate-600', label: '检测算法', value: ANOMALY_NAMES[detection.value.algo] || detection.value.algo },
+    { icon: 'fa-database', bg: 'bg-slate-100', fg: 'text-slate-600', label: '检测行数', value: (detection.value.rowCount || 0).toLocaleString() },
     { icon: 'fa-triangle-exclamation', bg: 'bg-rose-50', fg: 'text-rose-600', label: '异常点总数', value: s.totalAnomalies.toLocaleString() },
     { icon: 'fa-percent', bg: s.overallRate > 5 ? 'bg-rose-50' : 'bg-emerald-50', fg: s.overallRate > 5 ? 'text-rose-600' : 'text-emerald-600', label: '整体异常率', value: s.overallRate.toFixed(2) + '%' },
     { icon: 'fa-table-columns', bg: 'bg-amber-50', fg: 'text-amber-600', label: '受影响列数', value: `${s.colsAffected} / ${s.numCols}` },
-    { icon: 'fa-shield-halved', bg: 'bg-emerald-50', fg: 'text-emerald-600', label: '正常数据量', value: (totalCells - s.totalAnomalies).toLocaleString() }
+    { icon: 'fa-shield-halved', bg: 'bg-emerald-50', fg: 'text-emerald-600', label: '正常数据量', value: (s.totalCells - s.totalAnomalies).toLocaleString() }
   ]
 })
 const maxAnomaly = computed(() => Math.max(...(anomalyResults.value || []).map(r => r.anomalies), 1))
+function fmtBound(v) { return v === null || v === undefined ? '—' : Number(v).toFixed(1) }
 
 // ============ Tab3 掩码 ============
 const maskName = ref('mask_curtailment')
-function doGenerateMask() {
+async function doGenerateMask() {
+  if (!requireBackend('生成掩码列')) return
   if (!brushRange.value) { toast('warning', '请先在图表上拖拽框选要标记的时段'); return }
   const name = maskName.value.trim() || 'mask_1'
-  const ones = generateMask(name, brushRange.value)
+  const ones = await generateMask(name, brushRange.value)
+  if (ones === null) return
   toast('success', `已生成布尔掩码列 [${name}]，区间内 ${ones} 行置 1`)
   const num = state.masks.length + 1
   maskName.value = `mask_segment_${num}`
@@ -276,6 +306,14 @@ const maskStats = computed(() => ({
   rows: state.masks.reduce((s, m) => s + m.onesCount, 0),
   cols: d.value.columns.length
 }))
+async function doDeleteMask(idx) {
+  if (!requireBackend('删除掩码列')) return
+  if (await deleteMask(idx)) toast('success', '掩码列已从服务端工作区删除')
+}
+async function doDeleteAllMasks() {
+  if (!requireBackend('清空掩码列')) return
+  if (await deleteAllMasks()) toast('success', '掩码列已全部从服务端工作区删除')
+}
 
 // ============ 生命周期 ============
 function init() {
@@ -286,27 +324,44 @@ function init() {
   renderChart()
 }
 function resize() { chart && chart.resize() }
-onMounted(async () => { await nextTick(); init(); window.addEventListener('resize', resize) })
-onActivated(() => nextTick(() => { resize(); renderChart() }))
+onMounted(async () => { await nextTick(); init(); await refreshAll(); window.addEventListener('resize', resize) })
+onActivated(() => { nextTick(() => resize()); refreshAll() })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resize)
   chart && chart.dispose()
   chart = null
 })
-watch(() => state.dataVersion, () => nextTick(renderChart))
+watch(() => state.dataVersion, () => { if (state.currentStep === 4) refreshAll() })
 watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) })
+watch(plotCol, () => { ensureSeries().then(renderChart) })
 </script>
 
 <template>
   <section class="step-panel h-full p-4 flex flex-col gap-3 overflow-y-auto">
+    <!-- 本步不再需要浏览器整表视图：诊断与曲线各取一次后端聚合结果 -->
+    <div v-if="diagError || state.quality.loading" class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
+         :class="diagError ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-indigo-50 border-indigo-200 text-indigo-700'">
+      <i class="fa-solid mt-0.5" :class="diagError ? 'fa-triangle-exclamation' : 'fa-spinner fa-spin'"></i>
+      <div class="min-w-0">
+        <div class="font-semibold">{{ diagError ? '本步为只读：下方数字尚未从后端取到' : '正在从后端读取质量诊断…' }}</div>
+        <div class="mt-0.5 leading-snug opacity-80">{{ diagError || `${d.wsId} · 缺失扫描与抽稀曲线由服务端计算` }}</div>
+      </div>
+      <button v-if="diagError" @click="state.backend.online ? refreshAll() : checkBackend().then(refreshAll)"
+              class="ml-auto shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
+    </div>
+
     <!-- 诊断画布 -->
     <div class="h-[48%] min-h-[340px] shrink-0 bg-white rounded-xl border border-slate-200 shadow-sm p-2 flex flex-col relative">
-      <div class="flex justify-between items-center px-3 pt-1">
-        <div class="flex items-center space-x-3">
-          <span class="text-xs font-bold text-slate-800">时序异常诊断与区间标注画布</span>
-          <span class="text-[11px] bg-rose-50 text-rose-600 border border-rose-200 px-2 py-0.5 rounded-full font-medium">{{ summaryPill }}</span>
+      <div class="flex justify-between items-center px-3 pt-1 gap-3">
+        <div class="flex items-center space-x-3 min-w-0">
+          <span class="text-xs font-bold text-slate-800 shrink-0">时序异常诊断与区间标注画布</span>
+          <select v-model="chosenCol" class="text-[11px] border border-slate-200 rounded px-1.5 py-0.5 bg-white text-slate-600 outline-none focus:border-indigo-400 shrink-0">
+            <option v-for="c in floatCols" :key="c.key" :value="c.key">{{ c.label || c.key }}</option>
+          </select>
+          <span class="text-[11px] bg-rose-50 text-rose-600 border border-rose-200 px-2 py-0.5 rounded-full font-medium truncate">{{ summaryPill }}</span>
         </div>
-        <div class="flex items-center gap-2">
+        <div class="flex items-center gap-2 shrink-0">
+          <span v-if="sd" class="text-[10px] text-slate-400">服务端抽稀 {{ sd.x.length.toLocaleString() }} 点 / {{ sd.rowCount.toLocaleString() }} 行</span>
           <button @click="toggleBrush"
                   class="px-2.5 py-1 text-xs rounded border font-medium flex items-center transition-colors"
                   :class="brushActive ? 'border-rose-400 bg-rose-50 text-rose-700' : 'border-indigo-300 text-indigo-700 hover:bg-indigo-50'">
@@ -314,6 +369,12 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
           </button>
           <button @click="clearBrush" class="px-2.5 py-1 text-xs rounded border border-slate-200 text-slate-600 hover:bg-slate-100">清空框选</button>
         </div>
+      </div>
+      <div v-if="sd && sd.anomaliesTruncated" class="px-3 pt-0.5 text-[10px] text-amber-600 shrink-0">
+        <i class="fa-solid fa-circle-exclamation mr-1"></i>异常点超出绘图上限，图上只画了前 {{ sd.anomalies.length.toLocaleString() }} 个（共 {{ sd.anomalyCount.toLocaleString() }} 个，完整数量见下方表格）
+      </div>
+      <div v-if="sd && sd.stale" class="px-3 pt-0.5 text-[10px] text-rose-600 shrink-0">
+        <i class="fa-solid fa-arrows-rotate mr-1"></i>检测之后数据又被改过，图上的红点已不保证落在当前行：请重新执行检测
       </div>
       <div ref="chartEl" class="w-full flex-1"></div>
     </div>
@@ -356,12 +417,15 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                   <span class="text-sm font-bold font-mono leading-tight" :class="c.color">{{ c.value }}</span>
                 </div>
               </div>
+              <div v-if="!stats" class="col-span-5 text-center py-4 text-[11px] text-slate-400 border border-dashed border-slate-200 rounded-lg">
+                没有诊断数据可读：{{ diagError || '正在从后端读取…' }}
+              </div>
             </div>
 
-            <div class="border border-slate-200 rounded-lg overflow-hidden mb-4">
+            <div v-if="stats" class="border border-slate-200 rounded-lg overflow-hidden mb-4">
               <div class="bg-slate-50 px-3 py-1.5 border-b border-slate-200 flex items-center justify-between">
-                <span class="text-[11px] font-semibold text-slate-600">各列缺失详情 <span class="text-[10px] text-slate-400 font-normal ml-1">点击行查看缺失时间段</span></span>
-                <span class="text-[10px] text-slate-400">共 {{ missingStats.totalRows.toLocaleString() }} 行 × {{ d.columns.length }} 列</span>
+                <span class="text-[11px] font-semibold text-slate-600">各列缺失详情 <span class="text-[10px] text-slate-400 font-normal ml-1">点击数值列行查看缺失时间段</span></span>
+                <span class="text-[10px] text-slate-400">共 {{ stats.totalRows.toLocaleString() }} 行 × {{ stats.stats.length }} 列 · 服务端扫描</span>
               </div>
               <div class="max-h-[140px] overflow-auto">
                 <table class="w-full text-xs">
@@ -377,13 +441,13 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                     </tr>
                   </thead>
                   <tbody class="divide-y divide-slate-100 font-mono">
-                    <tr v-for="s in missingStats.stats" :key="s.key"
-                        class="hover:bg-amber-50/30" :class="s.missing > 0 ? 'cursor-pointer' : ''"
+                    <tr v-for="s in stats.stats" :key="s.key"
+                        class="hover:bg-amber-50/30" :class="s.imputable && s.missing > 0 ? 'cursor-pointer' : ''"
                         :style="segCol === s.key ? 'background:#fef3c7;outline:2px solid #f59e0b;outline-offset:-2px' : ''"
-                        @click="s.missing > 0 && (segCol = s.key)">
+                        @click="s.imputable && s.missing > 0 && (segCol = s.key)">
                       <td class="px-3 py-1.5 text-slate-700 font-sans font-medium truncate max-w-[140px]">
                         {{ s.label }}
-                        <i v-if="s.missing > 0" class="fa-solid fa-chevron-right text-[8px] text-amber-400 ml-1"></i>
+                        <i v-if="s.imputable && s.missing > 0" class="fa-solid fa-chevron-right text-[8px] text-amber-400 ml-1"></i>
                       </td>
                       <td class="px-3 py-1.5"><span class="px-1.5 py-0.5 rounded text-[10px] bg-slate-100 text-slate-500">{{ s.type }}</span></td>
                       <td class="px-3 py-1.5 text-right text-slate-600">{{ s.total.toLocaleString() }}</td>
@@ -405,9 +469,9 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
 
             <div v-if="segCol" class="border border-amber-200 rounded-lg overflow-hidden mb-4 bg-amber-50/30">
               <div class="bg-amber-50 px-3 py-2 border-b border-amber-200 flex items-center justify-between">
-                <div class="flex items-center gap-2">
+                <div class="flex items-center gap-2 min-w-0">
                   <i class="fa-solid fa-clock-rotate-left text-amber-600 text-[11px]"></i>
-                  <span class="text-[11px] font-bold text-amber-800">缺失时间段详情</span>
+                  <span class="text-[11px] font-bold text-amber-800 shrink-0">缺失时间段详情</span>
                   <span class="px-1.5 py-0.5 rounded text-[10px] font-bold bg-amber-200 text-amber-800 font-mono">{{ colLabel(segCol) }}</span>
                   <span class="text-[10px] text-amber-600">共 {{ segList.length }} 个缺失段，{{ segTotalRows() }} 行</span>
                 </div>
@@ -415,11 +479,16 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                   <i class="fa-solid fa-xmark text-[11px]"></i>
                 </button>
               </div>
+              <div v-if="segTruncated" class="px-3 py-2 bg-rose-50 border-b border-rose-200 text-[10px] text-rose-700 leading-snug">
+                <i class="fa-solid fa-circle-exclamation mr-1"></i>
+                该列缺失段超过 {{ stats?.segmentCap }} 段的返回上限，以下是前 {{ segList.length }} 段：逐段填补只能覆盖这部分，
+                整列请用右侧「执行填补与去重」（服务端扫描全表，不受上限限制）
+              </div>
               <div class="max-h-[220px] overflow-auto divide-y divide-amber-100">
                 <div v-if="segList.length === 0" class="text-center py-6 text-amber-400 text-xs">
-                  <i class="fa-solid fa-check-circle text-lg block mb-1"></i>该列无缺失数据
+                  <i class="fa-solid fa-check-circle text-lg block mb-1"></i>该列当前无缺失数据
                 </div>
-                <div v-for="(seg, idx) in segList" :key="idx" class="px-3 py-2.5 flex items-center gap-3 hover:bg-amber-50 transition-colors">
+                <div v-for="(seg, idx) in segList" :key="`${seg.startIdx}-${seg.endIdx}`" class="px-3 py-2.5 flex items-center gap-3 hover:bg-amber-50 transition-colors">
                   <span class="w-5 h-5 rounded-full bg-amber-200 text-amber-800 text-[10px] font-bold flex items-center justify-center shrink-0">{{ idx + 1 }}</span>
                   <div class="flex-1 min-w-0">
                     <div class="flex items-center gap-2 text-xs">
@@ -429,10 +498,10 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                     </div>
                     <div class="text-[10px] text-amber-600 mt-0.5">
                       缺失 <strong>{{ seg.count }}</strong> 行
-                      <span class="text-amber-400 mx-1">·</span>索引 {{ seg.startIdx }}–{{ seg.endIdx }}
+                      <span class="text-amber-400 mx-1">·</span>行号 {{ seg.startIdx }}–{{ seg.endIdx }}
                     </div>
                   </div>
-                  <select :value="algoFor(idx)" @change="setAlgo(idx, $event)"
+                  <select :value="algoFor(idx)" @change="setAlgoAt(idx, $event)"
                           class="text-[11px] border border-amber-300 rounded px-2 py-1 bg-white focus:border-amber-500 outline-none">
                     <option v-for="o in IMPUTE_ALGOS" :key="o.value" :value="o.value">{{ o.label }}</option>
                   </select>
@@ -440,7 +509,8 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                 </div>
                 <div v-if="segList.length > 0" class="px-3 py-2 bg-amber-100/50 border-t border-amber-200 flex items-center justify-between">
                   <span class="text-[10px] text-amber-600">对所有缺失段执行各自选定的算法</span>
-                  <button @click="doAllSegments" class="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-bold shadow-sm">
+                  <button @click="doAllSegments" :disabled="segTruncated" :class="segTruncated ? 'opacity-50 cursor-not-allowed' : ''"
+                          class="px-3 py-1 bg-amber-600 hover:bg-amber-700 text-white rounded text-[11px] font-bold shadow-sm">
                     <i class="fa-solid fa-wand-magic-sparkles mr-1 text-[9px]"></i>一键全部填补
                   </button>
                 </div>
@@ -449,17 +519,22 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
 
             <div class="grid grid-cols-2 gap-5">
               <div>
+                <label class="text-[11px] text-slate-500 block mb-1.5">全表填补默认算法</label>
+                <select v-model="defaultAlgo" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-xs bg-white focus:border-amber-400 outline-none">
+                  <option v-for="o in IMPUTE_ALGOS" :key="o.value" :value="o.value">{{ o.label }}</option>
+                </select>
+                <p class="text-[10px] text-slate-400 mt-1.5">服务端扫描全表时对所有缺失段使用该算法</p>
+              </div>
+              <div>
                 <label class="text-[11px] text-slate-500 block mb-1.5">重复时间戳合并策略</label>
                 <select v-model="dupStrategy" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-xs bg-white focus:border-amber-400 outline-none">
                   <option value="mean">聚合取平均值 (Aggregate Mean)</option>
                   <option value="first">保留首个记录 (Keep First)</option>
                   <option value="last">保留最后记录 (Keep Last)</option>
                 </select>
-                <p class="text-[10px] text-slate-400 mt-1.5">当同一时间戳存在多条记录时，选择合并或去重策略</p>
-              </div>
-              <div class="flex items-end">
-                <p class="text-[10px] text-slate-400 leading-relaxed">
-                  <i class="fa-solid fa-circle-info mr-1 text-amber-500"></i>缺失值填补算法已置于上方各列详情中，点击行后可按时间段独立选择算法
+                <p class="text-[10px] text-slate-400 mt-1.5">
+                  <i class="fa-solid fa-circle-info mr-1 text-amber-500"></i>当前重复时间戳
+                  {{ stats ? stats.duplicateCount.toLocaleString() + ' 条 / ' + stats.duplicateGroups.toLocaleString() + ' 组' : '待后端读取' }}
                 </p>
               </div>
             </div>
@@ -470,7 +545,7 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
               <i class="fa-solid fa-check text-sm"></i>
               <span>执行填补与去重</span>
             </button>
-            <p class="text-[10px] text-slate-400 mt-2 text-center w-40">自动检测缺失段并填充<br/>同时合并重复时间戳</p>
+            <p class="text-[10px] text-slate-400 mt-2 text-center w-40">服务端扫描全表缺失段并填充<br/>同时按解析后的时间戳合并重复</p>
           </div>
         </div>
 
@@ -487,7 +562,7 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                 <select v-model="algo" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-xs bg-white focus:border-rose-400 outline-none">
                   <option value="3sigma">3-Sigma (Z-Score &gt; 3.0)</option>
                   <option value="iqr">四分位距箱线法 (IQR 1.5倍)</option>
-                  <option value="iforest">孤立森林 (浏览器近似版 · 完整版需后端)</option>
+                  <option value="iforest">孤立森林 (近似版 · 后端 numpy 窗口 MAD)</option>
                   <option value="iforest_sklearn">孤立森林 (sklearn 完整版 · {{ state.backend.online ? '后端已连接' : '后端未连接' }})</option>
                   <option value="expr">自定义表达式 (Expression)</option>
                 </select>
@@ -505,7 +580,8 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                         class="flex-1 py-2 bg-rose-500 hover:bg-rose-600 disabled:opacity-60 text-white rounded-lg text-xs font-bold shadow-sm flex items-center justify-center gap-1.5">
                   <i class="fa-solid text-[10px]" :class="detecting ? 'fa-spinner fa-spin' : 'fa-magnifying-glass'"></i>{{ detecting ? '后端计算中…' : '执行检测' }}
                 </button>
-                <button @click="doRepair" class="flex-1 py-2 bg-slate-700 hover:bg-slate-800 text-white rounded-lg text-xs font-bold shadow-sm flex items-center justify-center gap-1.5">
+                <button @click="doRepair" :disabled="!detection || detection.stale"
+                        class="flex-1 py-2 bg-slate-700 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold shadow-sm flex items-center justify-center gap-1.5">
                   <i class="fa-solid fa-wand-magic-sparkles text-[10px]"></i>执行修复
                 </button>
               </div>
@@ -552,12 +628,18 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                 </button>
               </div>
               <div v-if="exprFeedback" class="mt-1.5 text-[10px]" :class="exprFeedback.ok ? 'text-emerald-600' : 'text-rose-600'">{{ exprFeedback.text }}</div>
+              <div class="mt-1 text-[10px] text-slate-400">「验证」只在浏览器检查语法与取值类型；真正逐行判定在后端按同一份表达式向量化求值。</div>
               <div class="flex items-center gap-1.5 mt-2 flex-wrap">
                 <span class="text-[10px] text-rose-400 mr-1">快捷模板:</span>
                 <button v-for="tpl in ['v > 1000', 'v < 0', 'v > mean + 2*std', 'v < mean - 2*std', 'v > q3 + 1.5*(q3-q1) || v < q1 - 1.5*(q3-q1)']" :key="tpl"
                         @click="exprInput = tpl"
                         class="px-2 py-0.5 rounded text-[10px] bg-white border border-rose-200 text-rose-600 hover:bg-rose-100">{{ tpl }}</button>
               </div>
+            </div>
+
+            <div v-if="detection && detection.stale" class="mb-4 px-3 py-2 rounded-lg border border-rose-200 bg-rose-50 text-[11px] text-rose-700 flex items-start gap-2">
+              <i class="fa-solid fa-arrows-rotate mt-0.5"></i>
+              <span>检测之后工作区又被改过（版本 {{ detection.version }} → 当前 {{ d.meta?.version ?? '—' }}），行号已不对应当时的异常行：修复按钮已禁用，请重新执行检测。</span>
             </div>
 
             <div class="grid grid-cols-6 gap-3 mb-4">
@@ -581,7 +663,7 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
             <div class="border border-slate-200 rounded-lg overflow-hidden">
               <div class="bg-slate-50 px-3 py-1.5 border-b border-slate-200 flex items-center justify-between">
                 <span class="text-[11px] font-semibold text-slate-600">各列异常详情</span>
-                <span class="text-[10px] text-slate-400">{{ state.lastAnomaly ? `${ALGO_NAMES[state.lastAnomaly.algo]} · ${state.lastAnomaly.time}` : '等待检测' }}</span>
+                <span class="text-[10px] text-slate-400">{{ detection ? `${ANOMALY_NAMES[detection.algo] || detection.algo} · ${detection.time} · 异常行索引留在服务端` : '等待检测' }}</span>
               </div>
               <div class="max-h-[160px] overflow-auto">
                 <table class="w-full text-xs">
@@ -605,8 +687,8 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                       <td class="px-3 py-1.5 text-right font-semibold" :class="r.anomalies > 0 ? 'text-rose-600' : 'text-slate-400'">{{ r.anomalies.toLocaleString() }}</td>
                       <td class="px-3 py-1.5 text-right font-semibold" :class="r.rate === 0 ? 'text-emerald-600' : r.rate < 5 ? 'text-amber-600' : 'text-rose-600'">{{ r.rate.toFixed(2) }}%</td>
                       <td class="px-3 py-1.5 text-right text-emerald-600">{{ r.normal.toLocaleString() }}</td>
-                      <td class="px-3 py-1.5 text-right text-slate-500">{{ r.lower.toFixed(1) }}</td>
-                      <td class="px-3 py-1.5 text-right text-slate-500">{{ r.upper.toFixed(1) }}</td>
+                      <td class="px-3 py-1.5 text-right text-slate-500" :title="r.lower === null ? '该列全部为异常或无正常点，无法给出边界' : ''">{{ fmtBound(r.lower) }}</td>
+                      <td class="px-3 py-1.5 text-right text-slate-500" :title="r.upper === null ? '该列全部为异常或无正常点，无法给出边界' : ''">{{ fmtBound(r.upper) }}</td>
                       <td class="px-3 py-1.5">
                         <div class="w-full h-2 bg-slate-100 rounded-full overflow-hidden">
                           <div class="h-full rounded-full transition-all"
@@ -647,7 +729,7 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                   <template v-if="brushRange">{{ brushRange.start }} ~ {{ brushRange.end }} (索引 {{ brushRange.startIdx }}–{{ brushRange.endIdx }})</template>
                   <template v-else>未框选 — 请先在上方图表上拖拽选取时段</template>
                 </div>
-                <p class="text-[10px] text-slate-400 mt-1.5">使用上方图表的「开启时段刷选标记」按钮框选</p>
+                <p class="text-[10px] text-slate-400 mt-1.5">图表只画服务端抽稀后的点，框选边界会吸附到最近的真实行号（行号即工作区当前帧的行位置）</p>
               </div>
               <div>
                 <label class="text-[11px] text-slate-500 block mb-1.5">自定义掩码特征列名</label>
@@ -667,7 +749,7 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                   <i class="fa-solid fa-layer-group text-teal-500 text-[10px]"></i>已生成的标注掩码
                   <span class="px-1.5 py-0.5 rounded-full text-[10px] font-bold bg-teal-100 text-teal-700">{{ state.masks.length }}</span>
                 </span>
-                <button v-if="state.masks.length > 0" @click="deleteAllMasks" class="text-[10px] text-slate-400 hover:text-rose-600">
+                <button v-if="state.masks.length > 0" @click="doDeleteAllMasks" class="text-[10px] text-slate-400 hover:text-rose-600">
                   <i class="fa-solid fa-trash-can mr-0.5"></i>清空全部
                 </button>
               </div>
@@ -695,7 +777,7 @@ watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) 
                         <span>索引 {{ m.startIdx }}–{{ m.endIdx }}</span>
                       </div>
                     </div>
-                    <button @click="deleteMask(idx)" title="删除此掩码"
+                    <button @click="doDeleteMask(idx)" title="删除此掩码"
                             class="shrink-0 w-7 h-7 rounded-md flex items-center justify-center text-slate-300 hover:text-rose-600 hover:bg-rose-50 opacity-0 group-hover:opacity-100 transition-all">
                       <i class="fa-solid fa-trash-can text-[11px]"></i>
                     </button>

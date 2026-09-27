@@ -1,21 +1,36 @@
 <script setup>
-import { computed, reactive, ref, nextTick, onActivated, onMounted } from 'vue'
+import { computed, reactive, ref, nextTick, onActivated, onMounted, watch } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import {
-  state, ds, toast, switchStep,
+  state, ds, toast, switchStep, rowCount, refreshPage, wsActionLog,
   initFeatureList, buildTimeFeatures, timePlanLabel, buildLagFeatures, buildDiffFeatures,
-  buildCatFeatures, catColumnDistribution, renameFeature, dropFeature, HOLIDAY_COUNT,
+  buildCatFeatures, catColumnDistribution, renameFeature, dropFeature, firstCompleteRow,
   ROLL_STATS, lagFeaturePlan, normEwmSpan, diffFeaturePlan
 } from '../store'
 
 // 换新引用才能失效下游 computed（见 Step2Config 同款注释）
 const d = computed(() => { void state.dataVersion; return { ...ds() } })
+// 四类特征全部在后端的整帧上算（期③）：浏览器只持有元数据与当前页窗口，不再常驻整表数据
+const limits = computed(() => state.backend.limits || {})
+const running = ref(false)
+// 一次只跑一个构建：连点两次会把同一批特征建第二遍（第二次只是「新增 0 列」，白跑一趟后端）
+async function runBuild(fn, onOk) {
+  if (running.value) return
+  running.value = true
+  try {
+    const r = await fn()
+    if (r) onOk(r)
+  } finally {
+    running.value = false
+  }
+}
 
 const activeTab = ref('time')
-// 「本步已完成」必须来自审计链：撤销和回放都会改写操作记录，本地一次性置 true 的标志会长期说谎
+// 「本步已完成」必须来自审计链：撤销和回放都会改写操作记录，本地一次性置 true 的标志会长期说谎。
+// 取 wsActionLog()：一份会话里连着开两个数据集时，上一个的构建不该给这一个打勾。
 const pipe = computed(() => {
   void state.dataVersion
-  const built = new Set(state.actionLog.filter(e => e.params?.type === 'feature_build').map(e => e.params.featureType))
+  const built = new Set(wsActionLog().filter(e => e.params?.type === 'feature_build').map(e => e.params.featureType))
   return { time: built.has('time'), lag: built.has('lag_roll'), diff: built.has('diff_freq'), cat: built.has('cat') }
 })
 
@@ -38,13 +53,15 @@ function runTimeFeatures() {
     toast('warning', '正余弦是对已勾选的周期维度（小时 / 星期 / 月份）换一种编码，需先勾选至少一个周期维度')
     return
   }
-  const r = buildTimeFeatures(chosen)
-  toast('success', `已写入 ${r.cols} 个时间特征列（其中正余弦 ${r.sinCos} 列，本次新增 ${r.created} 列）`)
+  runBuild(() => buildTimeFeatures(chosen), r => {
+    toast('success', `已写入 ${r.cols} 个时间特征列（其中正余弦 ${r.sinCos} 列，本次新增 ${r.created} 列）`)
+  })
 }
 
 // ---- 共享数值列勾选（滞后 / 差分两个 Tab 共用同一选择集，修正原型跨容器重复计数 bug）----
 const featCols = reactive({})
-function numericCols() { return d.value.columns.filter(c => c.type === 'float') }
+// 勾选框只列原始数值列：特征列已是工程产物，混进「操作字段」会让上一次构建的产物自动变成下一次的输入
+function numericCols() { return d.value.columns.filter(c => c.type === 'float' && !c.feature) }
 function ensureFeatCols() {
   const cols = numericCols()
   const valid = new Set(cols.map(c => c.key))
@@ -103,8 +120,9 @@ function runLagFeatures() {
     toast('warning', '已填写滚动窗口但未勾选任何滚动统计量')
     return
   }
-  const r = buildLagFeatures(targetCols, params)
-  toast('success', `已写入 ${r.cols} 个滞后与窗口特征列（本次新增 ${r.created} 列）· 目标列: ${targetCols.join(', ')}`)
+  runBuild(() => buildLagFeatures(targetCols, params), r => {
+    toast('success', `已写入 ${r.cols} 个滞后与窗口特征列（本次新增 ${r.created} 列）· 目标列: ${targetCols.join(', ')}`)
+  })
 }
 
 // ---- Tab 3: 差分平稳化与频域 ----
@@ -133,8 +151,9 @@ function runDiffFeatures() {
     toast('warning', '请至少勾选一项差分或频域特征')
     return
   }
-  const r = buildDiffFeatures(targetCols, diffParams())
-  toast('success', `已写入 ${r.cols} 个差分与频域特征列（本次新增 ${r.created} 列）· 目标列: ${targetCols.join(', ')}`)
+  runBuild(() => buildDiffFeatures(targetCols, diffParams()), r => {
+    toast('success', `已写入 ${r.cols} 个差分与频域特征列（本次新增 ${r.created} 列）· 目标列: ${targetCols.join(', ')}`)
+  })
 }
 
 // ---- Tab 4: 类别特征编码 ----
@@ -151,12 +170,27 @@ function ensureCatCols() {
   if (pickedKeys(catCols).length === 0 && cols.length > 0) catCols[cols[0].key] = true
 }
 
-const catDist = computed(() => {
-  void state.dataVersion
+// 面板上的取值分布来自后端 /value-counts（整表计数）：勾选变化 / 换编码方式 / 版本号变化都要重取
+const catDist = ref({ rows: [], totalNewCols: 0, loading: false, error: '' })
+let catDistSeq = 0
+
+async function loadCatDist() {
+  // 换数据集时这个 watch 先于 enterStep 里的 ensureCatCols 触发，勾选集还挂着上一份数据的列名，
+  // 直接送去 /value-counts 就是一句「列不存在」的 400。先按当前列注册表把失效项剔掉。
+  const valid = new Set(catColsList().map(c => c.key))
+  Object.keys(catCols).forEach(k => { if (!valid.has(k)) delete catCols[k] })
   const keys = catPicked.value
-  if (keys.length === 0) return { rows: [], totalNewCols: 0 }
-  return catColumnDistribution(keys, catMethod.value)
-})
+  const method = catMethod.value
+  if (keys.length === 0) { catDist.value = { rows: [], totalNewCols: 0, loading: false, error: '' }; return }
+  const seq = ++catDistSeq
+  catDist.value = { ...catDist.value, loading: true }
+  const r = await catColumnDistribution(keys, method)
+  if (seq !== catDistSeq) return   // 只认最后一次请求的结果
+  catDist.value = r
+    ? { ...r, loading: false, error: '' }
+    : { rows: [], totalNewCols: 0, loading: false, error: '后端未返回分布数据（原因见提示）' }
+}
+watch(() => `${catPicked.value.join(',')}|${catMethod.value}|${d.value.meta?.version ?? -1}`, () => { loadCatDist() })
 
 function distBar(row) {
   return row.uniqueVals.slice(0, 4).map((v, i) => {
@@ -170,42 +204,57 @@ function distBar(row) {
 function runCatFeatures() {
   const keys = catPicked.value
   if (keys.length === 0) { toast('warning', '请先在左侧勾选至少一个类别列'); return }
-  const r = buildCatFeatures(keys, catMethod.value)
-  toast('success', `已执行${CAT_METHOD_NAMES[catMethod.value]}，写入 ${r.cols} 列（本次新增 ${r.created} 列）· 列: ${keys.join(', ')}`)
+  runBuild(() => buildCatFeatures(keys, catMethod.value), r => {
+    toast('success', `已执行${CAT_METHOD_NAMES[catMethod.value]}，写入 ${r.cols} 列（本次新增 ${r.created} 列）· 列: ${keys.join(', ')}`)
+  })
 }
 
-// ---- 特征矩阵预览 ----
+// ---- 特征矩阵预览：读后端分页窗口，翻页即向 /rows 要下一段，浏览器不留整表 ----
 const newFeatCount = computed(() => { void state.dataVersion; return state.features.filter(f => f.isNew).length })
 const PREVIEW_SIZE = 10
 const previewStart = ref(0)
 function isNull(v) { return v === null || v === undefined || (typeof v === 'number' && Number.isNaN(v)) }
-const totalRows = computed(() => { void state.dataVersion; return d.value.data.length })
+const page = computed(() => d.value.page || { offset: 0, limit: 50, columns: [], rows: [], total: 0 })
+const pageRows = computed(() => {
+  const keys = page.value.columns
+  return page.value.rows.map(r => {
+    const o = {}
+    for (let i = 0; i < keys.length; i++) o[keys[i]] = r[i]
+    return o
+  })
+})
+const totalRows = computed(() => page.value.total)
 const previewRows = computed(() => {
   void state.dataVersion
-  const data = d.value.data
-  const start = Math.max(0, Math.min(previewStart.value, data.length - 1))
-  return data.slice(start, start + PREVIEW_SIZE)
+  return pageRows.value.slice(previewStart.value, previewStart.value + PREVIEW_SIZE)
 })
-const previewFrom = computed(() => previewRows.value.length ? Math.min(previewStart.value + 1, totalRows.value) : 0)
-const previewTo = computed(() => Math.min(previewStart.value + PREVIEW_SIZE, totalRows.value))
-function shiftPreview(delta) {
-  const max = Math.max(0, totalRows.value - PREVIEW_SIZE)
-  previewStart.value = Math.max(0, Math.min(max, previewStart.value + delta * PREVIEW_SIZE))
+const previewFrom = computed(() => (previewRows.value.length ? page.value.offset + previewStart.value + 1 : 0))
+const previewTo = computed(() => page.value.offset + previewStart.value + previewRows.value.length)
+const previewAtHead = computed(() => page.value.offset === 0 && previewStart.value === 0)
+async function shiftPreview(delta) {
+  const step = delta * PREVIEW_SIZE
+  const next = previewStart.value + step
+  const maxInPage = Math.max(0, pageRows.value.length - Math.min(PREVIEW_SIZE, pageRows.value.length))
+  if (next >= 0 && next <= maxInPage) { previewStart.value = next; return }
+  // 页内放不下就换页：offset 必须落在后端那一页里，所以按整页取回再从头显示
+  const offset = Math.max(0, Math.min(Math.max(0, totalRows.value - PREVIEW_SIZE), page.value.offset + step))
+  if (offset === page.value.offset) { previewStart.value = 0; return }
+  previewStart.value = 0
+  await refreshPage(offset)
 }
 // 长窗口特征在前 N 行必然为空（窗口未覆盖），定位到首个新特征全部有值的行
-function jumpToComplete() {
-  const data = d.value.data
+async function jumpToComplete() {
   const newKeys = state.features.filter(f => f.isNew).map(f => f.key)
   if (newKeys.length === 0) { toast('info', '当前没有新增特征列'); return }
-  const limit = Math.min(data.length, 5000)
-  for (let i = 0; i < limit; i++) {
-    if (newKeys.every(k => !isNull(data[i][k]))) {
-      previewStart.value = Math.min(i, Math.max(0, totalRows.value - PREVIEW_SIZE))
-      toast('success', `第 ${i + 1} 行起全部新增特征均有值`)
-      return
-    }
+  const r = await firstCompleteRow(newKeys)
+  if (!r) return
+  if (r.index === null) {
+    toast('warning', `前 ${r.scanned.toLocaleString()} 行内没有所有新增特征都有值的行`)
+    return
   }
-  toast('warning', `前 ${limit} 行内没有所有新增特征都有值的行`)
+  previewStart.value = 0
+  await refreshPage(r.index)
+  toast('success', `第 ${r.index + 1} 行起全部新增特征均有值`)
 }
 
 const renameIdx = ref(-1)
@@ -223,7 +272,7 @@ function commitRename() {
   const v = renameVal.value.trim()
   renameIdx.value = -1
   if (!v || v === state.features[idx].label) return
-  renameFeature(idx, v)
+  runBuild(() => renameFeature(idx, v), () => toast('success', `特征列已重命名为 [${v}]`))
 }
 function cancelRename() { renameIdx.value = -1 }
 
@@ -232,17 +281,19 @@ async function confirmDrop(idx) {
   const feat = state.features[idx]
   try {
     await ElMessageBox.confirm(
-      `确认撤销特征列「${feat.label}」？将同时删除 ${totalRows.value.toLocaleString()} 行里的该字段，此操作会写入操作记录（可回放、可导出 Python）。`,
+      `确认撤销特征列「${feat.label}」？后端工作区的 ${rowCount().toLocaleString()} 行会一并去掉该字段，此操作会写入操作记录（可回放、可导出 Python）。`,
       '撤销特征列', { type: 'warning' })
   } catch (e) { return }
   renameIdx.value = -1
-  if (dropFeature(idx)) toast('success', `特征列 [${feat.label}] 已撤销`)
+  const label = feat.label
+  await runBuild(() => dropFeature(idx), () => toast('success', `特征列 [${label}] 已撤销`))
 }
 
 function enterStep() {
   initFeatureList()
   ensureFeatCols()
   ensureCatCols()
+  loadCatDist()
 }
 onMounted(enterStep)
 onActivated(enterStep)
@@ -250,6 +301,24 @@ onActivated(enterStep)
 
 <template>
   <section class="h-full p-4 flex flex-col gap-3 overflow-y-auto">
+    <div class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
+         :class="state.backend.online ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-rose-50 border-rose-200 text-rose-700'">
+      <i class="fa-solid mt-0.5" :class="state.backend.online ? 'fa-server' : 'fa-triangle-exclamation'"></i>
+      <div class="min-w-0">
+        <div class="font-semibold">
+          <template v-if="state.backend.online">
+            四类特征均在后端整帧上计算 · 工作区 {{ rowCount().toLocaleString() }} 行 × {{ d.columns.length }} 列 · v{{ d.meta?.version ?? 0 }}
+            <span v-if="running" class="ml-1 opacity-70"><i class="fa-solid fa-spinner fa-spin mr-1"></i>构建中…</span>
+          </template>
+          <template v-else>后端不在线：本页的构建、重命名与撤销均为只读，浏览器不再算第二套</template>
+        </div>
+        <div class="mt-0.5 leading-snug opacity-80" v-if="state.backend.online">
+          浏览器只持有列注册表与下方预览的当前页窗口；单次构建上限
+          {{ limits.featureColsPerOp || '—' }} 列 · 独热单列取值上限 {{ limits.onehotLevels || '—' }} 个 ·
+          滚动窗口上限 {{ limits.featureWindow || '—' }} 步
+        </div>
+      </div>
+    </div>
     <!-- 特征配置区 -->
     <div class="shrink-0 bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
       <!-- Tab 栏 + 流水线状态 -->
@@ -343,7 +412,7 @@ onActivated(enterStep)
                 <div class="font-mono text-slate-400 break-all leading-snug mt-0.5">{{ timePlan.keys.join('  ') || '（未勾选任何维度）' }}</div>
               </div>
             </div>
-            <p class="text-[10px] text-slate-400 mt-2">节假日编码基于 2024 年中国法定节假日表（{{ HOLIDAY_COUNT }} 天）。</p>
+            <p class="text-[10px] text-slate-400 mt-2">节假日编码基于 2024 年中国法定节假日表（{{ limits.holidayDays || '—' }} 天，天数取自后端同一份表）。</p>
           </div>
           <div class="shrink-0 flex flex-col items-center justify-center h-full pl-4 border-l border-slate-100">
             <button @click="runTimeFeatures"
@@ -604,13 +673,15 @@ onActivated(enterStep)
                     <label class="text-[11px] text-slate-500 block mb-1.5">编码参数预览</label>
                     <div class="text-[11px] p-2.5 bg-slate-50 border border-slate-200 rounded-lg text-slate-600 font-mono min-h-[42px]">
                       <template v-if="catPicked.length === 0">选择类别列后自动预览</template>
+                      <template v-else-if="catDist.loading">后端正在整表计数…</template>
+                      <template v-else-if="catDist.error">{{ catDist.error }}</template>
                       <template v-else>
                         <span class="text-violet-600 font-bold">{{ catPicked.length }}</span> 列 ·
                         <span class="text-violet-600 font-bold">{{ CAT_METHOD_NAMES[catMethod] }}</span> · 预计新增
                         <span class="text-violet-600 font-bold">{{ catDist.totalNewCols }}</span> 列
                       </template>
                     </div>
-                    <p class="text-[10px] text-slate-400 mt-1.5">显示所选列的类别数、编码后预计新增列数</p>
+                    <p class="text-[10px] text-slate-400 mt-1.5">显示所选列的类别数、编码后预计新增列数（均由后端整表数出，与「执行编码」的产物列数同源）</p>
                   </div>
                 </div>
                 <div class="border border-slate-200 rounded-lg overflow-hidden">
@@ -633,9 +704,11 @@ onActivated(enterStep)
                         <tr v-if="catDist.rows.length === 0"><td colspan="5" class="text-center py-6 text-slate-300">—</td></tr>
                         <tr v-for="r in catDist.rows" :key="r.key" class="hover:bg-violet-50/30">
                           <td class="px-3 py-1.5 text-slate-700 font-sans font-medium truncate max-w-[100px]">{{ r.label }}</td>
-                          <td class="px-3 py-1.5 text-slate-500 text-[10px] truncate max-w-[200px]">{{ r.topVals }}</td>
-                          <td class="px-3 py-1.5 text-right font-semibold text-violet-600">{{ r.uniqueVals.length }}</td>
-                          <td class="px-3 py-1.5 text-right text-slate-600">{{ r.total.toLocaleString() }}</td>
+                          <td class="px-3 py-1.5 text-slate-500 text-[10px] truncate max-w-[200px]" :title="r.truncated ? `仅显示前 ${r.uniqueVals.length} 个取值，另有 ${r.restCount.toLocaleString()} 行落在其余取值` : r.topVals">{{ r.topVals || '—' }}</td>
+                          <td class="px-3 py-1.5 text-right font-semibold text-violet-600" :title="r.truncated ? `后端只回传前 ${limits.uniqueValuesReported || 200} 个取值，此数为真实取值数` : '整表去重取值数'">
+                            {{ r.uniqueTotal.toLocaleString() }}<span v-if="r.truncated" class="text-slate-400 font-normal">+</span>
+                          </td>
+                          <td class="px-3 py-1.5 text-right text-slate-600" :title="`非缺失 ${r.nonMissingRows.toLocaleString()} 行 / 共 ${r.total.toLocaleString()} 行`">{{ r.total.toLocaleString() }}</td>
                           <td class="px-3 py-1.5">
                             <div class="w-full h-2 bg-slate-100 rounded-full overflow-hidden flex">
                               <div v-for="(seg, si) in distBar(r)" :key="si" class="h-full" :class="seg.cls" :style="seg.style"></div>
@@ -673,11 +746,11 @@ onActivated(enterStep)
           <div class="flex items-center gap-1 mr-1">
             <button @click="jumpToComplete" title="定位到首个新增特征全部有值的行"
                     class="px-2 py-0.5 rounded border border-slate-200 text-slate-600 hover:border-indigo-300 hover:text-indigo-600">首个完整行</button>
-            <button @click="shiftPreview(-1)" :disabled="previewStart === 0"
+            <button @click="shiftPreview(-1)" :disabled="previewAtHead"
                     class="w-6 h-6 flex items-center justify-center rounded border border-slate-200 text-slate-600 hover:border-indigo-300 disabled:opacity-30 disabled:cursor-not-allowed">
               <i class="fa-solid fa-chevron-left text-[10px]"></i>
             </button>
-            <span class="font-mono text-slate-500">第 {{ previewFrom }}–{{ previewTo }} 行 / 共 {{ totalRows }}</span>
+            <span class="font-mono text-slate-500" :title="`预览读的是后端 /rows 分页窗口（每页 ${page.limit} 行）· 工作区共 ${rowCount().toLocaleString()} 行`">第 {{ previewFrom }}–{{ previewTo }} 行 / 工作区共 {{ totalRows.toLocaleString() }} 行</span>
             <button @click="shiftPreview(1)" :disabled="previewTo >= totalRows"
                     class="w-6 h-6 flex items-center justify-center rounded border border-slate-200 text-slate-600 hover:border-indigo-300 disabled:opacity-30 disabled:cursor-not-allowed">
               <i class="fa-solid fa-chevron-right text-[10px]"></i>

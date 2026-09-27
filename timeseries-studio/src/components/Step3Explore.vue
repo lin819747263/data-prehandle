@@ -1,8 +1,8 @@
 <script setup>
 import { ref, computed, reactive, onMounted, onActivated, onBeforeUnmount, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
-import { state, ds, switchStep, detectedFreqMinutes } from '../store'
-import { isMissing } from '../utils'
+import { state, ds, switchStep, detectedFreqMinutes, rowCount } from '../store'
+import { wsStats, wsHist, wsSeriesMulti } from '../api'
 
 const COLORS = ['#4f46e5', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#e11d48']
 const colorOf = i => COLORS[i % COLORS.length]
@@ -10,6 +10,14 @@ const colorOf = i => COLORS[i % COLORS.length]
 // 换新引用才能失效下游 computed（见 Step2Config 同款注释）
 const d = computed(() => { void state.dataVersion; return { ...ds() } })
 const floatCols = computed(() => d.value.columns.filter(c => c.type === 'float'))
+
+// 本页三块数字各自一次后端整表计算：统计矩阵、叠加曲线、直方图
+const gate = ref({ status: 'idle', note: '' })
+const stats = ref(null)
+const chart = ref(null)
+const hist = ref(null)
+const fetching = reactive({ stats: false, series: false, hist: false })
+let loadedVersion = null
 
 const selected = reactive(new Set())
 function ensureSelection() {
@@ -22,18 +30,23 @@ watch(floatCols, ensureSelection)
 function toggleCol(key) {
   if (selected.has(key)) selected.delete(key)
   else selected.add(key)
-  render()
+  refreshSeries()
 }
 function toggleAll(on) {
   selected.clear()
   if (on) floatCols.value.forEach(c => selected.add(c.key))
-  render()
+  refreshSeries()
 }
 function selectedList() {
   return floatCols.value.filter(c => selected.has(c.key)).map(c => c.key)
 }
 
-const downsample = ref('lttb')
+// 抽稀在后端执行（旧的那档 LTTB 是渲染期算法，随浏览器整表视图一起退场）
+const MODE_LABELS = { raw: '原始全量', extremes: '极值抽稀', mean: '窗口均值' }
+const downsample = ref('extremes')
+const pointsCap = computed(() => state.backend.limits?.seriesMaxPoints || 3000)
+const binsCount = computed(() => state.backend.limits?.histogramBins || 25)
+
 const distCol = ref('')
 watch(floatCols, () => {
   if (!floatCols.value.some(c => c.key === distCol.value)) distCol.value = floatCols.value[0]?.key || ''
@@ -44,65 +57,80 @@ const distEl = ref(null)
 let chartMain = null
 let chartDist = null
 
-const statsMatrix = computed(() => {
-  const data = d.value.data
-  const totalRows = data.length
-  let globalMax = 1
-  const rows = floatCols.value.map(col => {
-    const vals = data.map(r => r[col.key]).filter(v => !isMissing(v) && !isNaN(Number(v))).map(Number).sort((a, b) => a - b)
-    const missing = totalRows - vals.length
-    const missingRate = totalRows > 0 ? missing / totalRows * 100 : 0
-    if (vals.length === 0) {
-      return { label: col.label, key: col.key, n: 0, mean: 0, std: 0, min: 0, q1: 0, median: 0, q3: 0, max: 0, missing, missingRate }
-    }
-    const n = vals.length
-    const min = vals[0], max = vals[n - 1]
-    const mean = vals.reduce((s, v) => s + v, 0) / n
-    const median = n % 2 === 0 ? (vals[n / 2 - 1] + vals[n / 2]) / 2 : vals[Math.floor(n / 2)]
-    const q1 = vals[Math.floor(n * 0.25)]
-    const q3 = vals[Math.floor(n * 0.75)]
-    const std = Math.sqrt(vals.reduce((s, v) => s + (v - mean) ** 2, 0) / n)
-    if (max > globalMax) globalMax = max
-    return { label: col.label, key: col.key, n, mean, std, min, q1, median, q3, max, missing, missingRate }
-  })
-  return { rows, globalMax, totalRows, cols: floatCols.value.length }
-})
+const displayRows = computed(() => (stats.value ? stats.value.rowCount : rowCount()))
+const displayCols = computed(() => (stats.value ? stats.value.colCount : floatCols.value.length))
+function fmt(v) { return v === null || v === undefined ? '—' : Number(v).toFixed(1) }
 
-function downsampleValues(vals) {
-  if (downsample.value !== 'mean' || vals.length <= 500) return vals
-  const step = 4, result = []
-  for (let i = 0; i < vals.length; i += step) {
-    const chunk = vals.slice(i, i + step).filter(v => !isMissing(v)).map(Number)
-    result.push(chunk.length ? parseFloat((chunk.reduce((a, b) => a + b, 0) / chunk.length).toFixed(2)) : null)
+async function loadStats() {
+  const keys = floatCols.value.map(c => c.key)
+  if (!keys.length) { stats.value = null; return }
+  fetching.stats = true
+  try {
+    stats.value = await wsStats(d.value.wsId, keys)
+  } catch (e) {
+    gate.value = { status: 'error', note: `统计矩阵获取失败：${e.message || e}` }
+    return
+  } finally {
+    fetching.stats = false
   }
-  return result
 }
 
-function render() {
+async function refreshSeries() {
+  const keys = selectedList()
+  if (!keys.length) { chart.value = null; drawMain(); return }
+  fetching.series = true
+  try {
+    chart.value = await wsSeriesMulti(d.value.wsId, keys, downsample.value, pointsCap.value)
+    if (gate.value.status === 'loading') gate.value = { status: 'ready', note: '' }
+  } catch (e) {
+    gate.value = { status: 'error', note: `曲线数据获取失败：${e.message || e}` }
+    return
+  } finally {
+    fetching.series = false
+  }
+  drawMain()
+}
+
+async function refreshHist() {
+  if (!distCol.value) { hist.value = null; drawDist(); return }
+  fetching.hist = true
+  try {
+    hist.value = await wsHist(d.value.wsId, distCol.value, binsCount.value)
+  } catch (e) {
+    gate.value = { status: 'error', note: `直方图获取失败：${e.message || e}` }
+    return
+  } finally {
+    fetching.hist = false
+  }
+  drawDist()
+}
+
+async function prepare(force = false) {
+  if (!state.backend.online) { gate.value = { status: 'offline', note: '后端不在线：第三步的整表统计无从计算' }; return }
+  if (!d.value.wsId) { gate.value = { status: 'noData', note: '尚未接入数据' }; return }
+  const version = d.value.meta?.version
+  if (!force && loadedVersion === version && gate.value.status === 'ready') return
+  gate.value = { status: 'loading', note: '正在由后端整表计算统计矩阵、叠加曲线与直方图…' }
+  await loadStats()
+  await refreshSeries()
+  await refreshHist()
+  loadedVersion = version
+  if (gate.value.status === 'loading') gate.value = { status: 'ready', note: '' }
+}
+
+function drawMain() {
   if (!chartMain) return
-  const data = d.value.data
-  const feats = selectedList()
-  if (feats.length === 0) { chartMain.clear(); return }
+  const data = chart.value
+  if (!data || !data.series || data.series.length === 0) { chartMain.clear(); return }
 
-  const timestamps = data.map(r => r[d.value.timeCol])
-  const displayTs = downsample.value === 'mean' && timestamps.length > 500
-    ? timestamps.filter((_, i) => i % 4 === 0) : timestamps
-
-  const featData = feats.map(key => {
-    const raw = data.map(r => r[key])
-    const dsVals = downsampleValues(raw)
-    return { key, raw, dsVals }
-  })
-
-  const series = featData.map((fd, i) => {
+  const series = data.series.map((fd, i) => {
     const isFirst = i === 0
     return {
-      name: d.value.columns.find(c => c.key === fd.key)?.label || fd.key,
+      name: fd.label || fd.col,
       type: 'line',
-      data: fd.dsVals,
+      data: fd.y,
       smooth: true,
       showSymbol: false,
-      sampling: downsample.value === 'lttb' ? 'lttb' : false,
       lineStyle: { width: isFirst ? 2 : 1.5, color: colorOf(i) },
       itemStyle: { color: colorOf(i) },
       areaStyle: isFirst ? {
@@ -116,7 +144,9 @@ function render() {
 
   chartMain.setOption({
     title: {
-      text: feats.length === 1 ? `时序曲线 — ${feats[0]}` : `多特征叠加曲线 (${feats.length}条)`,
+      text: series.length === 1
+        ? `时序曲线 — ${data.series[0].label || data.series[0].col}`
+        : `多特征叠加曲线 (${series.length}条)`,
       left: 10, top: 5, textStyle: { fontSize: 13, color: '#334155' }
     },
     tooltip: {
@@ -125,7 +155,7 @@ function render() {
         if (!params || params.length === 0) return ''
         let tip = `<div style="font-size:11px"><b>${params[0].axisValue}</b><br/>`
         params.forEach(p => {
-          const val = p.value !== null && p.value !== undefined ? Number(p.value).toFixed(2) : 'NaN'
+          const val = p.value !== null && p.value !== undefined ? Number(p.value).toFixed(2) : '缺失'
           tip += `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${p.color};margin-right:4px"></span>${p.seriesName}: <b>${val}</b><br/>`
         })
         return tip + '</div>'
@@ -137,37 +167,17 @@ function render() {
       { type: 'inside', start: 0, end: 30 },
       { type: 'slider', bottom: 10, height: 22, borderColor: '#cbd5e1' }
     ],
-    xAxis: { type: 'category', data: displayTs, axisLine: { lineStyle: { color: '#94a3b8' } } },
+    xAxis: { type: 'category', data: data.x, axisLine: { lineStyle: { color: '#94a3b8' } } },
     yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed', color: '#e2e8f0' } } },
     series
   }, true)
-
-  if (!distCol.value || !feats.includes(distCol.value)) distCol.value = feats[0]
-  renderDist()
 }
 
-function renderDist() {
-  if (!chartDist || !distCol.value) return
-  const colKey = distCol.value
-  const vals = d.value.data.map(r => r[colKey]).filter(v => !isMissing(v) && !isNaN(Number(v))).map(Number).sort((a, b) => a - b)
-  if (vals.length === 0) { chartDist.clear(); return }
-
-  const n = vals.length
-  const min = vals[0], max = vals[n - 1]
-  const mean = vals.reduce((s, v) => s + v, 0) / n
-  const median = n % 2 === 0 ? (vals[n / 2 - 1] + vals[n / 2]) / 2 : vals[Math.floor(n / 2)]
-  const binCount = 25
-  const binWidth = (max - min) / binCount || 1
-  const bins = new Array(binCount).fill(0)
-  const binLabels = []
-  for (let i = 0; i < binCount; i++) binLabels.push((min + i * binWidth).toFixed(1))
-  vals.forEach(v => {
-    let idx = Math.floor((v - min) / binWidth)
-    if (idx >= binCount) idx = binCount - 1
-    bins[idx]++
-  })
-  const meanBinIdx = Math.min(binCount - 1, Math.max(0, Math.floor(((mean - min) / (max - min || 1)) * binCount)))
-  const medianBinIdx = Math.min(binCount - 1, Math.max(0, Math.floor(((median - min) / (max - min || 1)) * binCount)))
+function drawDist() {
+  if (!chartDist) return
+  const h = hist.value
+  if (!h || !h.edges || h.edges.length === 0) { chartDist.clear(); return }
+  const binLabels = h.edges.map(e => Number(e).toFixed(1))
 
   chartDist.setOption({
     tooltip: { trigger: 'axis', axisPointer: { type: 'shadow' } },
@@ -177,10 +187,10 @@ function renderDist() {
     series: [{
       name: '频次',
       type: 'bar',
-      data: bins.map((v, i) => ({
+      data: h.counts.map((v, i) => ({
         value: v,
         itemStyle: {
-          color: (i === meanBinIdx || i === medianBinIdx)
+          color: (i === h.meanBin || i === h.medianBin)
             ? '#6366f1'
             : new echarts.graphic.LinearGradient(0, 0, 0, 1, [
               { offset: 0, color: '#a5b4fc' },
@@ -193,17 +203,19 @@ function renderDist() {
       markLine: {
         symbol: 'none',
         data: [
-          { xAxis: binLabels[meanBinIdx], name: `Mean(${mean.toFixed(1)})`, lineStyle: { color: '#ef4444', width: 1.5, type: 'dashed' }, label: { show: true, formatter: `μ${mean.toFixed(0)}`, fontSize: 9, color: '#ef4444' } },
-          { xAxis: binLabels[medianBinIdx], name: `Median(${median.toFixed(1)})`, lineStyle: { color: '#4f46e5', width: 2 }, label: { show: true, formatter: `M${median.toFixed(0)}`, fontSize: 9, color: '#4f46e5' } }
+          { xAxis: binLabels[h.meanBin], name: `Mean(${h.mean.toFixed(1)})`, lineStyle: { color: '#ef4444', width: 1.5, type: 'dashed' }, label: { show: true, formatter: `μ${h.mean.toFixed(0)}`, fontSize: 9, color: '#ef4444' } },
+          { xAxis: binLabels[h.medianBin], name: `Median(${h.median.toFixed(1)})`, lineStyle: { color: '#4f46e5', width: 2 }, label: { show: true, formatter: `M${h.median.toFixed(0)}`, fontSize: 9, color: '#4f46e5' } }
         ]
       }
     }]
   }, true)
 }
 
+function render() { drawMain(); drawDist() }
+
 function quickZoom(days) {
   if (!chartMain) return
-  const total = d.value.data.length
+  const total = (chart.value && chart.value.rowCount) || displayRows.value || 1
   const freq = Math.max(1, Math.round(1440 / (detectedFreqMinutes() || 15)))
   const percentage = Math.min(100, (days * freq / total) * 100)
   chartMain.dispatchAction({ type: 'dataZoom', start: 0, end: percentage })
@@ -212,7 +224,6 @@ function quickZoom(days) {
 function initCharts() {
   if (mainEl.value && !chartMain) chartMain = echarts.init(mainEl.value)
   if (distEl.value && !chartDist) chartDist = echarts.init(distEl.value)
-  render()
 }
 function resize() {
   chartMain && chartMain.resize()
@@ -223,9 +234,12 @@ onMounted(async () => {
   await nextTick()
   initCharts()
   window.addEventListener('resize', resize)
+  await prepare(true)
+  render()
 })
-onActivated(() => {
+onActivated(async () => {
   nextTick(() => { resize(); render() })
+  await prepare()
 })
 onBeforeUnmount(() => {
   window.removeEventListener('resize', resize)
@@ -234,12 +248,33 @@ onBeforeUnmount(() => {
   chartMain = null
   chartDist = null
 })
-watch(downsample, render)
-watch(distCol, renderDist)
+
+watch(downsample, refreshSeries)
+watch(distCol, refreshHist)
+// 第二步改过数据（重采样/删列/换算）后版本号变了，此前那份整表统计即作废
+watch(() => d.value.meta?.version, () => { prepare(true) })
+watch(() => state.backend.online, on => { if (on) prepare(true) })
 </script>
 
 <template>
   <section class="step-panel h-full p-4 flex flex-col gap-3 overflow-y-auto">
+    <div v-if="gate.status !== 'ready'" class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
+         :class="gate.status === 'loading' ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-rose-50 border-rose-200 text-rose-700'">
+      <i class="fa-solid mt-0.5" :class="gate.status === 'loading' ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
+      <div class="min-w-0">
+        <div class="font-semibold">第三步的统计矩阵、叠加曲线与直方图一律由后端整表计算</div>
+        <div class="mt-0.5 leading-snug opacity-80">{{ gate.note || '正在由后端计算…' }}</div>
+      </div>
+      <button v-if="gate.status !== 'loading'" @click="prepare(true)"
+              class="ml-auto shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
+    </div>
+
+    <!-- 图上的数字仍是离线前那一次真实计算的结果，说清楚免得被当成实时值 -->
+    <div v-if="gate.status === 'ready' && !state.backend.online"
+         class="rounded-lg bg-amber-50 border border-amber-200 text-amber-700 px-3 py-1.5 text-[11px] shrink-0">
+      后端已离线：下方统计矩阵、曲线与直方图是离线前最后一次真实计算的结果，本页此时只读；重连后会自动重新计算。
+    </div>
+
     <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2.5 shrink-0">
       <div class="flex items-center justify-between">
         <div class="flex items-center gap-4">
@@ -253,11 +288,11 @@ watch(distCol, renderDist)
             <span class="text-[10px] text-slate-400 font-mono">已选 {{ selected.size }} 条</span>
           </div>
           <div class="flex items-center gap-2">
-            <label class="text-xs font-bold text-slate-600">降采样:</label>
+            <label class="text-xs font-bold text-slate-600">抽稀方式:</label>
             <select v-model="downsample" class="text-xs border border-slate-300 rounded px-2 py-1 bg-white">
-              <option value="none">原始全量</option>
-              <option value="lttb">LTTB 极值采样</option>
-              <option value="mean">窗口均值降采样</option>
+              <option value="raw">原始全量（超后端点数上限时等距抽稀）</option>
+              <option value="extremes">极值抽稀（每桶留最小/最大，尖峰不丢）</option>
+              <option value="mean">窗口均值降采样（4 行一桶取均值）</option>
             </select>
           </div>
           <div class="flex items-center gap-1.5 text-xs">
@@ -284,6 +319,15 @@ watch(distCol, renderDist)
 
     <div class="h-[52%] min-h-[360px] shrink-0 bg-white rounded-xl border border-slate-200 shadow-sm p-2 flex flex-col">
       <div ref="mainEl" class="w-full flex-1"></div>
+      <div class="px-2 pb-1 text-[10px] text-slate-400 font-mono flex items-center gap-2 shrink-0">
+        <span v-if="fetching.series"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端抽稀中…</span>
+        <template v-else-if="chart">
+          <span>整表 {{ chart.rowCount.toLocaleString() }} 行 → 图上 {{ chart.points.toLocaleString() }} 点 · {{ MODE_LABELS[chart.mode] }}</span>
+          <span v-if="chart.decimated" class="text-amber-600">已抽稀（放大不会补回被抽掉的行）</span>
+          <span v-else class="text-emerald-600">逐行未抽稀</span>
+          <span v-if="chart.windowStep > 1">窗口 {{ chart.windowStep }} 行</span>
+        </template>
+      </div>
     </div>
 
     <div class="flex-1 grid grid-cols-12 gap-3 min-h-[300px]">
@@ -292,7 +336,15 @@ watch(distCol, renderDist)
           <span class="text-xs font-bold text-slate-700 flex items-center gap-1.5">
             <i class="fa-solid fa-table-columns text-indigo-500 text-[10px]"></i>多列统计特征矩阵
           </span>
-          <span class="text-[10px] text-slate-400 font-mono">{{ statsMatrix.cols }} 列 × {{ statsMatrix.totalRows.toLocaleString() }} 行</span>
+          <span class="text-[10px] text-slate-400 font-mono">
+            <span v-if="fetching.stats"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端整表统计中…</span>
+            <template v-else>
+              {{ displayCols }} 列 × {{ displayRows.toLocaleString() }} 行
+              <span :class="gate.status === 'ready' ? 'text-emerald-600' : 'text-rose-500'">
+                · {{ gate.status === 'ready' ? '后端整表统计（Std 为总体标准差 ÷n）' : '统计未就绪' }}
+              </span>
+            </template>
+          </span>
         </div>
         <div class="flex-1 overflow-auto">
           <table class="w-full text-[11px] text-left border-collapse">
@@ -312,7 +364,7 @@ watch(distCol, renderDist)
               </tr>
             </thead>
             <tbody class="divide-y divide-slate-100 font-mono">
-              <tr v-for="s in statsMatrix.rows" :key="s.key"
+              <tr v-for="s in (stats && stats.rows) || []" :key="s.key"
                   class="transition-colors" :class="s.key === distCol ? 'bg-indigo-50/50' : 'hover:bg-slate-50/50'">
                 <td class="px-2 py-1.5 font-sans font-medium text-slate-700 whitespace-nowrap max-w-[100px] truncate" :title="s.label">
                   <span class="inline-flex items-center gap-1">
@@ -321,21 +373,27 @@ watch(distCol, renderDist)
                   </span>
                 </td>
                 <td class="px-2 py-1.5 text-right text-slate-600">{{ s.n.toLocaleString() }}</td>
-                <td class="px-2 py-1.5 text-right font-semibold text-indigo-600">{{ s.n > 0 ? s.mean.toFixed(1) : '—' }}</td>
-                <td class="px-2 py-1.5 text-right text-slate-600">{{ s.n > 0 ? s.std.toFixed(1) : '—' }}</td>
-                <td class="px-2 py-1.5 text-right text-slate-500">{{ s.n > 0 ? s.min.toFixed(1) : '—' }}</td>
-                <td class="px-2 py-1.5 text-right text-emerald-600">{{ s.n > 0 ? s.q1.toFixed(1) : '—' }}</td>
-                <td class="px-2 py-1.5 text-right font-semibold text-indigo-600">{{ s.n > 0 ? s.median.toFixed(1) : '—' }}</td>
-                <td class="px-2 py-1.5 text-right text-emerald-600">{{ s.n > 0 ? s.q3.toFixed(1) : '—' }}</td>
-                <td class="px-2 py-1.5 text-right text-slate-500">{{ s.n > 0 ? s.max.toFixed(1) : '—' }}</td>
+                <td class="px-2 py-1.5 text-right font-semibold text-indigo-600">{{ fmt(s.mean) }}</td>
+                <td class="px-2 py-1.5 text-right text-slate-600">{{ fmt(s.std) }}</td>
+                <td class="px-2 py-1.5 text-right text-slate-500">{{ fmt(s.min) }}</td>
+                <td class="px-2 py-1.5 text-right text-emerald-600">{{ fmt(s.q1) }}</td>
+                <td class="px-2 py-1.5 text-right font-semibold text-indigo-600">{{ fmt(s.median) }}</td>
+                <td class="px-2 py-1.5 text-right text-emerald-600">{{ fmt(s.q3) }}</td>
+                <td class="px-2 py-1.5 text-right text-slate-500">{{ fmt(s.max) }}</td>
                 <td class="px-2 py-1.5 text-right font-semibold"
                     :class="s.missingRate === 0 ? 'text-emerald-600' : s.missingRate < 5 ? 'text-amber-600' : 'text-rose-600'">{{ s.missingRate.toFixed(1) }}%</td>
                 <td class="px-2 py-1.5">
-                  <div class="w-full h-2 bg-slate-100 rounded-full overflow-hidden relative">
+                  <div v-if="s.n > 0" class="w-full h-2 bg-slate-100 rounded-full overflow-hidden relative">
                     <div class="absolute h-full bg-indigo-400/60 rounded-full"
-                         :style="{ left: Math.max(0, s.min / statsMatrix.globalMax * 100) + '%', width: Math.max(2, Math.min(100, s.max / statsMatrix.globalMax * 100) - Math.max(0, s.min / statsMatrix.globalMax * 100)) + '%' }"></div>
-                    <div class="absolute h-full w-0.5 bg-indigo-600" :style="{ left: (s.median / statsMatrix.globalMax * 100) + '%' }"></div>
+                         :style="{ left: Math.max(0, s.min / stats.globalMax * 100) + '%', width: Math.max(2, Math.min(100, s.max / stats.globalMax * 100) - Math.max(0, s.min / stats.globalMax * 100)) + '%' }"></div>
+                    <div class="absolute h-full w-0.5 bg-indigo-600" :style="{ left: (s.median / stats.globalMax * 100) + '%' }"></div>
                   </div>
+                  <span v-else class="text-[9px] text-slate-400 font-sans">全列缺失</span>
+                </td>
+              </tr>
+              <tr v-if="!((stats && stats.rows) || []).length && !fetching.stats">
+                <td colspan="11" class="px-2 py-6 text-center text-slate-400 font-sans">
+                  {{ gate.status === 'ready' ? '没有可统计的数值列' : '等待后端统计结果' }}
                 </td>
               </tr>
             </tbody>
@@ -351,6 +409,14 @@ watch(distCol, renderDist)
           </select>
         </div>
         <div ref="distEl" class="w-full flex-1"></div>
+        <div class="px-2 pb-1 text-[10px] text-slate-400 font-mono shrink-0">
+          <span v-if="fetching.hist"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端整表计数中…</span>
+          <span v-else-if="hist && hist.edges.length">
+            {{ hist.bins }} 桶 · {{ hist.n.toLocaleString() }} 个有效值 · 桶宽 {{ hist.binWidth.toFixed(3) }}
+            <span v-if="hist.missing" class="text-amber-600">· {{ hist.missing.toLocaleString() }} 缺失（不计桶）</span>
+          </span>
+          <span v-else>该列没有有效数值</span>
+        </div>
       </div>
     </div>
 

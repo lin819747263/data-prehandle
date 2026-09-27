@@ -12,6 +12,8 @@ server.log
 *.log
 timeseries-studio-server/dataset/*
 !timeseries-studio-server/dataset/.gitkeep
+# 服务端状态目录：工作区命令日志 + 最后一次会话，都是用户运行时数据
+timeseries-studio-server/.tss-state/
 
 # 本地验证草稿
 .verify/
