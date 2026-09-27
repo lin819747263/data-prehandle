@@ -80,7 +80,12 @@ class MaskDeleteRequest(BaseModel):
 
 class FeatureTimeRequest(BaseModel):
     dims: list[str] = Field(..., min_length=1, description="hour/day/month/weekday/is_weekend/holiday")
-    cyclical: bool = Field(False, description="对已勾选的周期维度追加正余弦编码")
+    cyclical: bool = Field(False, description="兼容拆分前的旧命令：true = 对全部已勾选的周期维度做正余弦编码")
+    cycDims: list[str] = Field(default_factory=list,
+                               description="本次改用正余弦编码的周期维度（hour/weekday/month）")
+    keepCycOriginal: bool = Field(True, description="被编码的维度是否同时保留数值列；false 表示只留 sin/cos")
+    # 节假日表不在这里传：feature_time 一律读工作区当前生效的那份（GET /holidays 同一份），
+    # 界面上看到的日期、真算出来的列、导出脚本复现的集合因此只会是一个。
 
 
 class FeatureLagRequest(BaseModel):
@@ -91,6 +96,8 @@ class FeatureLagRequest(BaseModel):
     expanding: bool = False
     ewm: bool = False
     ewmSpan: int = Field(12, ge=2, le=500)
+    group: Optional[Literal["lag", "window"]] = Field(
+        None, description="lag 只生成滞后 / window 只生成滑动窗口；缺省两类一起（拆分前的旧命令）")
 
 
 class FeatureDiffRequest(BaseModel):
@@ -102,12 +109,27 @@ class FeatureDiffRequest(BaseModel):
     fftDominant: bool = False
     fftEntropy: bool = False
     fftPowerRatio: bool = False
+    group: Optional[Literal["diff", "fft"]] = Field(
+        None, description="diff 只生成差分 / fft 只生成频域；缺省两类一起（拆分前的旧命令）")
 
 
 class FeatureCatRequest(BaseModel):
     cols: list[str] = Field(..., min_length=1)
     method: Literal["onehot", "ordinal", "target"] = "onehot"
     targetColumn: Optional[str] = Field(None, description="目标均值编码的参照数值列，缺省由服务端挑主列")
+
+
+class SplitApplyRequest(BaseModel):
+    """切分落成真实列：比例与界面滑杆同一档（50~85），验证/测试平分剩余。"""
+    ratio: int = Field(70, ge=50, le=85)
+    key: Optional[str] = Field(None, description="划分列名，缺省 dataset_split")
+    label: Optional[str] = Field(None, description="划分列显示名，缺省 数据集划分")
+
+
+class HolidaysRequest(BaseModel):
+    """节假日表配置：整份替换当前工作区的生效日期集合（空列表 = 不认任何节假日）。"""
+    days: list[str] = Field(..., max_length=200)
+    source: Optional[str] = Field(None, description="界面标注来源用，如 preset-2024 / custom")
 
 
 # ---------------- 工作区 ----------------

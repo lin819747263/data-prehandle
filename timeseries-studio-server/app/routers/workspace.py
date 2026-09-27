@@ -22,9 +22,9 @@ from ..schemas import (
     ExoPresetRequest,
     FeatureCatRequest, FeatureDiffRequest,
     FeatureLagRequest, FeatureTimeRequest,
-    ImputeRequest, MaskDeleteRequest, MaskGenerateRequest,
+    HolidaysRequest, ImputeRequest, MaskDeleteRequest, MaskGenerateRequest,
     PresetRequest, RenameColumnRequest, ResampleRequest,
-    RestoreRequest, TimeFormatRequest, DeleteColumnRequest,
+    RestoreRequest, SplitApplyRequest, TimeFormatRequest, DeleteColumnRequest,
 )
 from ..services import dataset_store, exporter, explore, features
 from ..services import workspace as ws_store
@@ -150,17 +150,6 @@ def get_quality(ws_id: str) -> dict:
     return _guard(ws.quality)
 
 
-@router.get("/{ws_id}/series")
-def get_series(ws_id: str, col: str = Query(..., description="列名"),
-               max_points: int = Query(1200, ge=20, le=6000)) -> dict:
-    """画一条曲线所需的抽稀点 + 原始行号 + 异常覆盖层，不需要整表。"""
-    ws = _get(ws_id)
-    _numeric_only(ws, [col])
-    return _guard(ws.series, col, max_points)
-
-
-# ---------------- 第三步：统计概览与图表 ----------------
-
 def _split_cols(raw: str) -> list[str]:
     return [c for c in (raw or "").split(",") if c]
 
@@ -177,6 +166,27 @@ def _numeric_only(ws: ws_store.Workspace, keys: list[str]) -> None:
             raise HTTPException(status_code=400,
                                 detail=f"该接口只接受数值列：{key} 是 {types[key]} 列")
 
+
+@router.get("/{ws_id}/series")
+def get_series(ws_id: str, cols: str = Query(..., description="逗号分隔的数值列名"),
+               points: int = Query(1200, ge=20, le=explore.MAX_POINTS)) -> dict:
+    """第四步的质量曲线：几条列共享一条抽稀时间轴，每列带原始行号、缺失标记与异常覆盖层。"""
+    ws = _get(ws_id)
+    wanted = _split_cols(cols)
+    if not wanted:
+        raise HTTPException(status_code=400, detail="cols 不能为空")
+    _numeric_only(ws, wanted)
+    labels_by_key = {c["key"]: c["label"] for c in ws.meta["columns"]}
+
+    def compute():
+        return {"wsId": ws.id, "version": ws.version, "timeCol": ws.time_col,
+                **explore.series_quality(ws.df, wanted, ws.time_labels(), points,
+                                         labels_by_key, ws.anomaly, ws.anomaly_stale())}
+
+    return _guard(compute)
+
+
+# ---------------- 第三步：统计概览与图表 ----------------
 
 @router.get("/{ws_id}/stats")
 def get_stats(ws_id: str, cols: str = Query("", description="逗号分隔的数值列名，留空则统计全部数值列")) -> dict:
@@ -201,8 +211,15 @@ def get_hist(ws_id: str, col: str = Query(..., description="列名"),
 @router.get("/{ws_id}/series-multi")
 def get_series_multi(ws_id: str, cols: str = Query(..., description="逗号分隔的列名"),
                      mode: str = Query("extremes", description="raw 全量 / extremes 极值抽稀 / mean 窗口均值"),
-                     points: int = Query(explore.DEFAULT_POINTS, ge=20, le=explore.MAX_POINTS)) -> dict:
-    """多列叠加曲线：共享一条时间轴，每列一条抽稀后的序列，整表不出后端。"""
+                     points: int = Query(explore.DEFAULT_POINTS, ge=20, le=explore.MAX_POINTS),
+                     span: str = Query("all", description="all/year/month/week/day：按自然周期筛行"),
+                     offset: int = Query(0, ge=-100000, le=100000,
+                                         description="该档位内往前/往后第几个自然周期，0=第一期，越界贴到最近一端")) -> dict:
+    """多列叠加曲线：共享一条时间轴，每列一条抽稀后的序列，整表不出后端。
+
+    span 由服务端按真实时间列筛行（不是按行数估算），点数上限在窗口内重新分配，
+    所以「看一天」得到的是这一天自己的点，而不是整年抽稀后剩下的几颗。
+    """
     ws = _get(ws_id)
     wanted = _split_cols(cols)
     if not wanted:
@@ -211,10 +228,28 @@ def get_series_multi(ws_id: str, cols: str = Query(..., description="逗号分�
     labels_by_key = {c["key"]: c["label"] for c in ws.meta["columns"]}
 
     def compute():
-        data = explore.series_multi(ws.df, wanted, ws.time_labels(), mode, points, labels_by_key)
+        data = explore.series_multi(ws.df, wanted, ws.time_labels(), mode, points, labels_by_key,
+                                    ts=explore.time_series_of(ws.df, ws.time_col),
+                                    span=span, offset=offset)
         return {"wsId": ws.id, "version": ws.version, "timeCol": ws.time_col, **data}
 
     return _guard(compute)
+
+
+@router.get("/{ws_id}/holidays")
+def get_holidays(ws_id: str) -> dict:
+    """当前工作区生效的节假日表：界面显示、导出复现与 feature-time 计算读的都是这一份。"""
+    ws = _get(ws_id)
+    days = ws.holiday_days()
+    return {
+        "wsId": ws.id, "version": ws.version,
+        "configured": ws.meta.get("holidayDays") is not None,
+        "source": ws.meta.get("holidaySource") or f"preset-{features.DEFAULT_HOLIDAY_YEAR}",
+        **features.holiday_view(days),
+        "presets": [{"year": y, "label": f"{y} 年中国法定节假日", **features.holiday_view(sorted(v))}
+                    for y, v in sorted(features.HOLIDAY_PRESETS.items())],
+        "maxDays": features.MAX_HOLIDAY_DAYS,
+    }
 
 
 @router.get("/{ws_id}/export")
@@ -362,6 +397,15 @@ def op_resample(ws_id: str, payload: ResampleRequest,
     return _with_page(ws, result, offset, limit)
 
 
+@router.post("/{ws_id}/op/split")
+def op_split(ws_id: str, payload: SplitApplyRequest,
+             offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
+    """把切分结果落成真实的一列：前端只发比例，三档行数由服务端按整表行数算并回带。"""
+    ws = _get(ws_id)
+    result = _guard(ws.apply, {"kind": "split_apply", "params": payload.model_dump()})
+    return _with_page(ws, result, offset, limit)
+
+
 @router.post("/{ws_id}/op/impute")
 def op_impute(ws_id: str, payload: ImputeRequest,
               offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
@@ -421,6 +465,15 @@ def value_counts(ws_id: str, keys: str = Query(..., description="逗号分隔的
                 "totalNewCols": total, **data}
 
     return _guard(compute)
+
+
+@router.post("/{ws_id}/op/holidays")
+def op_holidays(ws_id: str, payload: HolidaysRequest,
+                offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
+    """配置节假日表：只改工作区配置、不动帧，所以它仍是一条可撤销、可重放的命令。"""
+    ws = _get(ws_id)
+    result = _guard(ws.apply, {"kind": "holidays", "params": payload.model_dump()})
+    return _with_page(ws, result, offset, limit)
 
 
 @router.post("/{ws_id}/op/feature-time")

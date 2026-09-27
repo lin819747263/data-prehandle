@@ -569,7 +569,8 @@ def section_errors():
         ("类别列不能进统计矩阵", f"/api/ws/{ws}/stats?cols=weather", 400),
         ("时间列不能画叠加曲线", f"/api/ws/{ws}/series-multi?cols=timestamp", 400),
         ("时间列不能画直方图", f"/api/ws/{ws}/hist?col=timestamp", 400),
-        ("时间列不能画单列曲线", f"/api/ws/{ws}/series?col=timestamp", 400),
+        ("时间列不能画质量曲线", f"/api/ws/{ws}/series?cols=timestamp", 400),
+        ("质量曲线 cols 为空", f"/api/ws/{ws}/series?cols=", 400),
     ]
     for label, path, want in cases:
         st, pl, _ = call("GET", path)

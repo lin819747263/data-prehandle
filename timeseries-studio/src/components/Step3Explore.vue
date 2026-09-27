@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, reactive, onMounted, onActivated, onBeforeUnmount, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
-import { state, ds, switchStep, detectedFreqMinutes, rowCount } from '../store'
+import { state, ds, switchStep, rowCount } from '../store'
 import { wsStats, wsHist, wsSeriesMulti } from '../api'
 
 const COLORS = ['#4f46e5', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#e11d48']
@@ -47,6 +47,37 @@ const downsample = ref('extremes')
 const pointsCap = computed(() => state.backend.limits?.seriesMaxPoints || 3000)
 const binsCount = computed(() => state.backend.limits?.histogramBins || 25)
 
+// 时间窗口档位：由后端按自然周期筛行（explore.resolve_window），不是旧版那种「按采样间隔估百分比」
+// 的假 3 天/7 天 —— 界面上写的窗口必须与真实行同源。offset 是在该档位的周期清单里翻到第几期。
+const SPANS = [
+  { key: 'all', label: '全量' },
+  { key: 'year', label: '年' },
+  { key: 'month', label: '月' },
+  { key: 'week', label: '周' },
+  { key: 'day', label: '日' }
+]
+const span = ref('all')
+const periodOffset = ref(0)
+const spanUnit = computed(() => SPANS.find(s => s.key === span.value)?.label || '')
+
+// 翻页用的当前位置一律读后端回的那一份（window.offset）：越界由服务端贴边，
+// 界面跟着改口径，才会出现「请求第 9 期、实际停在第 8 期」这种说得清的状态。
+const win = computed(() => chart.value?.window || null)
+const periodTotal = computed(() => (span.value === 'all' ? 1 : (win.value?.periodTotal || 0)))
+const periodAt = computed(() => (win.value?.periodIndex || 0) - 1)
+const canPrev = computed(() => span.value !== 'all' && periodAt.value > 0)
+const canNext = computed(() => span.value !== 'all' && periodTotal.value > 0 && periodAt.value < periodTotal.value - 1)
+
+function stepPeriod(delta) {
+  if (!canPrev.value && !canNext.value) return
+  if (delta < 0 && !canPrev.value) return
+  if (delta > 0 && !canNext.value) return
+  periodOffset.value = periodAt.value + delta
+  zoom.start = 0
+  zoom.end = 100
+  refreshSeries()
+}
+
 const distCol = ref('')
 watch(floatCols, () => {
   if (!floatCols.value.some(c => c.key === distCol.value)) distCol.value = floatCols.value[0]?.key || ''
@@ -80,7 +111,9 @@ async function refreshSeries() {
   if (!keys.length) { chart.value = null; drawMain(); return }
   fetching.series = true
   try {
-    chart.value = await wsSeriesMulti(d.value.wsId, keys, downsample.value, pointsCap.value)
+    chart.value = await wsSeriesMulti(d.value.wsId, keys, downsample.value, pointsCap.value,
+      span.value, periodOffset.value)
+    periodOffset.value = chart.value?.window?.offset ?? 0
     if (gate.value.status === 'loading') gate.value = { status: 'ready', note: '' }
   } catch (e) {
     gate.value = { status: 'error', note: `曲线数据获取失败：${e.message || e}` }
@@ -117,6 +150,12 @@ async function prepare(force = false) {
   loadedVersion = version
   if (gate.value.status === 'loading') gate.value = { status: 'ready', note: '' }
 }
+
+// 用户拖出来的缩放窗口（百分比）：换列、换抽稀方式都不该被重置，
+// 只有显式换时间窗口（换的是另一段行）才回到整段。旧实现每次 setOption 都带 start:0,end:30，
+// 叠一份 notMerge，于是勾掉一列就等于把图缩回开头。
+const zoom = reactive({ start: 0, end: 100 })
+let zoomBound = false
 
 function drawMain() {
   if (!chartMain) return
@@ -164,13 +203,13 @@ function drawMain() {
     legend: { top: 5, right: 10, textStyle: { fontSize: 10 }, itemWidth: 14, itemHeight: 8 },
     grid: { top: 40, right: 25, bottom: 65, left: 55 },
     dataZoom: [
-      { type: 'inside', start: 0, end: 30 },
-      { type: 'slider', bottom: 10, height: 22, borderColor: '#cbd5e1' }
+      { type: 'inside', start: zoom.start, end: zoom.end },
+      { type: 'slider', bottom: 10, height: 22, borderColor: '#cbd5e1', start: zoom.start, end: zoom.end }
     ],
     xAxis: { type: 'category', data: data.x, axisLine: { lineStyle: { color: '#94a3b8' } } },
     yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed', color: '#e2e8f0' } } },
     series
-  }, true)
+  }, { replaceMerge: ['series', 'legend'] })
 }
 
 function drawDist() {
@@ -213,16 +252,33 @@ function drawDist() {
 
 function render() { drawMain(); drawDist() }
 
-function quickZoom(days) {
-  if (!chartMain) return
-  const total = (chart.value && chart.value.rowCount) || displayRows.value || 1
-  const freq = Math.max(1, Math.round(1440 / (detectedFreqMinutes() || 15)))
-  const percentage = Math.min(100, (days * freq / total) * 100)
-  chartMain.dispatchAction({ type: 'dataZoom', start: 0, end: percentage })
+// 换档 = 换一段行（后端按自然周期重新筛），所以缩放窗口回到整段；
+// 勾/取消列只是往同一窗口里多画或少画一条线，窗口保持用户当前看的范围。
+function setSpan(next) {
+  if (span.value === next) return
+  span.value = next
+  periodOffset.value = 0
+  zoom.start = 0
+  zoom.end = 100
+  refreshSeries()
+}
+
+function bindZoom() {
+  if (zoomBound || !chartMain) return
+  zoomBound = true
+  chartMain.on('dataZoom', () => {
+    const dz = chartMain.getOption()?.dataZoom?.[0]
+    if (!dz) return
+    zoom.start = typeof dz.start === 'number' ? dz.start : 0
+    zoom.end = typeof dz.end === 'number' ? dz.end : 100
+  })
 }
 
 function initCharts() {
-  if (mainEl.value && !chartMain) chartMain = echarts.init(mainEl.value)
+  if (mainEl.value && !chartMain) {
+    chartMain = echarts.init(mainEl.value)
+    bindZoom()
+  }
   if (distEl.value && !chartDist) chartDist = echarts.init(distEl.value)
 }
 function resize() {
@@ -262,8 +318,7 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
          :class="gate.status === 'loading' ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-rose-50 border-rose-200 text-rose-700'">
       <i class="fa-solid mt-0.5" :class="gate.status === 'loading' ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
       <div class="min-w-0">
-        <div class="font-semibold">第三步的统计矩阵、叠加曲线与直方图一律由后端整表计算</div>
-        <div class="mt-0.5 leading-snug opacity-80">{{ gate.note || '正在由后端计算…' }}</div>
+        <div class="font-semibold">{{ gate.note || '正在计算…' }}</div>
       </div>
       <button v-if="gate.status !== 'loading'" @click="prepare(true)"
               class="ml-auto shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
@@ -296,14 +351,38 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
             </select>
           </div>
           <div class="flex items-center gap-1.5 text-xs">
-            <span class="text-slate-400">跨度:</span>
-            <button @click="quickZoom(3)" class="px-2 py-0.5 border border-slate-200 rounded hover:bg-slate-100 text-slate-600">3天</button>
-            <button @click="quickZoom(7)" class="px-2 py-0.5 border border-slate-200 rounded hover:bg-slate-100 text-slate-600">7天</button>
-            <button @click="quickZoom(30)" class="px-2 py-0.5 border border-slate-200 rounded hover:bg-slate-100 text-slate-600">全量</button>
+            <span class="text-slate-400">时间窗口:</span>
+            <button v-for="s in SPANS" :key="s.key" @click="setSpan(s.key)"
+                    class="px-2 py-0.5 border rounded transition-colors"
+                    :class="span === s.key ? 'border-indigo-400 bg-indigo-50 text-indigo-700 font-semibold' : 'border-slate-200 hover:bg-slate-100 text-slate-600'"
+                    :title="s.key === 'all' ? '整表所有行' : `按${s.label}筛行（后端按时间列分周期），再用右侧箭头翻到上/下一个${s.label}`">
+              {{ s.label }}
+            </button>
+            <!-- 翻页器：位置与总期数都来自后端那一份周期清单，两端按到底就灰掉，不做「点了再说」的假按钮 -->
+            <div v-if="span !== 'all'" class="flex items-center gap-0.5 pl-1.5 ml-0.5 border-l border-slate-200">
+              <button @click="stepPeriod(-1)" :disabled="!canPrev || fetching.series"
+                      class="px-1.5 py-0.5 border border-slate-200 rounded text-slate-500 hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed"
+                      :title="canPrev ? `上一个${spanUnit}` : '已经是第一个周期'">
+                <i class="fa-solid fa-chevron-left text-[9px]"></i>
+              </button>
+              <span class="text-[10px] font-mono text-slate-500 whitespace-nowrap min-w-[104px] text-center">
+                <template v-if="fetching.series">后端筛行中…</template>
+                <template v-else-if="periodTotal">第 {{ periodAt + 1 }}/{{ periodTotal }} 个{{ spanUnit }}</template>
+                <template v-else>无可翻周期</template>
+              </span>
+              <button @click="stepPeriod(1)" :disabled="!canNext || fetching.series"
+                      class="px-1.5 py-0.5 border border-slate-200 rounded text-slate-500 hover:bg-slate-100 disabled:opacity-30 disabled:cursor-not-allowed"
+                      :title="canNext ? `下一个${spanUnit}` : '已经是最后一个周期'">
+                <i class="fa-solid fa-chevron-right text-[9px]"></i>
+              </button>
+            </div>
+            <span v-if="span !== 'all' && chart" class="text-[10px] text-slate-400 font-mono whitespace-nowrap">
+              {{ chart.window?.from || '' }} ~ {{ chart.window?.to || '' }} · 窗口内 {{ (chart.windowRows ?? 0).toLocaleString() }} 行
+            </span>
+            <span v-else-if="span === 'all' && chart" class="text-[10px] text-slate-400 font-mono whitespace-nowrap">
+              不分期 · 全表 {{ (chart.windowRows ?? 0).toLocaleString() }} 行
+            </span>
           </div>
-        </div>
-        <div class="text-[11px] text-slate-400 flex items-center">
-          <i class="fa-solid fa-mouse-pointer mr-1"></i>拖拽缩放 · 底部滑块长距拖动
         </div>
       </div>
       <div class="flex flex-wrap gap-1.5">
@@ -322,7 +401,13 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
       <div class="px-2 pb-1 text-[10px] text-slate-400 font-mono flex items-center gap-2 shrink-0">
         <span v-if="fetching.series"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端抽稀中…</span>
         <template v-else-if="chart">
-          <span>整表 {{ chart.rowCount.toLocaleString() }} 行 → 图上 {{ chart.points.toLocaleString() }} 点 · {{ MODE_LABELS[chart.mode] }}</span>
+          <span>整表 {{ chart.rowCount.toLocaleString() }} 行</span>
+          <span v-if="chart.window && chart.window.span !== 'all'" class="text-indigo-600">
+            → 第 {{ chart.window.periodIndex }}/{{ chart.window.periodTotal }} 个{{ chart.window.label }}
+            {{ chart.window.from }} ~ {{ chart.window.to }}（含起不含止）{{ chart.windowRows.toLocaleString() }} 行
+            <span v-if="chart.window.clamped" class="text-amber-600">（该档只有 {{ chart.window.periodTotal }} 期，已贴到端点）</span>
+          </span>
+          <span>→ 图上 {{ chart.points.toLocaleString() }} 点 · {{ MODE_LABELS[chart.mode] }}</span>
           <span v-if="chart.decimated" class="text-amber-600">已抽稀（放大不会补回被抽掉的行）</span>
           <span v-else class="text-emerald-600">逐行未抽稀</span>
           <span v-if="chart.windowStep > 1">窗口 {{ chart.windowStep }} 行</span>

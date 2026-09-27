@@ -26,15 +26,70 @@ CYCLE_PERIOD = {"hour": 24, "weekday": 7, "month": 12}
 CYCLE_CN = {"hour": "小时", "weekday": "星期", "month": "月份"}
 ROLL_STATS = {"mean": "mean", "std": "std", "max": "max", "min": "min", "median": "med"}
 CAT_METHODS = ("onehot", "ordinal", "target")
-FEATURE_FAMILIES = ("time", "lag_roll", "diff_freq", "cat")
+# lag/window 与 diff/fft 是各自独立的一次生成；lag_roll、diff_freq 是拆分之前那条命令的族名，
+# 老日志重放出来仍是这两个值，界面的特征登记表才认得旧列。
+FEATURE_FAMILIES = ("time", "lag", "window", "lag_roll", "diff", "fft", "diff_freq", "cat", "split")
 
-# 中国 2024 年部分法定节假日（示例数据集覆盖 2024-06）
+# 中国法定节假日表（示例数据集覆盖 2024-06）。界面可以改，改完的表落在工作区 meta 里，
+# 这条内置表只是「从未配置过」时的默认值与预设恢复源。
 HOLIDAYS_2024 = frozenset([
     "2024-01-01", "2024-02-10", "2024-02-11", "2024-02-12", "2024-02-13", "2024-02-14",
     "2024-04-04", "2024-04-05", "2024-05-01", "2024-05-02", "2024-05-03", "2024-06-10",
     "2024-09-15", "2024-09-16", "2024-10-01", "2024-10-02", "2024-10-03", "2024-10-04",
     "2024-10-05",
 ])
+
+# 内置预设清单：界面上的「按年份恢复默认」只列这里有的，不做「看起来像节假日」的编造
+HOLIDAY_PRESETS: dict[str, frozenset[str]] = {"2024": HOLIDAYS_2024}
+DEFAULT_HOLIDAY_YEAR = "2024"   # 工作区从未配置过时的默认表
+
+MAX_HOLIDAY_DAYS = 200         # 与 schemas.MAX_SESSION_INLINE_ARRAY 同一档：生效日期表要整份记进
+                               # 审计参数（导出脚本只能从那份复现日期集合），而会话保存会拒收更长的数组
+
+
+def holiday_view(days) -> dict:
+    """把一份日期集合整理成界面与 /holidays 响应用的形状（天数、按年分组、命中数据集的年份）。"""
+    ordered = sorted(set(days or []))
+    by_year: dict[str, list[str]] = {}
+    for d in ordered:
+        by_year.setdefault(d[:4], []).append(d)
+    return {"days": ordered, "count": len(ordered),
+            "byYear": [{"year": y, "days": v} for y, v in sorted(by_year.items())]}
+
+
+def check_holiday_days(values) -> list[str]:
+    """校验并去重节假日日期：只收 YYYY-MM-DD 且真实存在的日期，其余一律报错而不是悄悄丢掉。"""
+    if values is None:
+        raise ValueError("节假日列表不能为空（要清空请提交空列表）")
+    if len(values) > MAX_HOLIDAY_DAYS:
+        raise ValueError(f"节假日 {len(values)} 天，超过上限 {MAX_HOLIDAY_DAYS} 天")
+    out: list[str] = []
+    for raw in values:
+        s = str(raw or "").strip()
+        if len(s) != 10 or s[4] != "-" or s[7] != "-":
+            raise ValueError(f"节假日日期需为 YYYY-MM-DD，收到「{raw}」")
+        try:
+            date = pd.Timestamp(s)
+        except Exception:
+            raise ValueError(f"节假日日期无法解析：「{raw}」") from None
+        iso = date.strftime("%Y-%m-%d")
+        if iso not in out:
+            out.append(iso)
+    return sorted(out)
+
+
+# 数据集划分：时序不打乱，前 train% → 中间 val% → 末尾 test%，剩余两条平分。
+# 这份公式与前端 splitCounts()、导出脚本三处同源，改一处就要改三处。
+SPLIT_COL_KEY = "dataset_split"
+SPLIT_COL_LABEL = "数据集划分"
+SPLIT_VALUES = ("train", "val", "test")
+
+
+def split_counts(n: int, ratio: int) -> dict:
+    train = int(n) * int(ratio) // 100
+    rest = int(n) - train
+    test = rest // 2
+    return {"train": train, "val": rest - test, "test": test, "total": int(n)}
 
 MAX_WINDOW = 5000
 FFT_WINDOW = 64          # 逐行频谱窗口的左跨度：主频含当前行（长 65），熵/能量比不含（长 64）
@@ -137,8 +192,10 @@ def _is_blank(v) -> bool:
 
 # ---------------------------------------------------------------- 计划（列名 + 标签）
 
-def time_plan(dims: list[str], cyc_dims: list[str]) -> list[tuple[str, str]]:
-    items = [(f"feat_{d}", f"时间:{d}") for d in dims]
+def time_plan(dims: list[str], cyc_dims: list[str], keep_original: bool = True) -> list[tuple[str, str]]:
+    """keep_original=False 时，被正余弦编码的维度不再另出一份数值列（sin/cos 就是它的替代）。"""
+    skip = set() if keep_original else {d for d in cyc_dims if d in CYCLE_DIMS}
+    items = [(f"feat_{d}", f"时间:{d}") for d in dims if d not in skip]
     for d in cyc_dims:
         items.append((f"feat_{d}_sin", f"时间:{d}_sin"))
         items.append((f"feat_{d}_cos", f"时间:{d}_cos"))
@@ -243,27 +300,34 @@ def cat_plan(cols: list[str], method: str, uniques: dict[str, list]) -> list[tup
 
 # ---------------------------------------------------------------- 时间与日历
 
-def build_time(ts: pd.Series, dims: list[str], cyc_dims: list[str]) -> dict[str, np.ndarray]:
-    """日历维度 + 可选的正余弦编码。ts 必须是 datetime64（工作区载入时已转好）。"""
+def build_time(ts: pd.Series, dims: list[str], cyc_dims: list[str],
+               keep_original: bool = True, holidays=frozenset(HOLIDAYS_2024)) -> dict[str, np.ndarray]:
+    """日历维度 + 可选的正余弦编码。ts 必须是 datetime64（工作区载入时已转好）。
+
+    holidays 是**当前工作区生效的那份**节假日表（GET /holidays 与 feature_time 同源），
+    不再是模块里的常量——用户改过日历之后，特征列必须跟着他配的那份走。
+    """
     out: dict[str, np.ndarray] = {}
     hour = pd.to_numeric(ts.dt.hour, errors="coerce").to_numpy(dtype="float64")
     day = pd.to_numeric(ts.dt.day, errors="coerce").to_numpy(dtype="float64")
     month = pd.to_numeric(ts.dt.month, errors="coerce").to_numpy(dtype="float64")
     # pandas 的 dayofweek 周一=0，与 JS 的 (getDay()+6)%7 同一套编号
     weekday = pd.to_numeric(ts.dt.dayofweek, errors="coerce").to_numpy(dtype="float64")
-    if "hour" in dims:
+    skip = set() if keep_original else {d for d in cyc_dims if d in CYCLE_DIMS}
+    if "hour" in dims and "hour" not in skip:
         out["feat_hour"] = hour
-    if "day" in dims:
+    if "day" in dims and "day" not in skip:
         out["feat_day"] = day
-    if "month" in dims:
+    if "month" in dims and "month" not in skip:
         out["feat_month"] = month
-    if "weekday" in dims:
+    if "weekday" in dims and "weekday" not in skip:
         out["feat_weekday"] = weekday
     if "is_weekend" in dims:
         wknd = np.where(np.isnan(weekday), np.nan, (weekday >= 5).astype("float64"))
         out["feat_is_weekend"] = wknd
     if "holiday" in dims:
-        hit = ts.dt.strftime("%Y-%m-%d").isin(HOLIDAYS_2024).to_numpy(dtype="float64")
+        days = set(holidays)
+        hit = ts.dt.strftime("%Y-%m-%d").isin(days).to_numpy(dtype="float64")
         out["feat_holiday"] = np.where(ts.isna().to_numpy(), np.nan, hit)
 
     # 正余弦只对周期长度固定的维度有意义：day 每月 28~31 天，无固定周期，故不参与。
@@ -536,11 +600,24 @@ def build_cat(frame: pd.DataFrame, cols: list[str], method: str,
 
 # ---------------------------------------------------------------- 参数校验
 
-def check_time_params(dims, cyclical) -> tuple[list[str], list[str]]:
+def check_time_params(dims, cyclical, cyc_dims=None) -> tuple[list[str], list[str]]:
+    """勾选校验。
+
+    cyc_dims 是现在的按维度选择（['hour','month']）；cyclical=True 是拆分前的旧命令，
+    含义是「对全部已勾选的周期维度编码」。两者同时给时以 cyc_dims 为准。
+    """
     chosen = [d for d in (dims or []) if d in TIME_DIMS]
     if not chosen:
         raise ValueError("没有勾选任何日历维度")
-    cyc = [d for d in CYCLE_DIMS if d in chosen] if cyclical else []
+    if cyc_dims:
+        bad = [d for d in cyc_dims if d not in CYCLE_DIMS]
+        if bad:
+            raise ValueError(f"只有周期固定的维度能做正余弦编码（{'/'.join(CYCLE_DIMS)}），收到 {'/'.join(bad)}")
+        cyc = [d for d in CYCLE_DIMS if d in cyc_dims and d in chosen]
+    elif cyclical:
+        cyc = [d for d in CYCLE_DIMS if d in chosen]
+    else:
+        cyc = []
     return chosen, cyc
 
 

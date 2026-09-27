@@ -39,50 +39,133 @@ const TAB_COLORS = {
   mask: 'border-teal-500 text-teal-700 bg-white'
 }
 
-// ============ 图表（服务端抽稀曲线）============
+// ============ 图表（服务端抽稀曲线，多列共享一条时间轴）============
+const COLORS = ['#4f46e5', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#e11d48']
+const colorOf = i => COLORS[i % COLORS.length]
+// 颜色按「这一列在所有数值列里的位置」定，勾掉中间一列时其余列的颜色不会串位
+const colorFor = key => {
+  const i = floatCols.value.findIndex(c => c.key === key)
+  return colorOf(i < 0 ? 0 : i)
+}
+
 const chartEl = ref(null)
 let chart = null
 const brushActive = ref(false)
 const brushRange = ref(null)
-const sd = ref(null)          // 当前绘图列的 /series 响应
+const sd = ref(null)          // 当前勾选列的 /series 响应：{ x, idx, series:[{col,y,missingMarks,anomalies…}] }
 
 const floatCols = computed(() => d.value.columns.filter(c => c.type === 'float'))
-const chosenCol = ref(null)
-const plotCol = computed(() => (chosenCol.value && floatCols.value.some(c => c.key === chosenCol.value)
-  ? chosenCol.value : floatCols.value[0]?.key))
+const selected = reactive(new Set())
+function ensureSelection() {
+  if (selected.size === 0) floatCols.value.slice(0, 2).forEach(c => selected.add(c.key))
+  Array.from(selected).forEach(k => { if (!floatCols.value.some(c => c.key === k)) selected.delete(k) })
+}
+ensureSelection()
+watch(floatCols, ensureSelection)
+
+function toggleCol(key) {
+  if (selected.has(key)) selected.delete(key)
+  else selected.add(key)
+}
+function toggleAll(on) {
+  selected.clear()
+  if (on) floatCols.value.forEach(c => selected.add(c.key))
+}
+const selectedCols = computed(() => floatCols.value.filter(c => selected.has(c.key)))
+// 只有列集合真的变了才重新取数（勾选顺序不同不该多打一次后端）
+const selectionKey = computed(() => selectedCols.value.map(c => c.key).join('|'))
+
+// 覆盖层/虚线画不全时逐列汇总：抽稀抽掉的与超出预算的都算「图上没有、数据里有」。
+// 叠 39 列时逐列报会把这一行撑成十几屏，所以点名前 NOTE_COLS 列，但总数一律给全。
+const NOTE_COLS = 5
+function summarizeNote(rows) {
+  const bad = rows.filter(r => r.truncated)
+  if (!bad.length) return null
+  return {
+    shown: bad.slice(0, NOTE_COLS),
+    hidden: Math.max(0, bad.length - NOTE_COLS),
+    allCols: bad.length,
+    // 分子分母都按勾选的全部列汇总，不然「261/1103」会被读成只统计了点名这几列
+    drawn: rows.reduce((n, r) => n + r.drawn, 0),
+    total: rows.reduce((n, r) => n + r.total, 0)
+  }
+}
+const overlayNote = computed(() => {
+  const s = sd.value
+  if (!s || !s.series) return null
+  const rows = s.series.map(m => ({
+    label: m.label || m.col, total: m.anomalyCount, drawn: m.anomalies.length, truncated: m.anomaliesTruncated
+  }))
+  return summarizeNote(rows)
+})
+const marksNote = computed(() => {
+  const s = sd.value
+  if (!s || !s.series) return null
+  const rows = s.series.map(m => ({
+    label: m.label || m.col, total: m.missingCount, drawn: m.missingMarks.length, truncated: m.marksTruncated
+  }))
+  return summarizeNote(rows)
+})
+const staleChart = computed(() => !!(sd.value && sd.value.anomaly && sd.value.anomaly.stale))
 
 async function renderChart() {
   if (!chart) return
   const s = sd.value
-  const colKey = plotCol.value
-  if (!s || !colKey || !s.x?.length) { chart.clear(); return }
+  if (!s || !s.x?.length || !s.series?.length) { chart.clear(); return }
   const det = detection.value
+  const names = s.series.map(m => m.label || m.col)
+  const lines = s.series.map((m) => {
+    const color = colorFor(m.col)
+    return {
+      name: m.label || m.col,
+      type: 'line',
+      data: m.y,
+      showSymbol: false,
+      lineStyle: { color, width: 1.5 },
+      itemStyle: { color },
+      // 缺失标记按列着色：折线在空洞处断开，虚线告诉你洞在哪一段时间上
+      markLine: {
+        symbol: 'none', silent: true,
+        data: (m.missingMarks || []).map(t => ({ xAxis: t })),
+        lineStyle: { color, type: 'dotted', width: 1.5 },
+        label: { show: false }
+      }
+    }
+  })
+  const dots = s.series.filter(m => (m.anomalies || []).length).map((m) => ({
+    name: `${m.label || m.col} · 异常`,
+    type: 'scatter',
+    data: m.anomalies,
+    symbolSize: 9,
+    itemStyle: { color: colorFor(m.col), borderColor: '#fff', borderWidth: 1.5 },
+    z: 5
+  }))
   chart.setOption({
     title: {
-      text: `数据质量图示与异常探针 (${colKey})` +
+      text: `数据质量图示与异常探针 (${names.join('、')})` +
         `${det ? ` · ${ANOMALY_NAMES[det.algo] || det.algo}` : ' · 尚未执行异常检测'}`,
       left: 10, top: 5, textStyle: { fontSize: 12, color: '#334155' }
     },
-    tooltip: { trigger: 'axis' },
+    tooltip: {
+      trigger: 'axis', axisPointer: { type: 'cross' },
+      formatter(params) {
+        if (!params || params.length === 0) return ''
+        let tip = `<div style="font-size:11px"><b>${params[0].axisValue}</b><br/>`
+        params.forEach(p => {
+          const val = p.value !== null && p.value !== undefined ? Number(p.value).toFixed(2) : '缺失'
+          tip += `<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:${p.color};margin-right:4px"></span>${p.seriesName}: <b>${val}</b><br/>`
+        })
+        return tip + '</div>'
+      }
+    },
     toolbox: { feature: { brush: { type: ['lineX', 'clear'] } }, right: 20, top: 5 },
     brush: { toolbox: ['lineX', 'clear'], xAxisIndex: 0 },
-    grid: { top: 40, right: 25, bottom: 50, left: 55 },
+    legend: { top: 24, left: 10, textStyle: { fontSize: 10 }, itemWidth: 14, itemHeight: 8, type: 'scroll' },
+    grid: { top: 58, right: 25, bottom: 50, left: 55 },
     dataZoom: [{ type: 'inside' }, { type: 'slider', bottom: 5, height: 20 }],
     xAxis: { type: 'category', data: s.x },
     yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
-    series: [
-      {
-        name: '原始时序', type: 'line', data: s.y,
-        lineStyle: { color: '#6366f1', width: 1.5 },
-        // 缺失标记由服务端给出（最多 80 条），折线本身在空洞处断开而不是连过去
-        markLine: { symbol: 'none', data: (s.missingMarks || []).map(t => ({ xAxis: t })),
-                    lineStyle: { color: '#f43f5e', type: 'dotted', width: 1.5 } }
-      },
-      {
-        name: '检测到的异常点', type: 'scatter', data: s.anomalies || [],
-        symbolSize: 10, itemStyle: { color: '#ef4444', borderColor: '#fff', borderWidth: 2 }
-      }
-    ]
+    series: [...lines, ...dots]
   }, true)
   applyBrushCursor()
 }
@@ -132,8 +215,8 @@ async function refreshAll() {
 }
 
 async function ensureSeries() {
-  const colKey = plotCol.value
-  sd.value = colKey ? await loadSeries(colKey, 1200) : null
+  const keys = selectedCols.value.map(c => c.key)
+  sd.value = keys.length ? await loadSeries(keys, 1200) : null
 }
 
 // ============ Tab1 缺失与重复 ============
@@ -333,7 +416,7 @@ onBeforeUnmount(() => {
 })
 watch(() => state.dataVersion, () => { if (state.currentStep === 4) refreshAll() })
 watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) })
-watch(plotCol, () => { ensureSeries().then(renderChart) })
+watch(selectionKey, () => { ensureSeries().then(renderChart) })
 </script>
 
 <template>
@@ -355,13 +438,10 @@ watch(plotCol, () => { ensureSeries().then(renderChart) })
       <div class="flex justify-between items-center px-3 pt-1 gap-3">
         <div class="flex items-center space-x-3 min-w-0">
           <span class="text-xs font-bold text-slate-800 shrink-0">时序异常诊断与区间标注画布</span>
-          <select v-model="chosenCol" class="text-[11px] border border-slate-200 rounded px-1.5 py-0.5 bg-white text-slate-600 outline-none focus:border-indigo-400 shrink-0">
-            <option v-for="c in floatCols" :key="c.key" :value="c.key">{{ c.label || c.key }}</option>
-          </select>
           <span class="text-[11px] bg-rose-50 text-rose-600 border border-rose-200 px-2 py-0.5 rounded-full font-medium truncate">{{ summaryPill }}</span>
         </div>
         <div class="flex items-center gap-2 shrink-0">
-          <span v-if="sd" class="text-[10px] text-slate-400">服务端抽稀 {{ sd.x.length.toLocaleString() }} 点 / {{ sd.rowCount.toLocaleString() }} 行</span>
+          <span v-if="sd" class="text-[10px] text-slate-400">服务端抽稀 {{ sd.x.length.toLocaleString() }} 点 / {{ sd.rowCount.toLocaleString() }} 行 · {{ selectedCols.length }} 列</span>
           <button @click="toggleBrush"
                   class="px-2.5 py-1 text-xs rounded border font-medium flex items-center transition-colors"
                   :class="brushActive ? 'border-rose-400 bg-rose-50 text-rose-700' : 'border-indigo-300 text-indigo-700 hover:bg-indigo-50'">
@@ -370,11 +450,36 @@ watch(plotCol, () => { ensureSeries().then(renderChart) })
           <button @click="clearBrush" class="px-2.5 py-1 text-xs rounded border border-slate-200 text-slate-600 hover:bg-slate-100">清空框选</button>
         </div>
       </div>
-      <div v-if="sd && sd.anomaliesTruncated" class="px-3 pt-0.5 text-[10px] text-amber-600 shrink-0">
-        <i class="fa-solid fa-circle-exclamation mr-1"></i>异常点超出绘图上限，图上只画了前 {{ sd.anomalies.length.toLocaleString() }} 个（共 {{ sd.anomalyCount.toLocaleString() }} 个，完整数量见下方表格）
+
+      <!-- 绘图列多选（与第三步同款）：改勾选就是换一次后端取数，浏览器不持有整表 -->
+      <div class="flex items-center gap-1.5 px-3 pt-1.5 flex-wrap shrink-0">
+        <span class="text-[11px] font-bold text-slate-600 shrink-0">绘图列:</span>
+        <button @click="toggleAll(true)" class="text-[10px] text-indigo-600 hover:underline shrink-0">全选</button>
+        <span class="text-slate-300 shrink-0">|</span>
+        <button @click="toggleAll(false)" class="text-[10px] text-slate-500 hover:underline shrink-0">清空</button>
+        <span class="text-[10px] text-slate-400 font-mono shrink-0">已选 {{ selected.size }} 条</span>
+        <label v-for="(c, i) in floatCols" :key="c.key"
+               class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border cursor-pointer transition-all text-[10px] font-medium"
+               :class="selected.has(c.key) ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-200 hover:bg-indigo-50/50'">
+          <input type="checkbox" class="accent-indigo-500" :checked="selected.has(c.key)" @change="toggleCol(c.key)" />
+          <span class="w-2 h-2 rounded-full shrink-0" :style="{ background: colorOf(i) }"></span>
+          <span>{{ c.label || c.key }}</span>
+        </label>
+        <span v-if="!floatCols.length" class="text-[10px] text-slate-400">没有数值列可画</span>
       </div>
-      <div v-if="sd && sd.stale" class="px-3 pt-0.5 text-[10px] text-rose-600 shrink-0">
-        <i class="fa-solid fa-arrows-rotate mr-1"></i>检测之后数据又被改过，图上的红点已不保证落在当前行：请重新执行检测
+
+      <div v-if="overlayNote" class="px-3 pt-0.5 text-[10px] text-amber-600 shrink-0">
+        <i class="fa-solid fa-circle-exclamation mr-1"></i>有列的异常点没画全（被抽稀抽掉、或超出每列覆盖层预算）：
+        图上共 {{ overlayNote.drawn }} 个 / 检出共 {{ overlayNote.total }} 个。画不全的列（图上/真实数）：
+        <span v-for="(r, i) in overlayNote.shown" :key="r.label">{{ r.label }} {{ r.drawn }}/{{ r.total }}<span v-if="i < overlayNote.shown.length - 1">、</span></span><span v-if="overlayNote.hidden"> 等</span>，共 {{ overlayNote.allCols }} 列（完整数量见下方表格）
+      </div>
+      <div v-if="marksNote" class="px-3 pt-0.5 text-[10px] text-amber-600 shrink-0">
+        <i class="fa-solid fa-circle-exclamation mr-1"></i>有列的缺失虚线没画全（被抽稀抽掉、或超出每列虚线上限）：
+        图上共 {{ marksNote.drawn }} 条 / 缺失格共 {{ marksNote.total }} 个。画不全的列（虚线/缺失格）：
+        <span v-for="(r, i) in marksNote.shown" :key="r.label">{{ r.label }} {{ r.drawn }}/{{ r.total }}<span v-if="i < marksNote.shown.length - 1">、</span></span><span v-if="marksNote.hidden"> 等</span>，共 {{ marksNote.allCols }} 列（完整数量见下方表格）
+      </div>
+      <div v-if="staleChart" class="px-3 pt-0.5 text-[10px] text-rose-600 shrink-0">
+        <i class="fa-solid fa-arrows-rotate mr-1"></i>检测之后数据又被改过，图上的彩色散点已不保证落在当前行：请重新执行检测
       </div>
       <div ref="chartEl" class="w-full flex-1"></div>
     </div>
@@ -628,7 +733,7 @@ watch(plotCol, () => { ensureSeries().then(renderChart) })
                 </button>
               </div>
               <div v-if="exprFeedback" class="mt-1.5 text-[10px]" :class="exprFeedback.ok ? 'text-emerald-600' : 'text-rose-600'">{{ exprFeedback.text }}</div>
-              <div class="mt-1 text-[10px] text-slate-400">「验证」只在浏览器检查语法与取值类型；真正逐行判定在后端按同一份表达式向量化求值。</div>
+              <div class="mt-1 text-[10px] text-slate-400">「验证」只检查表达式语法与取值类型，不逐行判定异常。</div>
               <div class="flex items-center gap-1.5 mt-2 flex-wrap">
                 <span class="text-[10px] text-rose-400 mr-1">快捷模板:</span>
                 <button v-for="tpl in ['v > 1000', 'v < 0', 'v > mean + 2*std', 'v < mean - 2*std', 'v > q3 + 1.5*(q3-q1) || v < q1 - 1.5*(q3-q1)']" :key="tpl"
@@ -663,7 +768,7 @@ watch(plotCol, () => { ensureSeries().then(renderChart) })
             <div class="border border-slate-200 rounded-lg overflow-hidden">
               <div class="bg-slate-50 px-3 py-1.5 border-b border-slate-200 flex items-center justify-between">
                 <span class="text-[11px] font-semibold text-slate-600">各列异常详情</span>
-                <span class="text-[10px] text-slate-400">{{ detection ? `${ANOMALY_NAMES[detection.algo] || detection.algo} · ${detection.time} · 异常行索引留在服务端` : '等待检测' }}</span>
+                <span class="text-[10px] text-slate-400">{{ detection ? `${ANOMALY_NAMES[detection.algo] || detection.algo} · ${detection.time}` : '等待检测' }}</span>
               </div>
               <div class="max-h-[160px] overflow-auto">
                 <table class="w-full text-xs">

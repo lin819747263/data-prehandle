@@ -154,15 +154,29 @@ OP_KIND_LABELS = {
     "feature_time": "时间与日历特征", "feature_lag": "滞后与滑动窗口",
     "feature_diff": "差分与频域", "feature_cat": "类别特征编码",
     "exo-preset": "预设外生变量", "exo-formula": "公式生成外生变量", "exo-file": "侧表对齐合并",
+    "split_apply": "生成数据集划分列", "holidays": "配置节假日表",
 }
+
+# 滞后/窗口、差分/频域拆成两次独立生成之后，同一条命令种类要看 group 才知道生成了哪一半
+GROUPED_OP_LABELS = {
+    "feature_lag": {"lag": "滞后特征", "window": "滑动窗口特征"},
+    "feature_diff": {"diff": "差分特征", "fft": "频域特征"},
+}
+
+
+def _op_label(op: dict) -> str:
+    kind = op.get("kind")
+    base = OP_KIND_LABELS.get(kind, "")
+    by_group = GROUPED_OP_LABELS.get(kind)
+    if by_group:
+        got = by_group.get((op.get("params") or {}).get("group"))
+        if got:
+            return got
+    return base or str(op.get("summary") or kind or "")
 
 # 这些 params 键装的是整列/整份检测数据：可以进日志与重放，但**绝不进 HTTP 响应**
 # （meta.ops 每次操作都回给浏览器，带着数组就等于把明细又送回前端）。
 HEAVY_PARAM_KEYS = frozenset({"data", "detection"})
-
-
-def _op_label(op: dict) -> str:
-    return OP_KIND_LABELS.get(op.get("kind"), "") or str(op.get("summary") or op.get("kind") or "")
 
 
 def _op_params_view(op: dict) -> dict:
@@ -551,6 +565,13 @@ class Workspace:
             return render_times(self.df[self.time_col], self.meta.get("timeFormat") or "YYYY-MM-DD HH:mm:ss")
         return [str(i) for i in range(int(self.df.shape[0]))]
 
+    def holiday_days(self) -> list[str]:
+        """当前生效的节假日表：没配置过就是内置预设，配置过就是用户那份（空表也算配置过）。"""
+        days = self.meta.get("holidayDays")
+        if days is None:
+            return sorted(features.HOLIDAY_PRESETS[features.DEFAULT_HOLIDAY_YEAR])
+        return sorted(days)
+
     # ---- 元信息 ----
     @property
     def time_col(self) -> str | None:
@@ -742,39 +763,6 @@ class Workspace:
             self.df, [c for c in self.meta["columns"] if not c.get("feature")],
             self.time_col, self.time_labels())
         return {"wsId": self.id, "version": self.version, **snap}
-
-    def series(self, key: str, max_points: int = 1200) -> dict:
-        """一条列的抽稀曲线 + 异常点覆盖层 + 缺失标记：画图不再需要整表。"""
-        if key not in [str(c) for c in self.df.columns]:
-            raise ValueError(f"列不存在：{key}")
-        points = min(max(int(max_points), 20), quality.MAX_ENVELOPE_POINTS)
-        arr = quality.numeric_array(self.df, key)
-        labels = self.time_labels()
-        positions = quality.envelope(arr, points)
-        nan = np.isnan(arr)
-        out = {
-            "wsId": self.id, "version": self.version, "col": key,
-            "rowCount": int(arr.size), "maxPoints": points,
-            "x": [labels[i] for i in positions],
-            "y": [None if nan[i] else float(arr[i]) for i in positions],
-            "idx": [int(i) for i in positions],
-            "missingCount": int(nan.sum()),
-            "missingMarks": [labels[i] for i in np.flatnonzero(nan)[:quality.MAX_MISSING_MARKS]],
-            "anomalies": [], "anomalyCount": 0, "anomaliesTruncated": False,
-            "algo": None, "stale": False,
-        }
-        det = self.anomaly
-        if det is not None:
-            # 失效也要说出来：只报 anomalyCount=0 会让界面把"检测过期"读成"没有异常"
-            out["stale"] = self.anomaly_stale()
-        found = (det or {}).get("perColumn", {}).get(key)
-        if det and found is not None and not self.anomaly_stale():
-            indices = found["indices"]
-            out["anomalyCount"] = int(indices.size)
-            out["anomalies"] = [[labels[int(i)], float(arr[int(i)])] for i in indices[:quality.MAX_ANOMALY_POINTS]]
-            out["anomaliesTruncated"] = bool(indices.size > quality.MAX_ANOMALY_POINTS)
-            out["algo"] = det.get("algo")
-        return out
 
     # ---- 异常检测缓存（检测改数据之外的第四步计算）----
     def anomaly_stale(self) -> bool:
@@ -1443,6 +1431,14 @@ def _feature_commit(ws: Workspace, work: pd.DataFrame, family: str,
     if len(items) > MAX_FEATURE_COLS_PER_OP:
         raise ValueError(f"一次生成 {len(items)} 列，超过单次上限 {MAX_FEATURE_COLS_PER_OP} 列：请减少目标列或窗口数量")
     existed = {str(c) for c in work.columns}
+    # 同一族重新生成一次就是「换成这一批」：上一批里没被再次选中的列必须退场，
+    # 否则取消勾选「保留数值原列」之后 feat_hour 还赖在表里，界面上就是假的。
+    planned = {k for k, _ in items}
+    prev_by_key = {c["key"]: c for c in ws.meta["columns"]}
+    removed = [str(c) for c in work.columns
+               if (prev_by_key.get(str(c)) or {}).get("feature") == family and str(c) not in planned]
+    if removed:
+        work.drop(columns=removed, inplace=True)
     for key, values in columns.items():
         work[key] = values
     ws.rebuild_meta_columns(work)
@@ -1454,9 +1450,11 @@ def _feature_commit(ws: Workspace, work: pd.DataFrame, family: str,
         col["label"] = label
         col["feature"] = family
     created = sum(1 for key, _ in items if key not in existed)
+    if removed:
+        summary += f" · 换掉上一批未再勾选的 {len(removed)} 列"
     return {
         "summary": summary, "featureType": family,
-        "cols": len(items), "created": created,
+        "cols": len(items), "created": created, "removed": removed,
         "keys": [k for k, _ in items],
         "features": [{"key": k, "label": meta_by_key.get(k, {}).get("label", k), "feature": family}
                      for k, _ in items],
@@ -1466,23 +1464,84 @@ def _feature_commit(ws: Workspace, work: pd.DataFrame, family: str,
     }
 
 
+def _op_split_apply(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
+    """把切分落成真实的一列：时序不打乱，按整表行序前 train% / 中 val% / 末 test%。
+
+    行数只由这里的公式决定（features.split_counts），界面与导出脚本读的是同一份，
+    所以「界面上 2016 / 2016 / 2016 条」和列里真正写进去的值必然一致。
+    """
+    ratio = int(p.get("ratio") or 70)
+    if not 50 <= ratio <= 85:
+        raise ValueError(f"训练集占比需在 50~85 之间，收到 {ratio}")
+    n = int(work.shape[0])
+    if n < 3:
+        raise ValueError(f"整表只有 {n} 行，切不出训练/验证/测试三段")
+    key = (p.get("key") or features.SPLIT_COL_KEY).strip() or features.SPLIT_COL_KEY
+    label = (p.get("label") or features.SPLIT_COL_LABEL).strip() or features.SPLIT_COL_LABEL
+    c = features.split_counts(n, ratio)
+    values = ["train"] * c["train"] + ["val"] * c["val"] + ["test"] * c["test"]
+    existed = key in {str(x) for x in work.columns}
+    work[key] = values
+    ws.rebuild_meta_columns(work)
+    col = next((x for x in ws.meta["columns"] if x["key"] == key), None)
+    if col is not None:
+        col["label"] = label
+        # feature=split：让它进第五步的特征登记表（可改名、可撤销），同时被数值列选择器挡在外面
+        col["feature"] = "split"
+    counts = "/".join(f"{v} {c[v]}" for v in features.SPLIT_VALUES)
+    return {
+        "summary": f"{'更新' if existed else '生成'}划分列 {key}：{label} {ratio}% · {counts}（共 {n} 行）",
+        "key": key, "label": label, "ratio": ratio, "replaced": existed,
+        "train": c["train"], "val": c["val"], "test": c["test"], "rowCount": n,
+        "colCount": int(work.shape[1]),
+        "counts": {v: {"rows": c[v], "pct": round(c[v] / n * 100, 2)} for v in features.SPLIT_VALUES},
+        "_valueChange": False, "_frame": work,
+    }
+
+
+def _op_holidays(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
+    """配置节假日表：只改工作区配置，不动帧，但同样是一条可撤销、可重放的命令。"""
+    days = features.check_holiday_days(p.get("days"))
+    source = (p.get("source") or "").strip() or "custom"
+    ws.meta["holidayDays"] = days
+    ws.meta["holidaySource"] = source
+    return {
+        "summary": f"节假日表：{len(days)} 天（{source}）" +
+                   (f" · {days[0]} ~ {days[-1]}" if days else " · 不认任何节假日"),
+        "days": days, "count": len(days), "source": source,
+        "rowCount": int(work.shape[0]), "colCount": int(work.shape[1]),
+        "_valueChange": False,
+    }
+
+
 def _op_feature_time(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
-    dims, cyc = features.check_time_params(p.get("dims"), p.get("cyclical"))
+    dims, cyc = features.check_time_params(p.get("dims"), p.get("cyclical"), p.get("cycDims"))
+    # 拆分前的旧命令没有这个字段，缺省保留原列 == 旧行为，老日志重放出来的列一颗不差
+    keep = bool(p.get("keepCycOriginal", True))
     time_col = ws.time_col
     if not time_col or time_col not in [str(c) for c in work.columns]:
         raise ValueError("当前工作区没有可用的时间列，无法生成日历特征")
     ts = work[time_col]
     if not pd.api.types.is_datetime64_any_dtype(ts):
         ts = pd.to_datetime(ts, errors="coerce")
-    plan = features.time_plan(dims, cyc)
-    columns = features.build_time(ts, dims, cyc)
-    sin_cos = len(plan) - len(dims)
-    detail = ",".join(dims + [f"cyclical_{d}" for d in cyc])
-    return _feature_commit(ws, work, "time", plan, columns,
-                           f"时间日历特征：{len(plan)} 列（正余弦 {sin_cos}）· {detail}")
+    holidays = frozenset(ws.holiday_days())
+    plan = features.time_plan(dims, cyc, keep)
+    columns = features.build_time(ts, dims, cyc, keep, holidays)
+    sin_cos = 2 * len(cyc)          # 每个被编码的维度出 sin、cos 两列
+    detail = ",".join(dims + [f"cyclical_{d}" for d in cyc] + ([] if keep else ["replace_original"]))
+    result = _feature_commit(ws, work, "time", plan, columns,
+                             f"时间日历特征：{len(plan)} 列（正余弦 {sin_cos}）· {detail}")
+    # 把这次真正用上的日期表回带出去：审计记录留着它，导出脚本才复现得出同一批 feat_holiday 值
+    result["holidays"] = {"used": "holiday" in dims,
+                          "source": ws.meta.get("holidaySource") or f"preset-{features.DEFAULT_HOLIDAY_YEAR}",
+                          "days": sorted(holidays)}
+    return result
 
 
 def _op_feature_lag(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
+    group = p.get("group")
+    if group not in (None, "lag", "window"):
+        raise ValueError(f"不支持的生成组：{group}（可选 lag / window）")
     cols = [c for c in (p.get("cols") or []) if c]
     if not cols:
         raise ValueError("请先选择要构造滞后/窗口特征的目标列")
@@ -1496,7 +1555,17 @@ def _op_feature_lag(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     expanding = bool(p.get("expanding"))
     ewm = bool(p.get("ewm"))
     span = features.normalize_span(p.get("ewmSpan"))
-    if not (lags or windows or expanding or ewm):
+    if group == "lag":
+        if windows or expanding or ewm:
+            raise ValueError("这一组只生成滞后特征：滚动窗口/高级窗口请改用「滑动窗口」那一组提交")
+        if not lags:
+            raise ValueError("请先填写滞后阶数")
+    elif group == "window":
+        if lags:
+            raise ValueError("这一组只生成滑动窗口特征：滞后阶数请改用「滞后特征」那一组提交")
+        if not (windows or expanding or ewm):
+            raise ValueError("请先填写滚动窗口，或勾选 Expanding / EWM")
+    elif not (lags or windows or expanding or ewm):
         raise ValueError("至少选择一个滞后步长、滚动窗口或高级窗口")
     plan = features.lag_plan(cols, lags, windows, stats, expanding, ewm, span)
     columns: dict = {}
@@ -1513,11 +1582,16 @@ def _op_feature_lag(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
             columns[f"ewm_{col}_s{span}"] = features.ewm_prev(vals, span)
     detail = (f"cols:{','.join(cols)}|lag:{','.join(map(str, lags))}|roll:{','.join(map(str, windows))}"
               f"|stats:{','.join(stats)}|exp:{1 if expanding else 0}|ewm:{span if ewm else 0}")
-    return _feature_commit(ws, work, "lag_roll", plan, columns,
-                           f"滞后与滑动窗口特征：{len(plan)} 列 · {detail}")
+    family = {"lag": "lag", "window": "window"}.get(group, "lag_roll")
+    label = {"lag": "滞后特征", "window": "滑动窗口特征"}.get(group, "滞后与滑动窗口特征")
+    return _feature_commit(ws, work, family, plan, columns,
+                           f"{label}：{len(plan)} 列 · {detail}")
 
 
 def _op_feature_diff(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
+    group = p.get("group")
+    if group not in (None, "diff", "fft"):
+        raise ValueError(f"不支持的生成组：{group}（可选 diff / fft）")
     cols = [c for c in (p.get("cols") or []) if c]
     if not cols:
         raise ValueError("请先选择要做差分/频域分析的目标列")
@@ -1529,7 +1603,17 @@ def _op_feature_diff(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     dominant = bool(p.get("fftDominant"))
     entropy = bool(p.get("fftEntropy"))
     power_ratio = bool(p.get("fftPowerRatio"))
-    if not (d1 or d2 or seasonal or dominant or entropy or power_ratio):
+    if group == "diff":
+        if dominant or entropy or power_ratio:
+            raise ValueError("这一组只生成差分特征：频域项请改用「频域特征」那一组提交")
+        if not (d1 or d2 or seasonal):
+            raise ValueError("请至少勾选一阶、二阶或季节性差分")
+    elif group == "fft":
+        if d1 or d2 or seasonal:
+            raise ValueError("这一组只生成频域特征：差分项请改用「差分特征」那一组提交")
+        if not (dominant or entropy or power_ratio):
+            raise ValueError("请至少勾选一项频域特征")
+    elif not (d1 or d2 or seasonal or dominant or entropy or power_ratio):
         raise ValueError("至少选择一种差分或频域特征")
     plan = features.diff_plan(cols, d1, d2, seasonal, period, dominant, entropy, power_ratio)
     columns: dict = {}
@@ -1563,8 +1647,10 @@ def _op_feature_diff(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     fft = [n for n, on in (("dom", dominant), ("ent", entropy), ("pow", power_ratio)) if on]
     detail = (f"cols:{','.join(cols)}|d1:{1 if d1 else 0}|d2:{1 if d2 else 0}"
               f"|seas:{period if seasonal else 0}|fft:{','.join(fft)}")
-    return _feature_commit(ws, work, "diff_freq", plan, columns,
-                           f"差分与频域特征：{len(plan)} 列 · {detail}")
+    family = {"diff": "diff", "fft": "fft"}.get(group, "diff_freq")
+    label = {"diff": "差分特征", "fft": "频域特征"}.get(group, "差分与频域特征")
+    return _feature_commit(ws, work, family, plan, columns,
+                           f"{label}：{len(plan)} 列 · {detail}")
 
 
 CAT_METHOD_LABELS = {"onehot": "独热编码", "ordinal": "序数编码", "target": "目标均值编码"}
@@ -1620,10 +1706,12 @@ _OPS = {
     "convert_unit": _op_convert_unit,
     "derived_column": _op_derived_column,
     "resample": _op_resample,
+    "split_apply": _op_split_apply,
     "impute": _op_impute,
     "anomaly-repair": _op_anomaly_repair,
     "mask-generate": _op_mask_generate,
     "mask-delete": _op_mask_delete,
+    "holidays": _op_holidays,
     "feature_time": _op_feature_time,
     "feature_lag": _op_feature_lag,
     "feature_diff": _op_feature_diff,

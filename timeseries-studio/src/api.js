@@ -121,8 +121,11 @@ export function wsQuality(wsId) {
     .then(async (res) => { if (!res.ok) throw await jsonError(res); return res.json() })
 }
 
-export function wsSeries(wsId, key, maxPoints = 1200) {
-  return wsJson(`/api/ws/${enc(wsId)}/series?col=${enc(key)}&max_points=${maxPoints}`)
+// 多列共享一条抽稀时间轴，后端逐列带回缺失标记与异常覆盖层（整表不出后端）
+export function wsSeries(wsId, keys, points = 1200) {
+  const q = `cols=${keys.map(enc).join(',')}&points=${points}`
+  return withTimeout(`/api/ws/${enc(wsId)}/series?${q}`, {}, LONG_TIMEOUT_MS)
+    .then(async (res) => { if (!res.ok) throw await jsonError(res); return res.json() })
 }
 
 export function wsAnomaly(wsId) {
@@ -161,10 +164,17 @@ export function wsHist(wsId, key, bins = 25) {
   return wsJson(`/api/ws/${enc(wsId)}/hist?col=${enc(key)}&bins=${bins}`)
 }
 
-export function wsSeriesMulti(wsId, keys, mode, points) {
-  const q = `cols=${keys.map(enc).join(',')}&mode=${enc(mode)}&points=${points}`
+// span：all/year/month/week/day，由后端按自然周期筛行；offset 是该档位内第几个周期（0=第一期，
+// 越界由后端贴到最近一端并在 window.offset / window.requested 里说明，见 explore.resolve_window）
+export function wsSeriesMulti(wsId, keys, mode, points, span = 'all', offset = 0) {
+  const q = `cols=${keys.map(enc).join(',')}&mode=${enc(mode)}&points=${points}&span=${enc(span)}&offset=${offset | 0}`
   return withTimeout(`/api/ws/${enc(wsId)}/series-multi?${q}`, {}, LONG_TIMEOUT_MS)
     .then(async (res) => { if (!res.ok) throw await jsonError(res); return res.json() })
+}
+
+// 节假日表：整份留在后端 meta 上（feature-time 读的就是这一份），浏览器只按 GET 显示、POST 改
+export function wsHolidays(wsId) {
+  return wsJson(`/api/ws/${enc(wsId)}/holidays`)
 }
 
 // 新特征列的「首个完整行」：整列扫描在后端做，不再把 5000 行拉回浏览器找行号

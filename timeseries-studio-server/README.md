@@ -162,8 +162,9 @@ python -m venv .venv
 
 - `GET /api/ws/{id}/quality` → 各列缺失统计、缺失段区间（`startIdx/endIdx`，上限 300 段并如实标 `truncated`）、
   重复时间戳计数、每列建议算法；界面"共 1404 个缺失 / 1394 段"就是这里的原始计数
-- `GET /api/ws/{id}/series?col&max_points` → 画一条曲线所需的抽稀点 + **原始行号** + 异常覆盖层；
-  有了行号，鼠标点上去仍能对回真实行，不必把整表拉回浏览器
+- `GET /api/ws/{id}/series?cols=a,b&points` → 第四步质量曲线：几条列**共享一条**抽稀时间轴 + **原始行号** +
+  逐列缺失标记与异常覆盖层；有了行号，鼠标点上去仍能对回真实行，刷选框也能换算回真实区间去建掩码。
+  覆盖层只回能落到时间轴上的点，整列真实总数与 `marksTruncated`/`anomaliesTruncated` 一起给出
 - `GET /api/ws/{id}/anomaly` → 服务端留存的检测结果（没有则 `null`），`meta.anomaly.stale` 表示数据已改动、需重测
 - `POST /api/ws/{id}/anomaly-detect { algo: "3sigma"|"iqr"|"iforest"|"iforest_sklearn"|"expr", expr?, nEstimators?, contamination?, randomState?, normalLowerQ?, normalUpperQ? }`
   → `{ detection, meta }`；结果只存在服务端，后续修复按这份索引走，前端不回传点

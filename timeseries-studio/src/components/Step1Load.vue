@@ -113,14 +113,6 @@ function relTime(mtime) {
 
 <template>
   <section class="step-panel h-full p-6 flex flex-col gap-5 overflow-y-auto">
-    <div class="text-center py-4">
-      <h2 class="text-xl font-bold text-slate-800 flex items-center justify-center gap-2">
-        <i class="fa-solid fa-database text-indigo-600"></i>
-        数据加载
-      </h2>
-      <p class="text-xs text-slate-500 mt-1">解析与加工全部在后端执行：导入即落盘 dataset 目录并建立服务端工作区，浏览器只保留当前页窗口</p>
-    </div>
-
     <div class="flex-1 flex flex-col gap-4 min-h-0">
       <div class="flex flex-col gap-3 shrink-0">
         <div
@@ -157,8 +149,8 @@ function relTime(mtime) {
               </button>
             </div>
             <p class="text-[11px] text-slate-400 mt-3 flex items-center justify-center gap-1">
-              <i class="fa-solid fa-circle-info"></i>单文件建议 ≤ 64MB · 多文件按行拼接需后端合并（阶段②）·
-              {{ state.backend.online ? '导入即落盘 dataset 目录，整表留在服务端，界面只取当前页' : '后端未连接：工作台只读，无法解析或加工数据' }}
+              <i class="fa-solid fa-circle-info"></i>单文件建议 ≤ 64MB · 多文件按行拼接需后端合并（阶段②）
+              <template v-if="!state.backend.online">· 后端未连接：工作台只读，无法解析或加工数据</template>
             </p>
             <div class="mt-3 flex items-center justify-center">
               <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] border"

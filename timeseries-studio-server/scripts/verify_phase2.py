@@ -592,31 +592,50 @@ def main() -> int:
     check("换算数值后检测被判失效", meta_after["anomaly"]["stale"] is True, meta_after["anomaly"])
     st, pl = call("POST", f"/api/ws/{w}/op/anomaly-repair", {"repair": "clip"})
     check("失效后拒绝修复", st == 400, pl.decode("utf-8", "replace")[:80])
-    s = api("GET", f"/api/ws/{w}/series?col=flow")
-    check("失效后曲线不再带异常覆盖层", s["anomalyCount"] == 0 and s["stale"] is True,
-          f"{s['anomalyCount']} 点 · stale={s['stale']}")
+    s = api("GET", f"/api/ws/{w}/series?cols=flow")
+    sc = s["series"][0]
+    check("失效后曲线不再带异常覆盖层", sc["anomalyCount"] == 0 and s["anomaly"]["stale"] is True,
+          f"{sc['anomalyCount']} 点 · stale={s['anomaly']['stale']}")
     back = api("POST", f"/api/ws/{w}/restore", {"version": 1})
     check("回退版本后检测缓存被清空", back["meta"]["anomaly"] is None, back["meta"]["anomaly"])
     close_workspace(w)
 
-    # ---------- 8. 曲线 /series ----------
-    print("\n== 8. GET /series：抽稀点、原始行号与覆盖层 ==")
+    # ---------- 8. 曲线 /series（多列）----------
+    print("\n== 8. GET /series：多列共享抽稀时间轴、原始行号与逐列覆盖层 ==")
     w = upload(probe_csv())["meta"]["wsId"]
-    s = api("GET", f"/api/ws/{w}/series?col=flow&max_points=20")
+    s = api("GET", f"/api/ws/{w}/series?cols=flow&points=20")
+    sc = s["series"][0]
     check("抽稀后点数不超请求上限", len(s["x"]) <= 20, f"{len(s['x'])} 点")
     check("原始行号严格递增", all(b > a for a, b in zip(s["idx"], s["idx"][1:])), s["idx"])
     check("抽稀点保留尖峰所在行", 9 in s["idx"], f"idx={s['idx']}（9999 在第 9 行）")
-    check("缺失点留在序列里", s["y"].count(None) >= 1 and s["missingCount"] == 5,
-          f"None×{s['y'].count(None)} · 整列缺失 {s['missingCount']}")
+    check("缺失点留在序列里", sc["y"].count(None) >= 1 and sc["missingCount"] == 5,
+          f"None×{sc['y'].count(None)} · 整列缺失 {sc['missingCount']}")
+    # 抽稀把缺失行抽掉时虚线会少画，这时必须点亮截断标志：图不能反过来证明「数据里没有」
+    flow_missing = {i for i, v in enumerate(arrays["flow"]) if v is None}
+    on_axis_missing = len(flow_missing & set(s["idx"]))
+    check("虚线只画抽稀轴上留下的缺失行，少画则点亮截断",
+          all(t in s["x"] for t in sc["missingMarks"]) and len(sc["missingMarks"]) == on_axis_missing
+          and sc["marksTruncated"] is (on_axis_missing < sc["missingCount"]),
+          f"画 {len(sc['missingMarks'])}/{sc['missingCount']} 条 · 轴上缺失 {on_axis_missing} · 截断={sc['marksTruncated']}")
     check("x 用时间渲染", s["x"][0] == "2024-05-01 00:00:00", s["x"][0])
     det = api("POST", f"/api/ws/{w}/anomaly-detect", {"algo": "iqr"})["detection"]
-    s2 = api("GET", f"/api/ws/{w}/series?col=flow")
+    s2 = api("GET", f"/api/ws/{w}/series?cols=flow,temp,sparse")
+    check("逐列各回一条序列且与时间轴等长",
+          [m["col"] for m in s2["series"]] == ["flow", "temp", "sparse"]
+          and all(len(m["y"]) == len(s2["x"]) for m in s2["series"]),
+          f"{[(m['col'], len(m['y'])) for m in s2['series']]} / x {len(s2['x'])}")
+    check("检测算法随响应带回", s2["anomaly"]["algo"] == "iqr" and s2["anomaly"]["stale"] is False, s2["anomaly"])
     ref_hits = sorted(ref_detect(arrays["flow"], "iqr")[0])
-    check("覆盖层点数与检测一致", s2["anomalyCount"] == len(ref_hits), f"{s2['anomalyCount']} vs {len(ref_hits)}")
-    check("覆盖层就是检测到的那些行", [labels[i] for i in ref_hits] == [a[0] for a in s2["anomalies"]],
-          f"{[a[0] for a in s2['anomalies']]}")
-    check("覆盖层带原始值", all(close_enough(a[1], arrays['flow'][labels.index(a[0])]) for a in s2["anomalies"]))
-    check("曲线响应很小（明细不出后端）", len(json.dumps(s2)) < 8192, f"{len(json.dumps(s2))} 字节")
+    sc2 = next(m for m in s2["series"] if m["col"] == "flow")
+    check("覆盖层点数与检测一致", sc2["anomalyCount"] == len(ref_hits), f"{sc2['anomalyCount']} vs {len(ref_hits)}")
+    check("覆盖层就是检测到的那些行", [labels[i] for i in ref_hits] == [a[0] for a in sc2["anomalies"]],
+          f"{[a[0] for a in sc2['anomalies']]}")
+    check("覆盖层带原始值", all(close_enough(a[1], arrays['flow'][labels.index(a[0])]) for a in sc2["anomalies"]))
+    per_col = {m["col"]: m for m in api("GET", f"/api/ws/{w}/series?cols=flow")["series"]}
+    check("单列与多列的覆盖层一致", per_col["flow"]["anomalyCount"] == sc2["anomalyCount"]
+          and per_col["flow"]["anomalies"] == sc2["anomalies"],
+          f"{sc2['anomalyCount']} vs {per_col['flow']['anomalyCount']}")
+    check("曲线响应很小（明细不出后端）", len(json.dumps(s2)) < 16384, f"{len(json.dumps(s2))} 字节")
     close_workspace(w)
 
     # ---------- 9. 掩码列 ----------
@@ -785,13 +804,18 @@ def main() -> int:
          f"{bd['summary']['overallRate']:.4f}%")
     check("检测响应不含行索引", "perColumn" not in json.dumps(bd) and "anomalyIndices" in bd)
     t0 = time.perf_counter()
-    status, payload = call("GET", f"/api/ws/{bw}/series?col=%E4%BC%A0%E6%84%9F%E5%99%A801&max_points=1200")
+    status, payload = call("GET", f"/api/ws/{bw}/series?cols=%E4%BC%A0%E6%84%9F%E5%99%A801,%E4%BC%A0%E6%84%9F%E5%99%A802&points=1200")
     bs = json.loads(payload.decode("utf-8"))
-    show("/series", f"{(time.perf_counter()-t0)*1000:.0f} ms · {len(bs['x'])} 点 · 响应 "
-         f"{len(payload)/1024:.1f} KiB · 覆盖层 {bs['anomalyCount']} 点")
+    b0 = bs["series"][0]
+    show("/series(2 列)", f"{(time.perf_counter()-t0)*1000:.0f} ms · {len(bs['x'])} 点 · 响应 "
+         f"{len(payload)/1024:.1f} KiB · 覆盖层 {b0['anomalyCount']} 点（画 {len(b0['anomalies'])} 个）")
     check("抽稀后点数远小于行数", len(bs["x"]) <= 1200 and len(bs["x"]) < bs["rowCount"] / 4,
           f"{len(bs['x'])} / {bs['rowCount']}")
-    check("覆盖层未超过上限", bs["anomalyCount"] <= 4000, f"{bs['anomalyCount']} · 截断={bs['anomaliesTruncated']}")
+    check("每列都按同一条时间轴返回", all(len(m["y"]) == len(bs["x"]) for m in bs["series"])
+          and len(bs["series"]) == 2, [m["col"] for m in bs["series"]])
+    check("覆盖层未超过上限", b0["anomalyCount"] <= 4000
+          and len(b0["anomalies"]) <= 2000,
+          f"{b0['anomalyCount']} · 截断={b0['anomaliesTruncated']}")
     # 与 pandas 独立对拍：3σ 判定点数 = 各列 |x-mean|/std 超 3 的个数
     import numpy as np
     import pandas as pd
@@ -807,6 +831,13 @@ def main() -> int:
           f"{bd['summary']['totalAnomalies']} vs {total_ref}")
     check("大表缺失格数与 pandas 一致", bq["totalMissingCells"] == int(ref.isna().sum().sum()),
           f"{bq['totalMissingCells']} vs {int(ref.isna().sum().sum())}")
+    axis = set(bs["idx"])
+    for m in bs["series"]:
+        na_rows = set(np.flatnonzero(ref[m["col"]].isna().to_numpy()).tolist())
+        check(f"大表 {m['col']} 虚线数 = 抽稀轴上的真实缺失行数",
+              len(m["missingMarks"]) == len(na_rows & axis) == m["missingCount"] - len(na_rows - axis)
+              and m["marksTruncated"] is (len(na_rows & axis) < m["missingCount"]),
+              f"画 {len(m['missingMarks'])} 条 / 整列缺失 {m['missingCount']} 格 · 截断={m['marksTruncated']}")
     close_workspace(bw)
 
     print("\n== 结果 ==")

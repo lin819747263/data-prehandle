@@ -416,14 +416,13 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <div class="p-5 space-y-2.5">
         <div class="text-[11px] text-slate-500 bg-slate-50 border border-slate-200 rounded-lg px-3 py-2 font-mono leading-relaxed">
           {{ dsName }} · 后端工作区 {{ rowCount().toLocaleString() }} 行 × {{ exportCols }} 列
-          <span class="text-emerald-600">· 明细不过网络，四种格式均由服务端直出</span>
         </div>
         <button @click="doExport('csv')" :disabled="!state.backend.online || !!exporting"
                 class="w-full flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50/40 disabled:opacity-60 text-left transition-all">
           <span class="w-9 h-9 rounded-lg bg-emerald-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-csv text-emerald-600"></i></span>
           <span class="flex-1 min-w-0">
             <span class="block text-xs font-bold text-slate-700">CSV 宽表 (.csv)</span>
-            <span class="block text-[11px] text-slate-400">含全部清洗结果、外生变量与衍生特征列，后端直出（UTF-8 BOM，Excel 直接双击不乱码）</span>
+            <span class="block text-[11px] text-slate-400">含全部清洗结果、外生变量与衍生特征列（UTF-8 BOM，Excel 直接双击不乱码）</span>
           </span>
           <i class="fa-solid fa-chevron-right text-slate-300 text-xs"></i>
         </button>
@@ -432,7 +431,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="w-9 h-9 rounded-lg bg-green-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-excel text-green-600"></i></span>
           <span class="flex-1 min-w-0">
             <span class="block text-xs font-bold text-slate-700">Excel 工作簿 (.xlsx)</span>
-            <span class="block text-[11px] text-slate-400">后端 openpyxl 生成，单表全量数据</span>
+            <span class="block text-[11px] text-slate-400">单表全量数据</span>
           </span>
           <i class="fa-solid fa-chevron-right text-slate-300 text-xs"></i>
         </button>
@@ -450,7 +449,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <span class="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-columns text-orange-600"></i></span>
             <span class="flex-1 min-w-0">
               <span class="block text-xs font-bold text-slate-700">Parquet 列式归档 (.parquet)</span>
-              <span class="block text-[11px] text-slate-400">后端 pyarrow 真实编码（snappy 压缩），含全部清洗结果与特征列</span>
+              <span class="block text-[11px] text-slate-400">snappy 压缩，含全部清洗结果与特征列</span>
             </span>
             <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-600 border border-emerald-200 shrink-0">
               <i class="fa-solid fa-circle-check mr-0.5"></i>{{ exporting === 'parquet' ? '编码中…' : '后端可用' }}
@@ -461,7 +460,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <span class="w-9 h-9 rounded-lg bg-sky-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-feather text-sky-600"></i></span>
             <span class="flex-1 min-w-0">
               <span class="block text-xs font-bold text-slate-700">Feather 高速格式 (.feather)</span>
-              <span class="block text-[11px] text-slate-400">后端 Arrow IPC 编码，读写最快，适合本地流水线中转</span>
+              <span class="block text-[11px] text-slate-400">读写最快，适合本地流水线中转</span>
             </span>
             <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-600 border border-emerald-200 shrink-0">
               <i class="fa-solid fa-circle-check mr-0.5"></i>{{ exporting === 'feather' ? '编码中…' : '后端可用' }}

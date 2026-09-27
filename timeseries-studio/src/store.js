@@ -221,6 +221,8 @@ export const state = reactive({
   imputeSegAlgos: {},   // colKey -> { segIdx -> algo }
   // 第四步的诊断结果：GET /quality 的整份回显（缺失统计 + 缺失段 + 重复计数）
   quality: { wsId: '', version: -1, data: null, loading: false, error: '' },
+  // 第五步节假日表：GET /holidays 的整份回显（生效日期 + 可选预设），配置存在后端 meta 上
+  holidays: { wsId: '', version: -1, data: null, loading: false, error: '' },
   // 图表与刷选用的降采样曲线：GET /series（含每点的行位置 idx，掩码区间靠它换算）
   series: { key: '', data: null },
   lastAnomaly: null,    // 后端 detection_view()：{ algo, expr, results, summary, stale, anomalyIndices }
@@ -440,13 +442,6 @@ export async function refreshOverview() {
     toast('error', `整表统计失败：${e.message}`)
     return null
   }
-}
-
-export function currentMissingRate() {
-  return ds()?.overview?.missingRate ?? 0
-}
-export function currentDuplicateRate() {
-  return ds()?.overview?.duplicateRate ?? 0
 }
 
 // ---- 外生变量：三条来源全部打在服务端 ----
@@ -793,20 +788,23 @@ export function invalidateSeries() {
   state.series = { key: '', data: null }
 }
 
-export async function loadSeries(colKey, maxPoints = 1200) {
+export async function loadSeries(keys, maxPoints = 1200) {
   const d = ds()
-  if (!d?.wsId || !colKey) return null
+  const cols = (Array.isArray(keys) ? keys : [keys]).filter(Boolean)
+  if (!d?.wsId || !cols.length) return null
   if (!state.backend.online) return null
   const la = state.lastAnomaly
   const detTag = la && la.wsId === d.wsId ? `${la.version}:${la.stale ? 'stale' : 'fresh'}` : 'none'
-  const key = `${d.wsId}|${d.meta?.version ?? -1}|${colKey}|${maxPoints}|${detTag}`
+  // 勾选顺序不该多打一次后端：列名排序后作键
+  const colTag = [...cols].sort().join(',')
+  const key = `${d.wsId}|${d.meta?.version ?? -1}|${colTag}|${maxPoints}|${detTag}`
   const hit = seriesCache.get(key)
   if (hit) {
     if (state.series.key !== key) state.series = { key, data: hit }
     return hit
   }
   try {
-    const resp = await ws.wsSeries(d.wsId, colKey, maxPoints)
+    const resp = await ws.wsSeries(d.wsId, cols, maxPoints)
     if (seriesCache.size > 24) seriesCache.clear()
     seriesCache.set(key, resp)
     state.series = { key, data: resp }
@@ -867,6 +865,8 @@ export async function deleteAllMasks() {
 }
 
 // ---- 数据集切分 ----
+// 与后端 features.split_counts 同一份公式（整数除法，先训练后测试再验证），
+// 滑杆上显示的三段行数即划分列里真正写入的行数。
 export function splitCounts(trainPct) {
   const total = rowCount()
   const train = Math.floor(total * trainPct / 100)
@@ -891,25 +891,99 @@ export function setSplitRatio(ratio) {
   return r
 }
 
+// 把比例落成真实的一列（dataset_split：train/val/test）。
+// 切分动作从此跟数据走，不再只是滑杆上的三个数字——下游脚本导出宽表时这一列就在表里。
+export async function applySplitColumn(ratio) {
+  const r = Math.min(85, Math.max(50, Math.round(Number(ratio ?? state.splitRatio)) || 70))
+  const s = splitCounts(r)
+  const res = await runOp('split', { ratio: r }, {
+    step: 2, icon: 'split', title: '生成数据集划分列',
+    detail: x => `训练 ${x.ratio}% · train ${x.train.toLocaleString()} / val ${x.val.toLocaleString()} / test ${x.test.toLocaleString()}（共 ${x.rowCount.toLocaleString()} 行，时序不打乱）`,
+    // 三段行数记的是服务端那一次的真实数字（含当时的行数）：导出脚本照它复现，
+    // 之后若再删行/撤销，脚本里的 assert 会直接失败，而不是悄悄切成另一份数据
+    params: x => ({ type: 'split_apply', ratio: x.ratio, key: x.key, label: x.label,
+      rows: x.rowCount, train: x.train, val: x.val, test: x.test })
+  })
+  if (!res) return null
+  // 后端才是行数的裁判：界面先按它给的数校正一次，公式若哪天两边不一致会立刻显形
+  if (res.train !== s.train || res.val !== s.val || res.test !== s.test) {
+    toast('warning', `后端划分结果为 train ${res.train} / val ${res.val} / test ${res.test}，与本地预估不同，以后端为准`)
+  }
+  return res
+}
+
+// ---- 节假日表（第五步日历特征的配置项，整份存在后端工作区 meta 上）----
+export async function loadHolidays() {
+  const d0 = ds()
+  if (!d0?.wsId) return null
+  if (!requireBackend('读取节假日表')) return null
+  try {
+    const r = await ws.wsHolidays(d0.wsId)
+    state.holidays = { wsId: d0.wsId, version: r.version, data: r, loading: false, error: '' }
+    return r
+  } catch (e) {
+    state.holidays = { wsId: d0.wsId, version: -1, data: null, loading: false, error: e.message }
+    toast('error', `节假日表读取失败：${e.message}`)
+    return null
+  }
+}
+
+// days 是界面编辑后的整份表（新增/删除/换年份都提交全量）：后端 check_holiday_days 逐条校验格式
+export async function saveHolidays(days, source) {
+  const r = await runOp('holidays', { days, source }, {
+    step: 5, icon: 'wand', title: '配置节假日表',
+    detail: x => `${x.count} 天（${x.source}）` + (x.days.length ? ` · ${x.days[0]} ~ ${x.days[x.days.length - 1]}` : ' · 不认任何节假日'),
+    params: x => ({ type: 'holidays', count: x.count, source: x.source, days: x.days })
+  })
+  if (!r) return null
+  await loadHolidays()
+  return r
+}
+
 // ---- 第五步：特征工程（构建全部在后端，界面只发命令、读列注册表）----
 export function initFeatureList() {
   syncFeatureList(ds())
 }
 
-// 正余弦不是第 7 个日历维度，而是对「已勾选的周期维度」换一种编码方式。
-// 只有周期长度固定的维度能编码；day 每月天数不同（28~31），无固定周期，故不参与。
+// 正余弦不是第 7 个日历维度，而是对「已勾选的周期维度」换一种编码方式，所以按维度各给一个勾：
+// sincos_hour 只在 hour 也勾了时才生效。只有周期长度固定的维度能编码；
+// day 每月天数不同（28~31），无固定周期，故不参与。
 const TIME_DIMS = ['hour', 'day', 'month', 'weekday', 'is_weekend', 'holiday']
 const CYCLE_DIMS = ['hour', 'weekday', 'month']
 const CYCLE_PERIOD = { hour: 24, weekday: 7, month: 12 }
 const CYCLE_CN = { hour: '小时', weekday: '星期', month: '月份' }
+// 勾选集里的特殊项：sincos_<维度> = 该维度改用正余弦；keep_cyc_original = 编码后仍保留数值原列
+const SINCOS_OPTS = CYCLE_DIMS.map(o => `sincos_${o}`)
+const KEEP_ORIGINAL_OPT = 'keep_cyc_original'
+// 界面照这份列表渲染勾选框：勾选项与计划函数共用一份键表，两边不会各写各的
+export const TIME_OPTS_ALL = [...TIME_DIMS, ...SINCOS_OPTS, KEEP_ORIGINAL_OPT]
 
+// 计划函数是「哪些列会被生成」的唯一答案：面板预览、构建、审计明细、回放、Python 导出全读它
 export function timeFeaturePlan(opts) {
   const chosen = new Set(opts)
   const dims = TIME_DIMS.filter(o => chosen.has(o))
-  const wantSinCos = chosen.has('cyclical_sincos')
-  const cycDims = wantSinCos ? CYCLE_DIMS.filter(o => chosen.has(o)) : []
+  const cycDims = CYCLE_DIMS.filter(o => chosen.has(o) && chosen.has(`sincos_${o}`))
+  const keep = chosen.has(KEEP_ORIGINAL_OPT)
+  const skipped = keep ? [] : cycDims
+  const plainCols = dims.filter(o => !skipped.includes(o)).map(o => `feat_${o}`)
   const cycCols = cycDims.flatMap(o => [`feat_${o}_sin`, `feat_${o}_cos`])
-  return { dims, cycDims, cycCols, keys: [...dims.map(o => `feat_${o}`), ...cycCols] }
+  return { dims, cycDims, keep, skipped, keys: [...plainCols, ...cycCols] }
+}
+
+// 审计链里的那串 token：dims + cyclical_<维度> +（不保留原列时）replace_original。
+// 三者合起来无损还原 (dims, cycDims, keep)，回放与导出脚本都靠它复原同一批列。
+export function timePlanDetail(opts) {
+  const plan = timeFeaturePlan(opts)
+  return [...plan.dims, ...plan.cycDims.map(o => `cyclical_${o}`),
+    ...(plan.keep || plan.cycDims.length === 0 ? [] : ['replace_original'])].join(',')
+}
+
+export function parseTimeDetail(detail) {
+  const toks = String(detail || '').split(',').filter(Boolean)
+  const replace = toks.includes('replace_original')
+  const cyc = toks.filter(t => t.startsWith('cyclical_')).map(t => t.slice('cyclical_'.length))
+  const dims = toks.filter(t => !t.startsWith('cyclical_') && t !== 'replace_original')
+  return [...dims, ...cyc.map(o => `sincos_${o}`), ...(replace ? [] : [KEEP_ORIGINAL_OPT])]
 }
 
 // 供 UI 展示「将生成哪些列」，与实际构建共用 timeFeaturePlan，数字与列名同源于一次计算
@@ -918,25 +992,42 @@ export function timePlanLabel(opts) {
   return {
     dims: plan.dims,
     cyc: plan.cycDims.map(o => `${CYCLE_CN[o]}(${CYCLE_PERIOD[o]})`),
-    sinCosCols: plan.cycCols.length,
+    cycDims: plan.cycDims,
+    sinCosCols: plan.cycDims.length * 2,
+    dropped: plan.keep ? [] : plan.cycDims,
     keys: plan.keys,
     total: plan.keys.length,
-    daySkipped: opts.includes('day') && opts.includes('cyclical_sincos')
+    daySkipped: plan.dims.includes('day') && plan.cycDims.length > 0
   }
 }
 
 // 四个 Tab 的构建命令统一走 runOp：明细留在后端帧上算，响应回带最新列注册表，
 // state.features 由 applyMeta → syncFeatureList 从注册表派生（见上面的注释）。
+
+// 同一族重新生成时，后端会把上一批里没再勾选的列退场（否则取消「保留数值原列」之后
+// feat_hour 还留在表里）。退了几颗必须写进审计，不然界面上就是凭空少列。
+export function featureRemovedNote(x) {
+  const n = (x?.removed || []).length
+  if (!n) return ''
+  return ` · 换出 ${n} 列：${(x.removed || []).slice(0, 4).join('、')}${n > 4 ? ' 等' : ''}`
+}
+
 export async function buildTimeFeatures(opts) {
   const plan = timeFeaturePlan(opts)
   if (plan.keys.length === 0) return null
-  const detail = [...plan.dims, ...plan.cycDims.map(o => `cyclical_${o}`)].join(',')
-  const r = await runOp('feature-time', { dims: plan.dims, cyclical: plan.cycDims.length > 0 }, {
+  const detail = timePlanDetail(opts)
+  const r = await runOp('feature-time', {
+    dims: plan.dims, cyclical: false, cycDims: plan.cycDims, keepCycOriginal: plan.keep
+  }, {
     step: 5, icon: 'wand', title: '时间日历特征',
-    detail: x => `${x.cols} 列（新增 ${x.created}）: ${x.keys.join(', ')}`,
-    params: { type: 'feature_build', featureType: 'time', detail }
+    detail: x => `${x.cols} 列（新增 ${x.created}）: ${x.keys.join(', ')}${featureRemovedNote(x)}`,
+    params: x => ({ type: 'feature_build', featureType: 'time', detail,
+      // 用的就是工作区当时生效的那份表：整份记下来，脱离本项目也能复现 feat_holiday
+      holidayDays: x.holidays?.used ? x.holidays.days : null })
   }, { long: true })
-  return r && { cols: r.cols, created: r.created, sinCos: plan.cycCols.length }
+  return r && { cols: r.cols, created: r.created, removed: (r.removed || []).length,
+    removedNote: featureRemovedNote(r),
+    sinCos: plan.cycDims.length * 2, dropped: plan.keep ? 0 : plan.cycDims.length }
 }
 
 // 滚动统计量：键是勾选框/日志里的 fn，值是进入列名的简写（median → med 沿用既有命名）
@@ -947,33 +1038,38 @@ export function normEwmSpan(v) {
   return Number.isFinite(n) && n >= 2 ? Math.min(n, 500) : 12
 }
 
+// 滞后与滑动窗口拆成两次独立生成（group='lag' / 'window'）：同一份表单里两组参数各按自己的按钮提交，
+// 想要哪半边就点哪半边的按钮，不必为了只生成滞后而把窗口清空。
 // 所有窗口类特征（lag / rolling / expanding / ewm）统一不含当前行，
 // 等价于 pandas 的 .shift(1)，避免用 t 时刻的值预测 t 时刻的标签。
-export function lagFeaturePlan(targetCols, params) {
+export function lagFeaturePlan(targetCols, params, group) {
   const span = normEwmSpan(params.ewmSpan)
   const keys = []
   targetCols.forEach(col => {
-    (params.lags || []).forEach(s => keys.push(`lag_${col}_t${s}`))
-    ;(params.windows || []).forEach(w => (params.stats || []).forEach(fn => {
-      if (ROLL_STATS[fn]) keys.push(`roll_${ROLL_STATS[fn]}_${col}_w${w}`)
-    }))
-    if (params.expanding) keys.push(`expanding_mean_${col}`)
-    if (params.ewm) keys.push(`ewm_${col}_s${span}`)
+    if (group !== 'window') (params.lags || []).forEach(s => keys.push(`lag_${col}_t${s}`))
+    if (group !== 'lag') {
+      ;(params.windows || []).forEach(w => (params.stats || []).forEach(fn => {
+        if (ROLL_STATS[fn]) keys.push(`roll_${ROLL_STATS[fn]}_${col}_w${w}`)
+      }))
+      if (params.expanding) keys.push(`expanding_mean_${col}`)
+      if (params.ewm) keys.push(`ewm_${col}_s${span}`)
+    }
   })
   return [...new Set(keys)]
 }
 
-const LAG_DEFAULTS = { cols: [], lags: [], windows: [], stats: [], expanding: false, ewm: false, ewmSpan: 12 }
+const LAG_DEFAULTS = { cols: [], lags: [], windows: [], stats: [], expanding: false, ewm: false, ewmSpan: 12, group: null }
 
-export function lagPlanDetail(targetCols, params) {
+export function lagPlanDetail(targetCols, params, group) {
   return [
     `cols:${targetCols.join(',')}`,
-    `lag:${(params.lags || []).join(',')}`,
-    `roll:${(params.windows || []).join(',')}`,
-    `stats:${(params.stats || []).join(',')}`,
-    `exp:${params.expanding ? 1 : 0}`,
-    `ewm:${params.ewm ? normEwmSpan(params.ewmSpan) : 0}`
-  ].join('|')
+    group === 'window' ? '' : `lag:${(params.lags || []).join(',')}`,
+    group === 'lag' ? '' : `roll:${(params.windows || []).join(',')}`,
+    group === 'lag' ? '' : `stats:${(params.stats || []).join(',')}`,
+    group === 'lag' ? '' : `exp:${params.expanding ? 1 : 0}`,
+    group === 'lag' ? '' : `ewm:${params.ewm ? normEwmSpan(params.ewmSpan) : 0}`,
+    group ? `group:${group}` : ''
+  ].filter(Boolean).join('|')
 }
 
 export function parseLagDetail(detail) {
@@ -984,6 +1080,7 @@ export function parseLagDetail(detail) {
   })
   const list = s => (s ? s.split(',').filter(Boolean) : [])
   const nums = s => list(s).map(Number).filter(n => Number.isFinite(n) && n > 0)
+  const group = ['lag', 'window'].includes(f.group) ? f.group : null
   return {
     ...LAG_DEFAULTS,
     cols: list(f.cols),
@@ -992,36 +1089,49 @@ export function parseLagDetail(detail) {
     stats: list(f.stats).filter(s => ROLL_STATS[s]),
     expanding: f.exp === '1',
     ewm: !!f.ewm && f.ewm !== '0',
-    ewmSpan: f.ewm && f.ewm !== '0' ? normEwmSpan(f.ewm) : 12
+    ewmSpan: f.ewm && f.ewm !== '0' ? normEwmSpan(f.ewm) : 12,
+    group
   }
 }
 
-export async function buildLagFeatures(targetCols, params) {
-  const keys = lagFeaturePlan(targetCols, params)
+export async function buildLagFeatures(targetCols, params, group) {
+  const keys = lagFeaturePlan(targetCols, params, group)
   if (keys.length === 0) return null
-  const detail = lagPlanDetail(targetCols, params)
-  const r = await runOp('feature-lag', {
-    cols: targetCols, lags: params.lags || [], windows: params.windows || [],
-    stats: params.stats || [], expanding: !!params.expanding,
-    ewm: !!params.ewm, ewmSpan: normEwmSpan(params.ewmSpan)
-  }, {
-    step: 5, icon: 'wand', title: '滞后与滑动窗口特征',
-    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}`,
-    params: { type: 'feature_build', featureType: 'lag_roll', detail }
+  const detail = lagPlanDetail(targetCols, params, group)
+  const head = { lag: '滞后特征', window: '滑动窗口特征' }[group] || '滞后与滑动窗口特征'
+  // 后端按组校验「不许夹带另一组的参数」：所以发出去的参数集只留这一组真正会生成的部分，
+  // 界面上另一组的输入框此时归滑动窗口那个按钮管，不跟这次提交走。
+  const send = {
+    cols: targetCols,
+    lags: group === 'window' ? [] : (params.lags || []),
+    windows: group === 'lag' ? [] : (params.windows || []),
+    stats: group === 'lag' ? [] : (params.stats || []),
+    expanding: group === 'lag' ? false : !!params.expanding,
+    ewm: group === 'lag' ? false : !!params.ewm,
+    ewmSpan: normEwmSpan(params.ewmSpan),
+    group
+  }
+  const r = await runOp('feature-lag', send, {
+    step: 5, icon: 'wand', title: head,
+    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}${featureRemovedNote(x)}`,
+    // 组名同时决定后端的特征族（lag / window）与这份日志的归族；缺 group 的老记录重放仍是 lag_roll
+    params: { type: 'feature_build', featureType: group || 'lag_roll', detail }
   }, { long: true })
-  return r && { cols: r.cols, created: r.created }
+  return r && { cols: r.cols, created: r.created, removed: (r.removed || []).length, removedNote: featureRemovedNote(r) }
 }
 
-// 差分与频域：同样是「一份计划四处复用」（面板预览 / 构建 / 日志 / 回放 / 代码导出）
-export function diffFeaturePlan(targetCols, params) {
+// 差分与频域同理：各自一次生成，featureType 记 'diff' / 'fft'，未分组的老记录仍是 'diff_freq'
+export function diffFeaturePlan(targetCols, params, group) {
   const keys = []
-  targetCols.forEach(col => {
-    if (params.d1) keys.push(`diff1_${col}`)
-    if (params.d2) keys.push(`diff2_${col}`)
-    if (params.seasonal) keys.push(`diff_season${params.period}_${col}`)
-  })
+  if (group !== 'fft') {
+    targetCols.forEach(col => {
+      if (params.d1) keys.push(`diff1_${col}`)
+      if (params.d2) keys.push(`diff2_${col}`)
+      if (params.seasonal) keys.push(`diff_season${params.period}_${col}`)
+    })
+  }
   const fftCol = targetCols[0]
-  if (fftCol) {
+  if (fftCol && group !== 'diff') {
     if (params.fftDominant) keys.push(`fft_top1_${fftCol}`, `fft_top2_${fftCol}`, `fft_top3_${fftCol}`)
     if (params.fftEntropy) keys.push(`fft_entropy_${fftCol}`)
     if (params.fftPowerRatio) keys.push(`fft_power_ratio_${fftCol}`)
@@ -1029,18 +1139,19 @@ export function diffFeaturePlan(targetCols, params) {
   return [...new Set(keys)]
 }
 
-export function diffPlanDetail(targetCols, params) {
+export function diffPlanDetail(targetCols, params, group) {
   const fft = []
   if (params.fftDominant) fft.push('dom')
   if (params.fftEntropy) fft.push('ent')
   if (params.fftPowerRatio) fft.push('pow')
   return [
     `cols:${targetCols.join(',')}`,
-    `d1:${params.d1 ? 1 : 0}`,
-    `d2:${params.d2 ? 1 : 0}`,
-    `seas:${params.seasonal ? Math.max(1, Math.round(params.period) || 1) : 0}`,
-    `fft:${fft.join(',')}`
-  ].join('|')
+    group === 'fft' ? '' : `d1:${params.d1 ? 1 : 0}`,
+    group === 'fft' ? '' : `d2:${params.d2 ? 1 : 0}`,
+    group === 'fft' ? '' : `seas:${params.seasonal ? Math.max(1, Math.round(params.period) || 1) : 0}`,
+    group === 'diff' ? '' : `fft:${fft.join(',')}`,
+    group ? `group:${group}` : ''
+  ].filter(Boolean).join('|')
 }
 
 export function parseDiffDetail(detail) {
@@ -1060,25 +1171,32 @@ export function parseDiffDetail(detail) {
     period,
     fftDominant: fft.includes('dom'),
     fftEntropy: fft.includes('ent'),
-    fftPowerRatio: fft.includes('pow')
+    fftPowerRatio: fft.includes('pow'),
+    group: ['diff', 'fft'].includes(f.group) ? f.group : null
   }
 }
 
-export async function buildDiffFeatures(targetCols, params) {
-  const keys = diffFeaturePlan(targetCols, params)
+export async function buildDiffFeatures(targetCols, params, group) {
+  const keys = diffFeaturePlan(targetCols, params, group)
   if (keys.length === 0) return null
-  const detail = diffPlanDetail(targetCols, params)
+  const detail = diffPlanDetail(targetCols, params, group)
+  const head = { diff: '差分平稳化特征', fft: '频域特征' }[group] || '差分与频域特征'
   const r = await runOp('feature-diff', {
     cols: targetCols,
-    d1: !!params.d1, d2: !!params.d2,
-    seasonal: !!params.seasonal, period: Math.max(1, Math.round(params.period) || 1),
-    fftDominant: !!params.fftDominant, fftEntropy: !!params.fftEntropy, fftPowerRatio: !!params.fftPowerRatio
+    d1: group === 'fft' ? false : !!params.d1,
+    d2: group === 'fft' ? false : !!params.d2,
+    seasonal: group === 'fft' ? false : !!params.seasonal,
+    period: Math.max(1, Math.round(params.period) || 1),
+    fftDominant: group === 'diff' ? false : !!params.fftDominant,
+    fftEntropy: group === 'diff' ? false : !!params.fftEntropy,
+    fftPowerRatio: group === 'diff' ? false : !!params.fftPowerRatio,
+    group
   }, {
-    step: 5, icon: 'wand', title: '差分与频域特征',
-    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}`,
-    params: { type: 'feature_build', featureType: 'diff_freq', detail }
+    step: 5, icon: 'wand', title: head,
+    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}${featureRemovedNote(x)}`,
+    params: { type: 'feature_build', featureType: group || 'diff_freq', detail }
   }, { long: true })
-  return r && { cols: r.cols, created: r.created }
+  return r && { cols: r.cols, created: r.created, removed: (r.removed || []).length, removedNote: featureRemovedNote(r) }
 }
 
 // 类别列的取值分布由后端整表数出（/value-counts）：浏览器不留整表，
@@ -1132,7 +1250,7 @@ export async function buildCatFeatures(selectedKeys, method) {
   const detail = catPlanDetail(selectedKeys, method)
   const r = await runOp('feature-cat', { cols: selectedKeys, method }, {
     step: 5, icon: 'wand', title: '类别特征编码',
-    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}`,
+    detail: x => `${x.cols} 列（新增 ${x.created}）· ${detail}${featureRemovedNote(x)}`,
     // 独热列名来自数据取值，构建当场把服务端算出的键序记进审计参数：
     // 整表不再常驻浏览器，导出 Python 时只有这一份记录能复现同一批列名与列序。
     // targetColumn 同理——目标均值编码的参照列由服务端挑，界面看不到挑中的是哪一个。
@@ -1140,7 +1258,7 @@ export async function buildCatFeatures(selectedKeys, method) {
       onehotKeys: method === 'onehot' ? x.keys : null,
       targetColumn: x.targetColumn || null })
   }, { long: true })
-  return r && { cols: r.cols, created: r.created }
+  return r && { cols: r.cols, created: r.created, removed: (r.removed || []).length, removedNote: featureRemovedNote(r) }
 }
 
 // 「首个完整行」：长窗口特征在前 N 行必然为空（窗口还没盖到）。整列扫描在后端 /first-complete 做，
@@ -1396,27 +1514,21 @@ async function replaySingleOp(op) {
     }
     case 'feature_build': {
       // 四个 Tab 都打在后端同一批 op 上：回放与界面点构建走的是同一条路
-      if (p.featureType === 'lag_roll' && p.detail) {
-        // detail 里带完整计划（目标列/阶数/窗口/统计量/expanding/ewm span），复原后走同一个构建函数
+      if (['lag_roll', 'lag', 'window'].includes(p.featureType) && p.detail) {
+        // detail 里带完整计划（目标列/阶数/窗口/统计量/expanding/ewm span/组别），复原后走同一个构建函数
         const plan = parseLagDetail(p.detail)
         if (plan.cols.length === 0) return false
         if (!await buildLagFeatures(plan.cols, {
           lags: plan.lags, windows: plan.windows, stats: plan.stats,
           expanding: plan.expanding, ewm: plan.ewm, ewmSpan: plan.ewmSpan
-        })) return false
+        }, plan.group)) return false
       } else if (p.featureType === 'time' && p.detail) {
-        // 日志记的是展开后的列计划（cyclical_hour 这类），还原成勾选态再复用同一构建函数
-        const toks = p.detail.split(',').filter(Boolean)
-        const cyc = toks.filter(t => t.startsWith('cyclical_'))
-        const ok = await buildTimeFeatures([
-          ...toks.filter(t => !t.startsWith('cyclical_')),
-          ...(cyc.length ? ['cyclical_sincos'] : [])
-        ])
-        if (!ok) return false
-      } else if (p.featureType === 'diff_freq' && p.detail) {
+        // 日志记的是展开后的列计划（cyclical_hour / replace_original 这类），还原成勾选态再复用同一构建函数
+        if (!await buildTimeFeatures(parseTimeDetail(p.detail))) return false
+      } else if (['diff_freq', 'diff', 'fft'].includes(p.featureType) && p.detail) {
         const plan = parseDiffDetail(p.detail)
         if (plan.cols.length === 0) return false
-        if (!await buildDiffFeatures(plan.cols, plan)) return false
+        if (!await buildDiffFeatures(plan.cols, plan, plan.group)) return false
       } else if (p.featureType === 'cat' && p.detail) {
         const plan = parseCatDetail(p.detail)
         if (plan.cols.length === 0) return false
@@ -1436,6 +1548,20 @@ async function replaySingleOp(op) {
       setSplitRatio(p.ratio)  // 走同一入口：界面比例真的被还原
       const last = state.actionLog[state.actionLog.length - 1]
       last.title = '[回放] 设置切分比例'
+      return true
+    }
+    case 'split_apply': {
+      if (typeof p.ratio !== 'number') return false
+      if (!await applySplitColumn(p.ratio)) return false
+      const last = state.actionLog[state.actionLog.length - 1]
+      last.title = '[回放] 生成数据集划分列'
+      return true
+    }
+    case 'holidays': {
+      if (!Array.isArray(p.days)) return false
+      if (!await saveHolidays(p.days, p.source || 'replay')) return false
+      const last = state.actionLog[state.actionLog.length - 1]
+      last.title = '[回放] 配置节假日表'
       return true
     }
     default:
@@ -2037,7 +2163,10 @@ export function generatePythonCode() {
       done.add(key)
       if (p.featureType === 'time') {
         nextHeader('日历时间特征')
-        const dims = (p.detail || '').split(',').filter(Boolean)
+        const toks = (p.detail || '').split(',').filter(Boolean)
+        const replace = toks.includes('replace_original')
+        const cycSet = toks.filter(t => t.startsWith('cyclical_')).map(t => t.slice('cyclical_'.length))
+        const dims = toks.filter(t => !t.startsWith('cyclical_') && t !== 'replace_original')
         // 与浏览器端 weekdayIndex/cyclical 同一套语义：pandas dayofweek 同样是周一=0
         const DIM_EXPR = {
           hour: `df['${tc}'].dt.hour`,
@@ -2052,37 +2181,41 @@ export function generatePythonCode() {
           month: `(df['${tc}'].dt.month - 1) / 12.0`
         }
         dims.forEach(opt => {
+          // 勾选了「编码后不保留原列」的维度只出 sin/cos：这里跳过它的数值列（同后端 time_plan 的 skip）
+          if (replace && cycSet.includes(opt)) return
           if (opt === 'holiday') {
-            // 节假日表已从前端迁到后端（features.HOLIDAYS_2024 是唯一真相），脚本要能脱离本项目独立运行，
-            // 所以把 /api/health  limits 里那份清单原样抄进生成的代码；没连过后端就如实标注，不编日期。
-            const days = (state.backend.limits && state.backend.limits.holidayDates2024) || []
+            // 节假日表以构建那一刻工作区生效的那份为准（记在这条审计参数里）：
+            // 后端默认表可能已经换过年份，只有这份快照能复现界面上 feat_holiday 的取值
+            const days = Array.isArray(p.holidayDays) ? p.holidayDays : []
             if (days.length === 0) {
-              lines.push(`# feat_holiday 依赖后端 2024 节假日表（app/services/features.py 的 HOLIDAYS_2024），当前会话未取到该表，无法生成日期集合`)
-              lines.push(`# 请先连上后端并重新探测（GET /api/health → limits.holidayDates2024），再导出本脚本`)
+              lines.push(`# feat_holiday 依赖工作区生效的节假日表，这条记录未留存日期清单（旧版本的操作日志），无法复现该列`)
+              lines.push(`# 请在第五步重新配置一次节假日表并重建日历特征，再导出本脚本`)
               return
             }
-            lines.push(`# 与后端 app/services/features.py 的 HOLIDAYS_2024 同一份表（${days.length} 天）`)
+            lines.push(`# 构建时工作区生效的节假日表（${days.length} 天，第五步「节假日表」面板配置）`)
             lines.push(`HOLIDAYS = {${days.map(h => `'${h}'`).join(', ')}}`)
             lines.push(`df['feat_holiday'] = df['${tc}'].dt.strftime('%Y-%m-%d').isin(HOLIDAYS).astype(int)`)
             return
           }
-          if (opt.startsWith('cyclical_')) {
-            const dim = opt.slice('cyclical_'.length)
-            const x = CYCLE_EXPR[dim]
-            if (!x) return
-            lines.push(`df['feat_${dim}_sin'] = np.sin(2 * np.pi * ${x})`)
-            lines.push(`df['feat_${dim}_cos'] = np.cos(2 * np.pi * ${x})`)
-            return
-          }
           if (DIM_EXPR[opt]) lines.push(`df['feat_${opt}'] = ${DIM_EXPR[opt]}`)
         })
-        if (dims.some(o => o.startsWith('cyclical_')) && dims.includes('day')) {
+        cycSet.forEach(dim => {
+          const x = CYCLE_EXPR[dim]
+          if (!x) return
+          lines.push(`df['feat_${dim}_sin'] = np.sin(2 * np.pi * ${x})`)
+          lines.push(`df['feat_${dim}_cos'] = np.cos(2 * np.pi * ${x})`)
+        })
+        if (cycSet.length && dims.includes('day')) {
           lines.push(`# 注：day 每月天数不固定（28~31），无周期可言，故未做正余弦编码`)
         }
+        if (replace && cycSet.length) {
+          lines.push(`# 这些维度勾选了「编码后不保留数值原列」，所以只有 feat_${cycSet[0]}_sin/cos，没有 feat_${cycSet.join('/')} 普通列`)
+        }
       }
-      if (p.featureType === 'lag_roll') {
+      if (['lag_roll', 'lag', 'window'].includes(p.featureType)) {
         ensureFeatureHelpers()
-        nextHeader(`滞后与滑动窗口特征（${p.detail}）`)
+        const groupName = { lag: '滞后特征', window: '滑动窗口特征' }[p.featureType] || '滞后与滑动窗口特征'
+        nextHeader(`${groupName}（${p.detail}）`)
         const plan = parseLagDetail(p.detail)
         lines.push(`# 窗口类特征只看当前行之前的数据（等价 .shift(1)）：防止标签泄漏`)
         lines.push(`# 窗口内有缺失时按有效值个数聚合（同后端 rolling_agg），不是 pandas rolling 的 NaN 传播`)
@@ -2095,9 +2228,10 @@ export function generatePythonCode() {
           if (plan.ewm) lines.push(`df['ewm_${col}_s${plan.ewmSpan}'] = _ewm_prev(df['${col}'], ${plan.ewmSpan})`)
         })
       }
-      if (p.featureType === 'diff_freq') {
+      if (['diff_freq', 'diff', 'fft'].includes(p.featureType)) {
         const plan = parseDiffDetail(p.detail)
-        nextHeader(`差分与频域特征（${p.detail}）`)
+        const groupName = { diff: '差分平稳化特征', fft: '频域特征' }[p.featureType] || '差分与频域特征'
+        nextHeader(`${groupName}（${p.detail}）`)
         if (plan.cols.length === 0) {
           lines.push('# 该次构建未登记任何目标列，无可导出语句')
           return
@@ -2202,14 +2336,31 @@ export function generatePythonCode() {
   })
 
   // 切分是收尾动作：按最后一次真实设置的比例，在最终矩阵上发射
-  const splits = ops.filter(e => e.params.type === 'split')
-  if (splits.length > 0) {
-    const ratio = splits[splits.length - 1].params.ratio
-    nextHeader(`训练/验证/测试切分（训练 ${ratio}%，时序不打乱）`)
-    const s = splitCounts(ratio)
-    lines.push(`train = df.iloc[:${s.train}]`)
-    lines.push(`val   = df.iloc[${s.train}:${s.train + s.val}]`)
-    lines.push(`test  = df.iloc[${s.train + s.val}:]`)
+  const splitApplied = ops.filter(e => e.params.type === 'split_apply')
+  if (splitApplied.length > 0) {
+    // 划分列由后端逐行写入，脚本复现同一条规则：整表行序前 train% → 中间 val% → 末段 test%
+    const last = splitApplied[splitApplied.length - 1]
+    const { ratio, train, val, test, rows } = last.params
+    const key = last.params.key || 'dataset_split'
+    nextHeader(`生成数据集划分列 ${key}（训练 ${ratio}%，时序不打乱）`)
+    lines.push(`# 生成时整表 ${rows} 行：train ${train} / val ${val} / test ${test}（界面上那三个数与后端同一次计算）`)
+    lines.push(`_n = len(df)`)
+    lines.push(`assert _n == ${rows}, f"生成划分时 ${rows} 行，现在 {_n} 行：中间增删过行，请按新行数重新生成划分列"`)
+    lines.push(`_train = _n * ${ratio} // 100`)
+    lines.push(`_test = (_n - _train) // 2`)
+    lines.push(`df["${key}"] = ["train"] * _train + ["val"] * (_n - _train - _test) + ["test"] * _test`)
+    lines.push(`print("split:", df["${key}"].value_counts().to_dict())`)
+  } else {
+    const splits = ops.filter(e => e.params.type === 'split')
+    if (splits.length > 0) {
+      const ratio = splits[splits.length - 1].params.ratio
+      nextHeader(`训练/验证/测试切分（训练 ${ratio}%，时序不打乱）`)
+      const s = splitCounts(ratio)
+      lines.push(`# 这份日志只设过比例、没生成划分列（旧流程），按行序切片`)
+      lines.push(`train = df.iloc[:${s.train}]`)
+      lines.push(`val   = df.iloc[${s.train}:${s.train + s.val}]`)
+      lines.push(`test  = df.iloc[${s.train + s.val}:]`)
+    }
   }
 
   const exported = ops.filter(e => e.params.type === 'export')
@@ -2407,7 +2558,6 @@ function applySessionUi(doc) {
   // 直接赋值而不是走 setSplitRatio：恢复不是用户拖动滑杆，不该凭空多一条审计记录
   state.splitRatio = Math.round((doc.splitRatio ?? 0.7) * 100)
   lastLoggedSplit = state.splitRatio
-  if (doc.currentKey && datasets[doc.currentKey]) state.currentKey = doc.currentKey
   state.currentStep = doc.step || 1
 }
 
@@ -2459,6 +2609,11 @@ export async function restoreSession() {
   state.lastAnomaly = null
   state.quality = { wsId: '', version: -1, data: null, loading: false, error: '' }
   invalidateSeries()
+  // 数据集是上面那个循环才注册进来的，applySessionUi 跑在它之前，所以游标只能在循环之后指过去。
+  // 早先那句 datasets[doc.currentKey] 守卫对目录/上传来的那一份（key 不在预置的 pv/load 里）
+  // 永远不成立，结果恢复明明成功、界面却停在空白数据集上报「尚未载入数据集」。
+  const focus = restored.find(r => r.w.key === doc.currentKey) || restored[0]
+  if (focus) state.currentKey = focus.w.key
   touch()
   const drift = restored.find(r => r.w.versionDrift)
   const m = doc.meta || {}

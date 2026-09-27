@@ -6,10 +6,10 @@ import {
   detectTimeFormat, convertTimeColumn, detectedFreqMinutes, pageColumnValues,
   refreshPage, refreshOverview, rowCount,
   resampleDataset, resamplePreview,
-  loadExoCatalog, exoColumns, addExoPreset, addExoFormula,
+  loadExoCatalog, exoColumns,
   inspectSideTable, attachSideTable, removeExoColumn,
   applyDerivedCol, clearAllDerivedCols, deleteDerivedCol, computeTermChain,
-  renameColumn, deleteColumn, convertColumnUnit, splitCounts, setSplitRatio
+  renameColumn, deleteColumn, convertColumnUnit, splitCounts, setSplitRatio, applySplitColumn
 } from '../store'
 import {
   convertSingleTime, convertWithCustomFormat, isMissing,
@@ -64,7 +64,7 @@ async function goPage(offset, limit) {
 }
 function onPageSize(ev) { goPage(0, Number(ev.target.value)) }
 
-// 整表统计（缺失率/重复率/未解析时间）与当前页都要向后端取，进入本步即刷新一次
+// 整表概览（采样间隔/未解析时间）与当前页都要向后端取，进入本步即刷新一次
 const numbersBusy = ref(false)
 async function reloadServerNumbers() {
   if (!hasWs.value || !backendReady.value || numbersBusy.value) return
@@ -72,13 +72,6 @@ async function reloadServerNumbers() {
   try {
     await Promise.all([refreshOverview(), refreshPage(page.value.offset, page.value.limit)])
   } finally { numbersBusy.value = false }
-}
-
-// 后端直接返回百分数值（0.3272…），原样打印会拖一长串尾数；精确格数在旁边的小字里给出
-function pct(v) {
-  const n = Number(v)
-  if (!Number.isFinite(n)) return '—'
-  return String(Math.round(n * 10000) / 10000)
 }
 
 // ============ 时间列识别与转换 ============
@@ -175,17 +168,12 @@ async function confirmResample() {
   toast('success', `重采样完成（后端）：${r.oldCount.toLocaleString()} 行 → ${r.newCount.toLocaleString()} 行`)
 }
 
-// ============ 外生变量：三条来源都在服务端 ============
-// 下拉选项读 GET /api/exo/presets（后端清单与生成器同一份表）；
+// ============ 外生变量：只从文件导入，生成与对齐都在服务端 ============
 // 侧表先看后挂：/api/exo/inspect 解析并落盘，确认列名/时间列/对齐方式后才提交一条命令。
 // 这里没有「先在浏览器攒一列、再点合并」那一步，也没有 inner 连接这种实现里不成立的选项。
-const exoMode = ref('preset')
-const presetKey = ref('')
-const presetAlias = ref('')
-const formulaName = ref('')
-const formulaExpr = ref('')
 const exoBusy = ref(false)
 
+// 对齐方式读 GET /api/exo/presets 的 alignModes：与后端 attach 校验用的是同一份枚举
 const catalog = ref(null)
 const catalogBusy = ref(false)
 async function ensureCatalog(force) {
@@ -198,35 +186,8 @@ async function ensureCatalog(force) {
 // 后端可能是稍后才探到的（首屏 checkBackend 还在飞），在线就必须有清单
 watch(() => state.backend.online, (ok) => { if (ok) ensureCatalog() }, { immediate: true })
 
-const presetItems = computed(() => catalog.value?.items || [])
 const alignModes = computed(() => catalog.value?.alignModes
   || [{ mode: 'left', label: '精确时间戳' }, { mode: 'nearest', label: '就近匹配' }])
-const formulaVars = computed(() => (catalog.value?.vars || ['hour', 'day', 'month', 'weekday', 'idx', 'PI', 'E']))
-const formulaFuncs = computed(() => (catalog.value?.funcs || []).join(' / '))
-const formulaHelp = computed(() => catalog.value?.formulaHelp || '')
-const presetSel = computed(() => presetItems.value.find(p => p.key === presetKey.value) || null)
-// needs 是服务端声明的依赖（如露点温度要读主表气温列）：缺列就别发这条命令，让后端 400 之前先说清楚
-const presetMissing = computed(() => (presetSel.value?.needs || []).filter(n => !d.value.columns.some(c => c.key === n)))
-
-async function doAddPreset() {
-  if (!presetKey.value) { toast('warning', '请先选择一个预设外生变量'); return }
-  if (presetMissing.value.length) { toast('warning', `模板「${presetSel.value.label}」需要主表列 ${presetMissing.value.join('、')}，当前工作区没有`); return }
-  if (exoBusy.value) return
-  exoBusy.value = true
-  const r = await addExoPreset(presetKey.value, presetAlias.value.trim())
-  exoBusy.value = false
-  if (r) { toast('success', `后端已挂列：${r.summary}`); presetAlias.value = '' }
-}
-
-async function doAddFormula() {
-  const name = formulaName.value.trim()
-  if (!name || !formulaExpr.value.trim()) { toast('warning', '请填写变量名称与生成公式'); return }
-  if (exoBusy.value) return
-  exoBusy.value = true
-  const r = await addExoFormula(name, formulaExpr.value.trim())
-  exoBusy.value = false
-  if (r) { toast('success', `后端已挂列：${r.summary}`); formulaName.value = ''; formulaExpr.value = '' }
-}
 
 // ---- 侧表：inspect 回显 → 逐列确认 → attach ----
 const exoFileInput = ref(null)
@@ -284,6 +245,8 @@ async function doAttachSide() {
 
 function doRemoveExo(col) { return removeExoColumn(col) }
 const attachedExo = computed(() => { void state.dataVersion; return exoColumns() })
+// 界面只剩「从文件导入」一条入口，但服务端命令日志里可能还留着早前用预设/公式挂上的列，
+// 那是要照实标出来的历史，不能因为入口没了就把它们显示成侧表
 const EXO_KIND_META = {
   preset: { icon: 'fa-cubes', label: '预设' },
   formula: { icon: 'fa-function', label: '公式' },
@@ -417,6 +380,50 @@ const splitLogged = computed(() => {
   return wsActionLog().some(e => e.params?.type === 'split')
 })
 function commitSplit() { setSplitRatio(state.splitRatio) }
+
+// 划分列的真实样子取自审计链：那三个数是后端生成当场回带的，不是界面按行数估的
+const splitApplied = computed(() => {
+  void state.dataVersion
+  const recs = wsActionLog().filter(e => e.params?.type === 'split_apply')
+  return recs.length ? recs[recs.length - 1].params : null
+})
+// 生成之后又删过行 / 改过比例，列里的标签就和现在界面上算的对不上了：把差在哪写出来，而不是悄悄一致
+const splitStale = computed(() => {
+  const a = splitApplied.value
+  if (!a) return ''
+  const why = []
+  if (a.rows !== totalRows.value) why.push(`行数已从 ${a.rows.toLocaleString()} 变成 ${totalRows.value.toLocaleString()}`)
+  if (a.ratio !== state.splitRatio) why.push(`比例已从 ${a.ratio}% 改成 ${state.splitRatio}%`)
+  return why.join('；')
+})
+async function doApplySplit() {
+  const r = await applySplitColumn(state.splitRatio)
+  // runOp 已把最新元数据与页窗口换回来，新列就在下方快照里，不必再要一次
+  if (r) toast('success', `划分列 [${r.label}] 已写入 ${r.rowCount.toLocaleString()} 行：train ${r.train.toLocaleString()} / val ${r.val.toLocaleString()} / test ${r.test.toLocaleString()}`)
+}
+
+// ============ Tab 布局：五个环节改为切换显示（与第五步同款） ============
+const activeTab = ref('time')
+// 「已执行」一律取自审计链：撤销与回放都会改写操作记录，本地一次性置 true 的标志会长期说谎。
+// 取 wsActionLog() 而非 state.actionLog——同一份会话里连着开两个数据集时，上一份的操作不该给这一个打勾。
+const pipe = computed(() => {
+  void state.dataVersion
+  const t = new Set(wsActionLog().map(e => e.params?.type))
+  return {
+    time: t.has('time_convert'),
+    rate: t.has('resample'),
+    exo: t.has('exo-preset') || t.has('exo-formula') || t.has('exo-file'),
+    calc: t.has('multi_calc'),
+    split: t.has('split') || t.has('split_apply')
+  }
+})
+const PIPE_CHIPS = [
+  ['time', 'bg-indigo-400', '转换'],
+  ['rate', 'bg-sky-400', '频率'],
+  ['exo', 'bg-teal-400', '外生'],
+  ['calc', 'bg-amber-400', '运算'],
+  ['split', 'bg-emerald-400', '切分']
+]
 </script>
 
 <template>
@@ -429,7 +436,7 @@ function commitSplit() { setSplitRatio(state.splitRatio) }
       <template v-if="hasWs">
         <span class="font-mono text-slate-600">{{ d.wsId }}</span>
         <span class="px-1.5 py-0.5 rounded bg-slate-100 font-mono text-slate-600">版本 v{{ wsVersion }}</span>
-        <span class="text-slate-500">整表 <b class="font-mono text-slate-700">{{ totalRows.toLocaleString() }}</b> 行 × {{ d.columns.length }} 列（明细留在后端）</span>
+        <span class="text-slate-500">整表 <b class="font-mono text-slate-700">{{ totalRows.toLocaleString() }}</b> 行 × {{ d.columns.length }} 列</span>
         <span class="text-slate-500">浏览器缓存第 <b class="font-mono text-indigo-700">{{ pageFrom.toLocaleString() }}–{{ pageTo.toLocaleString() }}</b> 行</span>
         <span v-if="wsCells !== null" class="text-slate-400 font-mono"
               :title="`与行数同源于后端 meta：${wsCells} 格 / ${wsMemoryBytes ?? 0} 字节`">
@@ -452,9 +459,53 @@ function commitSplit() { setSplitRatio(state.splitRatio) }
       </div>
     </div>
 
-    <div class="grid grid-cols-12 gap-3">
-      <!-- 时间列识别与转换 -->
-      <div class="col-span-6 bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-3">
+    <!-- 五个配置环节改为 Tab 切换：一次只看一个环节，与第五步同款布局 -->
+    <div class="shrink-0 bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
+      <!-- Tab 栏 + 流水线状态 -->
+      <div class="flex items-center flex-wrap gap-y-1.5 border-b border-slate-200 bg-slate-50/80">
+        <div class="flex items-center">
+          <button @click="activeTab = 'time'"
+                  class="flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors"
+                  :class="activeTab === 'time' ? 'border-indigo-500 text-indigo-600 bg-white' : 'border-transparent text-slate-500 hover:text-slate-700'">
+            <i class="fa-regular fa-clock"></i>时间格式转换
+          </button>
+          <button @click="activeTab = 'rate'"
+                  class="flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors"
+                  :class="activeTab === 'rate' ? 'border-indigo-500 text-indigo-600 bg-white' : 'border-transparent text-slate-500 hover:text-slate-700'">
+            <i class="fa-solid fa-wave-square"></i>采样频率配置
+          </button>
+          <button @click="activeTab = 'exo'"
+                  class="flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors"
+                  :class="activeTab === 'exo' ? 'border-indigo-500 text-indigo-600 bg-white' : 'border-transparent text-slate-500 hover:text-slate-700'">
+            <i class="fa-solid fa-link"></i>外生变量导入
+          </button>
+          <button @click="activeTab = 'calc'"
+                  class="flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors"
+                  :class="activeTab === 'calc' ? 'border-indigo-500 text-indigo-600 bg-white' : 'border-transparent text-slate-500 hover:text-slate-700'">
+            <i class="fa-solid fa-calculator"></i>列运算生成列
+          </button>
+          <button @click="activeTab = 'split'"
+                  class="flex items-center gap-1.5 px-4 py-2.5 text-xs font-semibold border-b-2 transition-colors"
+                  :class="activeTab === 'split' ? 'border-indigo-500 text-indigo-600 bg-white' : 'border-transparent text-slate-500 hover:text-slate-700'">
+            <i class="fa-solid fa-timeline"></i>数据集切分
+          </button>
+        </div>
+
+        <div class="flex-1"></div>
+
+        <div class="flex items-center gap-2 px-3 h-full text-[10px]">
+          <div v-for="c in PIPE_CHIPS" :key="c[0]"
+               class="flex items-center gap-1 px-1.5 py-0.5 rounded bg-white border border-slate-200">
+            <span class="w-1.5 h-1.5 rounded-full" :class="c[1]"></span>
+            <span class="text-slate-500">{{ c[2] }}</span>
+            <span class="font-bold" :class="pipe[c[0]] ? 'font-mono text-emerald-600' : 'text-slate-400'">{{ pipe[c[0]] ? '✓ 完成' : '待执行' }}</span>
+          </div>
+          <span class="text-slate-400 ml-1">工作区 <strong class="text-indigo-600">v{{ wsVersion ?? 0 }}</strong></span>
+        </div>
+      </div>
+
+      <!-- Tab 1: 时间列识别与转换 -->
+      <div v-show="activeTab === 'time'" class="p-4 flex flex-col gap-3">
         <div class="flex items-center justify-between">
           <h2 class="text-xs font-bold text-slate-700 flex items-center">
             <i class="fa-regular fa-clock mr-1.5 text-indigo-600"></i>时间列识别与转换引擎
@@ -552,8 +603,8 @@ function commitSplit() { setSplitRatio(state.splitRatio) }
         </div>
       </div>
 
-      <!-- 采样频率配置 -->
-      <div class="col-span-6 bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between">
+      <!-- Tab 2: 采样频率配置 -->
+      <div v-show="activeTab === 'rate'" class="p-4 flex flex-col">
         <div class="flex items-center justify-between mb-2">
           <h2 class="text-xs font-bold text-slate-700 flex items-center">
             <i class="fa-solid fa-wave-square mr-1.5 text-indigo-600"></i>采样频率配置
@@ -588,30 +639,6 @@ function commitSplit() { setSplitRatio(state.splitRatio) }
             </select>
           </div>
         </div>
-        <div class="mt-2 grid grid-cols-2 gap-2">
-          <div class="flex items-center justify-between px-2.5 py-1.5 rounded-lg border bg-emerald-50/60 border-emerald-200"
-               :title="overview ? `后端整表：缺失 ${overview.missingCells} / ${overview.missingDenominator} 格` : '需后端整表统计'">
-            <div class="flex items-center gap-1.5">
-              <i class="fa-solid fa-circle-exclamation text-emerald-600 text-[11px]"></i>
-              <span class="text-[11px] text-emerald-800 font-medium">整表缺失率</span>
-            </div>
-            <span class="font-mono font-bold text-emerald-700 text-xs">
-              {{ overview ? pct(overview.missingRate) + '%' : '—' }}
-              <span v-if="overview" class="text-[9px] font-normal text-emerald-600">{{ overview.missingCells.toLocaleString() }}/{{ overview.missingDenominator.toLocaleString() }} 格</span>
-            </span>
-          </div>
-          <div class="flex items-center justify-between px-2.5 py-1.5 rounded-lg border bg-amber-50/60 border-amber-200"
-               :title="overview ? `后端整表：重复 ${overview.duplicateRows} / ${overview.rowCount} 行` : '需后端整表统计'">
-            <div class="flex items-center gap-1.5">
-              <i class="fa-solid fa-copy text-amber-600 text-[11px]"></i>
-              <span class="text-[11px] text-amber-800 font-medium">整表重复率</span>
-            </div>
-            <span class="font-mono font-bold text-amber-700 text-xs">
-              {{ overview ? pct(overview.duplicateRate) + '%' : '—' }}
-              <span v-if="overview" class="text-[9px] font-normal text-amber-600">{{ overview.duplicateRows.toLocaleString() }}/{{ overview.rowCount.toLocaleString() }} 行</span>
-            </span>
-          </div>
-        </div>
         <div class="mt-2 flex items-center justify-between text-[11px] gap-2">
           <span class="text-slate-500 shrink-0">后端预演:</span>
           <span v-if="projBusy" class="font-mono text-slate-400"><i class="fa-solid fa-spinner fa-spin mr-1"></i>正在按真实时间跨度预演…</span>
@@ -627,266 +654,248 @@ function commitSplit() { setSplitRatio(state.splitRatio) }
           <span v-if="!backendReady" class="text-[10px] text-rose-500">
             <button @click="checkBackend()" class="underline hover:no-underline font-semibold">重新探测后端</button> 后才能执行加工
           </span>
-          <span v-else class="text-[10px] text-slate-400">聚合在后端整表执行，浏览器只重取当前页</span>
           <button @click="confirmResample" :disabled="!hasWs || !backendReady || !!state.busy"
                   class="ml-auto px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded text-xs font-semibold shadow-sm flex items-center gap-1.5 transition-colors shrink-0">
             <i class="fa-solid fa-check text-[11px]"></i>确认重采样
           </button>
         </div>
       </div>
-    </div>
 
-    <!-- 外生变量导入 -->
-    <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col gap-3 shrink-0">
-      <div class="flex items-center justify-between">
-        <h2 class="text-xs font-bold text-slate-700 flex items-center">
-          <i class="fa-solid fa-link mr-1.5 text-indigo-600"></i>外生变量导入
-          <span class="text-[10px] text-slate-400 font-normal ml-2">三种来源都在服务端生成/对齐，浏览器不碰整列</span>
-        </h2>
-        <span v-if="attachedExo.length > 0" class="text-[11px] bg-teal-100 text-teal-700 px-2 py-0.5 rounded-full font-mono font-semibold">已挂 {{ attachedExo.length }} 列</span>
-      </div>
+      <!-- Tab 3: 外生变量导入 -->
+      <div v-show="activeTab === 'exo'" class="p-4 flex flex-col gap-3">
+        <div class="flex items-center justify-between">
+          <h2 class="text-xs font-bold text-slate-700 flex items-center">
+            <i class="fa-solid fa-link mr-1.5 text-indigo-600"></i>外生变量导入
+          </h2>
+          <span v-if="attachedExo.length > 0" class="text-[11px] bg-teal-100 text-teal-700 px-2 py-0.5 rounded-full font-mono font-semibold">已挂 {{ attachedExo.length }} 列</span>
+        </div>
 
-      <div class="grid grid-cols-12 gap-3">
-        <div class="col-span-7 flex flex-col gap-2.5">
-          <div class="flex items-center gap-3">
-            <label class="text-[11px] text-slate-500">导入方式:</label>
-            <div class="flex items-center gap-1.5">
-              <button @click="exoMode = 'preset'" class="px-2.5 py-1 text-[11px] rounded-md font-medium transition-colors"
-                      :class="exoMode === 'preset' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'">
-                <i class="fa-solid fa-cubes mr-1 text-[9px]"></i>预设变量模板
-              </button>
-              <button @click="exoMode = 'file'" class="px-2.5 py-1 text-[11px] rounded-md font-medium transition-colors"
-                      :class="exoMode === 'file' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'">
+        <div class="grid grid-cols-12 gap-3">
+          <div class="col-span-7 flex flex-col gap-2.5">
+            <div class="flex items-center gap-3">
+              <label class="text-[11px] text-slate-500">导入方式:</label>
+              <span class="px-2.5 py-1 text-[11px] rounded-md font-medium bg-teal-600 text-white">
                 <i class="fa-solid fa-file-import mr-1 text-[9px]"></i>从文件导入
-              </button>
-              <button @click="exoMode = 'formula'" class="px-2.5 py-1 text-[11px] rounded-md font-medium transition-colors"
-                      :class="exoMode === 'formula' ? 'bg-teal-600 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200'">
-                <i class="fa-solid fa-function mr-1 text-[9px]"></i>公式生成
-              </button>
-            </div>
-            <span v-if="!backendReady" class="text-[10px] text-rose-500">需后端在线</span>
-          </div>
-
-          <!-- 预设：选项读 GET /api/exo/presets -->
-          <div v-if="exoMode === 'preset'" class="flex flex-col gap-2">
-            <div class="grid grid-cols-2 gap-2">
-              <div>
-                <label class="text-[11px] text-slate-500 block mb-1">
-                  选择预设外生变量
-                  <span v-if="catalogBusy" class="text-[9px] text-slate-400 ml-1">清单读取中…</span>
-                </label>
-                <select v-model="presetKey" class="w-full text-xs border border-slate-200 rounded-lg px-2.5 py-2 bg-white focus:border-teal-400 outline-none">
-                  <option value="">-- 请选择 --</option>
-                  <option v-for="p in presetItems" :key="p.key" :value="p.key">{{ p.label }}</option>
-                </select>
-              </div>
-              <div>
-                <label class="text-[11px] text-slate-500 block mb-1">自定义列名（可选）</label>
-                <input v-model="presetAlias" placeholder="留空则使用默认名" class="w-full text-xs border border-slate-200 rounded-lg px-2.5 py-2 font-mono bg-white focus:border-teal-400 outline-none" />
-              </div>
-            </div>
-            <p v-if="presetSel?.needs?.length" class="text-[10px] rounded px-2 py-1 border"
-               :class="presetMissing.length ? 'text-rose-600 bg-rose-50 border-rose-200' : 'text-slate-500 bg-slate-50 border-slate-200'">
-              <i class="fa-solid fa-circle-info mr-1"></i>该模板需要主表列
-              <code v-for="n in presetSel.needs" :key="n" class="bg-white/70 px-1 rounded mx-0.5">{{ n }}</code>
-              {{ presetMissing.length ? '（当前工作区没有这一列，需先接入该变量或改用其他模板）' : '（当前工作区已有，生成值随该列取值变化）' }}
-            </p>
-            <p class="text-[10px] text-amber-600 bg-amber-50 border border-amber-200 rounded px-2 py-1">
-              <i class="fa-solid fa-circle-info mr-1"></i>后端按主表时间列（{{ totalRows.toLocaleString() }} 行）用带 seed 的模拟序列生成这一列：真实气象/电价需接入数据源。seed 会钉进命令日志，撤销后重做拿到的是同一串值。
-            </p>
-            <button @click="doAddPreset" :disabled="exoBusy || !backendReady || !hasWs || !!state.busy"
-                    class="self-start px-4 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors flex items-center gap-1.5">
-              <i class="fa-solid text-[10px]" :class="exoBusy ? 'fa-spinner fa-spin' : 'fa-plus'"></i>{{ exoBusy ? '后端生成中…' : '生成并挂到主表' }}
-            </button>
-          </div>
-
-          <!-- 侧表：先看后挂 -->
-          <div v-else-if="exoMode === 'file'" class="flex flex-col gap-2">
-            <div @click="exoFileInput.click()"
-                 class="border-2 border-dashed border-slate-300 hover:border-teal-400 rounded-lg px-4 py-3 text-center transition-colors cursor-pointer">
-              <input ref="exoFileInput" type="file" accept=".csv,.xlsx,.xls" class="hidden" @change="onExoFile" />
-              <i class="fa-solid text-lg mb-1" :class="sideBusy ? 'fa-spinner fa-spin text-slate-400' : 'fa-cloud-arrow-up text-teal-500'"></i>
-              <p class="text-[11px] text-slate-600 font-medium">{{ sideBusy ? '后端解析中…' : (side ? `已解析：${side.filename}` : '点击上传外生变量侧表') }}</p>
-              <p class="text-[10px] text-slate-400">CSV / Excel · 上传即落盘到服务端数据集目录，此处只确认表头，不写入工作区</p>
+              </span>
+              <span v-if="!backendReady" class="text-[10px] text-rose-500">需后端在线</span>
             </div>
 
-            <div v-if="side" class="flex flex-col gap-2 border border-teal-200 bg-teal-50/40 rounded-lg p-2.5">
-              <div class="flex items-center justify-between text-[10px] text-slate-500">
-                <span>侧表 <code class="bg-white px-1 rounded font-mono">{{ side.rows.toLocaleString() }} 行</code> · 内容指纹 <code class="bg-white px-1 rounded font-mono">{{ (side.sha || '').slice(0, 12) }}</code></span>
-                <button @click="side = null; sideRows = []" class="text-slate-400 hover:text-rose-600"><i class="fa-solid fa-xmark mr-0.5"></i>丢弃这份</button>
+            <!-- 侧表：先看后挂 -->
+            <div class="flex flex-col gap-2">
+              <div @click="exoFileInput.click()"
+                   class="border-2 border-dashed border-slate-300 hover:border-teal-400 rounded-lg px-4 py-3 text-center transition-colors cursor-pointer">
+                <input ref="exoFileInput" type="file" accept=".csv,.xlsx,.xls" class="hidden" @change="onExoFile" />
+                <i class="fa-solid text-lg mb-1" :class="sideBusy ? 'fa-spinner fa-spin text-slate-400' : 'fa-cloud-arrow-up text-teal-500'"></i>
+                <p class="text-[11px] text-slate-600 font-medium">{{ sideBusy ? '后端解析中…' : (side ? `已解析：${side.filename}` : '点击上传外生变量侧表') }}</p>
+                <p class="text-[10px] text-slate-400">CSV / Excel · 上传即落盘到服务端数据集目录，此处只确认表头，不写入工作区</p>
               </div>
-              <div class="grid grid-cols-3 gap-2">
-                <div>
-                  <label class="text-[11px] text-slate-500 block mb-1">侧表时间列</label>
-                  <select v-model="sideTimeCol" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-1.5 bg-white focus:border-teal-400 outline-none">
-                    <option value="">-- 请选择 --</option>
-                    <option v-for="c in side.columns" :key="c.from" :value="c.from">{{ c.label }}</option>
-                  </select>
+
+              <div v-if="side" class="flex flex-col gap-2 border border-teal-200 bg-teal-50/40 rounded-lg p-2.5">
+                <div class="flex items-center justify-between text-[10px] text-slate-500">
+                  <span>侧表 <code class="bg-white px-1 rounded font-mono">{{ side.rows.toLocaleString() }} 行</code> · 内容指纹 <code class="bg-white px-1 rounded font-mono">{{ (side.sha || '').slice(0, 12) }}</code></span>
+                  <button @click="side = null; sideRows = []" class="text-slate-400 hover:text-rose-600"><i class="fa-solid fa-xmark mr-0.5"></i>丢弃这份</button>
                 </div>
-                <div>
-                  <label class="text-[11px] text-slate-500 block mb-1">对齐方式</label>
-                  <select v-model="sideMode" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-1.5 bg-white focus:border-teal-400 outline-none">
-                    <option v-for="m in alignModes" :key="m.mode" :value="m.mode">{{ m.label }}</option>
-                  </select>
-                </div>
-                <div>
-                  <label class="text-[11px] text-slate-500 block mb-1">容差（分钟，仅就近）</label>
-                  <input v-model.number="sideTolerance" type="number" min="1" max="1440" :disabled="sideMode !== 'nearest'"
-                         class="w-full text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono bg-white focus:border-teal-400 outline-none disabled:bg-slate-100 disabled:text-slate-400" />
-                </div>
-              </div>
-              <div class="border border-slate-200 rounded-lg bg-white overflow-hidden">
-                <div class="bg-slate-50 px-2.5 py-1 border-b border-slate-200 text-[10px] font-semibold text-slate-600 flex items-center justify-between">
-                  <span>要挂到主表的列（{{ sidePicked.length }} 已选）</span>
-                  <span class="font-normal text-slate-400">变量名需为 ASCII 合法标识符，可手动改</span>
-                </div>
-                <div class="max-h-[168px] overflow-auto divide-y divide-slate-100">
-                  <div v-for="row in sideRows" :key="row.from" class="flex items-center gap-2 px-2.5 py-1.5">
-                    <input type="checkbox" v-model="row.on" :disabled="!row.numeric || row.from === sideTimeCol" class="shrink-0" />
-                    <span class="text-[11px] text-slate-700 font-mono truncate w-32 shrink-0" :title="row.from">{{ row.from }}</span>
-                    <span v-if="row.needsName" class="text-[9px] text-rose-500 shrink-0" :title="row.reason">需命名</span>
-                    <input v-model="row.key" :placeholder="row.key || '变量名'"
-                           class="w-28 text-[11px] border border-slate-200 rounded px-1.5 py-0.5 font-mono outline-none focus:border-teal-400 ml-auto" />
-                    <span class="text-[9px] shrink-0" :class="row.numeric ? 'text-slate-400' : 'text-amber-600'">{{ row.numeric ? '数值' : '非数值，跳过' }}</span>
+                <div class="grid grid-cols-3 gap-2">
+                  <div>
+                    <label class="text-[11px] text-slate-500 block mb-1">侧表时间列</label>
+                    <select v-model="sideTimeCol" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-1.5 bg-white focus:border-teal-400 outline-none">
+                      <option value="">-- 请选择 --</option>
+                      <option v-for="c in side.columns" :key="c.from" :value="c.from">{{ c.label }}</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="text-[11px] text-slate-500 block mb-1">对齐方式</label>
+                    <select v-model="sideMode" class="w-full text-xs border border-slate-200 rounded-lg px-2 py-1.5 bg-white focus:border-teal-400 outline-none">
+                      <option v-for="m in alignModes" :key="m.mode" :value="m.mode">{{ m.label }}</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label class="text-[11px] text-slate-500 block mb-1">容差（分钟，仅就近）</label>
+                    <input v-model.number="sideTolerance" type="number" min="1" max="1440" :disabled="sideMode !== 'nearest'"
+                           class="w-full text-xs border border-slate-200 rounded-lg px-2.5 py-1.5 font-mono bg-white focus:border-teal-400 outline-none disabled:bg-slate-100 disabled:text-slate-400" />
                   </div>
                 </div>
-              </div>
-              <button @click="doAttachSide" :disabled="exoBusy || !backendReady || !hasWs || !!state.busy || !sidePicked.length"
-                      class="self-start px-4 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors flex items-center gap-1.5">
-                <i class="fa-solid text-[10px]" :class="exoBusy ? 'fa-spinner fa-spin' : 'fa-code-merge'"></i>{{ exoBusy ? '后端对齐挂列中…' : `按时间戳对齐并挂 ${sidePicked.length} 列` }}
-              </button>
-              <p class="text-[10px] text-slate-500 leading-snug">
-                <i class="fa-solid fa-circle-info mr-1"></i>「精确时间戳」按秒对齐，未命中的主表行留空；「就近匹配」取容差内最近的一条，主表时间戳重复时以第一条为准。文件名与内容指纹会写进命令日志，回放时重新读那份文件。
-              </p>
-            </div>
-          </div>
-
-          <!-- 公式 -->
-          <div v-else class="flex flex-col gap-2">
-            <div class="grid grid-cols-2 gap-2">
-              <div>
-                <label class="text-[11px] text-slate-500 block mb-1">变量名称</label>
-                <input v-model="formulaName" placeholder="如: solar_elevation" class="w-full text-xs border border-slate-200 rounded-lg px-2.5 py-2 font-mono bg-white focus:border-teal-400 outline-none" />
-              </div>
-              <div>
-                <label class="text-[11px] text-slate-500 block mb-1">生成公式</label>
-                <input v-model="formulaExpr" placeholder="如: sin(hour/24*2*PI)" class="w-full text-xs border border-slate-200 rounded-lg px-2.5 py-2 font-mono bg-white focus:border-teal-400 outline-none" />
-              </div>
-            </div>
-            <div class="text-[10px] text-slate-400 leading-relaxed">
-              <div>可用变量: <code v-for="v in formulaVars" :key="v" class="bg-slate-100 px-1 rounded mr-1">{{ v }}</code></div>
-              <div class="mt-0.5">函数: <code class="bg-slate-100 px-1 rounded">{{ formulaFuncs || 'abs/sqrt/log/exp/sin/cos/…' }}</code></div>
-              <div v-if="formulaHelp" class="mt-0.5 text-slate-500">{{ formulaHelp }}</div>
-            </div>
-            <button @click="doAddFormula" :disabled="exoBusy || !backendReady || !hasWs || !!state.busy"
-                    class="self-start px-4 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors flex items-center gap-1.5">
-              <i class="fa-solid text-[10px]" :class="exoBusy ? 'fa-spinner fa-spin' : 'fa-plus'"></i>{{ exoBusy ? '后端求值中…' : '生成并挂到主表' }}
-            </button>
-          </div>
-        </div>
-
-        <div class="col-span-5 flex flex-col gap-2">
-          <div class="border border-slate-200 rounded-lg overflow-hidden flex-1">
-            <div class="bg-slate-50 px-3 py-1.5 border-b border-slate-200 flex items-center justify-between">
-              <span class="text-[11px] font-semibold text-slate-600">已挂上的外生变量列（工作区真实列）</span>
-              <span class="text-[10px] text-slate-400">{{ attachedExo.length }} 列</span>
-            </div>
-            <div class="max-h-[240px] overflow-auto divide-y divide-slate-100">
-              <div v-if="attachedExo.length === 0" class="text-center py-5 text-slate-300 text-[11px]">
-                <i class="fa-regular fa-object-ungroup text-base block mb-1 opacity-40"></i>
-                尚未挂任何外生变量
-              </div>
-              <div v-for="col in attachedExo" :key="col.key"
-                   class="flex items-center gap-2.5 px-3 py-2 hover:bg-teal-50/40 transition-colors group">
-                <div class="w-6 h-6 rounded-md bg-teal-100 flex items-center justify-center shrink-0">
-                  <i class="fa-solid text-teal-600 text-[9px]" :class="(EXO_KIND_META[col.exo?.kind] || EXO_KIND_META.formula).icon"></i>
-                </div>
-                <div class="flex-1 min-w-0">
-                  <div class="flex items-center gap-1.5">
-                    <span class="text-[11px] font-bold text-slate-700 font-mono truncate">{{ col.key }}</span>
-                    <span class="px-1 py-0.5 rounded text-[8px] font-bold bg-teal-100 text-teal-700">{{ (EXO_KIND_META[col.exo?.kind] || EXO_KIND_META.formula).label }}</span>
-                    <span v-if="col.label !== col.key" class="text-[9px] text-slate-400 truncate">{{ col.label }}</span>
+                <div class="border border-slate-200 rounded-lg bg-white overflow-hidden">
+                  <div class="bg-slate-50 px-2.5 py-1 border-b border-slate-200 text-[10px] font-semibold text-slate-600 flex items-center justify-between">
+                    <span>要挂到主表的列（{{ sidePicked.length }} 已选）</span>
+                    <span class="font-normal text-slate-400">变量名需为 ASCII 合法标识符，可手动改</span>
                   </div>
-                  <div class="text-[9px] text-slate-400 mt-0.5 font-mono">{{ col.exo?.expr || col.exo?.presetKey || col.exo?.filename || '' }}</div>
+                  <div class="max-h-[168px] overflow-auto divide-y divide-slate-100">
+                    <div v-for="row in sideRows" :key="row.from" class="flex items-center gap-2 px-2.5 py-1.5">
+                      <input type="checkbox" v-model="row.on" :disabled="!row.numeric || row.from === sideTimeCol" class="shrink-0" />
+                      <span class="text-[11px] text-slate-700 font-mono truncate w-32 shrink-0" :title="row.from">{{ row.from }}</span>
+                      <span v-if="row.needsName" class="text-[9px] text-rose-500 shrink-0" :title="row.reason">需命名</span>
+                      <input v-model="row.key" :placeholder="row.key || '变量名'"
+                             class="w-28 text-[11px] border border-slate-200 rounded px-1.5 py-0.5 font-mono outline-none focus:border-teal-400 ml-auto" />
+                      <span class="text-[9px] shrink-0" :class="row.numeric ? 'text-slate-400' : 'text-amber-600'">{{ row.numeric ? '数值' : '非数值，跳过' }}</span>
+                    </div>
+                  </div>
                 </div>
-                <button @click="doRemoveExo(col)" :disabled="!!state.busy" class="shrink-0 w-5 h-5 rounded flex items-center justify-center text-slate-300 hover:text-rose-600 hover:bg-rose-50 transition-colors opacity-0 group-hover:opacity-100" title="删除该列（走通用删列命令，可撤销）">
-                  <i class="fa-solid fa-xmark text-[10px]"></i>
+                <button @click="doAttachSide" :disabled="exoBusy || !backendReady || !hasWs || !!state.busy || !sidePicked.length"
+                        class="self-start px-4 py-1.5 bg-teal-600 hover:bg-teal-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors flex items-center gap-1.5">
+                  <i class="fa-solid text-[10px]" :class="exoBusy ? 'fa-spinner fa-spin' : 'fa-code-merge'"></i>{{ exoBusy ? '后端对齐挂列中…' : `按时间戳对齐并挂 ${sidePicked.length} 列` }}
                 </button>
+                <p class="text-[10px] text-slate-500 leading-snug">
+                  <i class="fa-solid fa-circle-info mr-1"></i>「精确时间戳」按秒对齐，未命中的主表行留空；「就近匹配」取容差内最近的一条，主表时间戳重复时以第一条为准。文件名与内容指纹会写进命令日志，回放时重新读那份文件。
+                </p>
               </div>
             </div>
           </div>
-          <p class="text-[10px] text-slate-400 leading-snug">
-            这些列与主表列同源：都在后端工作区里，随页窗口一起返回、参与第四步检测与第五步特征，
-            删除与撤销走的也是通用列命令日志（每条一行，服务端重放）。
-          </p>
-        </div>
-      </div>
-    </div>
 
-    <!-- 列运算生成器 -->
-    <div class="bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex flex-col gap-3 shrink-0">
-      <div class="flex items-center justify-between">
-        <h2 class="text-xs font-bold text-slate-700 flex items-center">
-          <i class="fa-solid fa-calculator mr-1.5 text-indigo-600"></i>列运算生成新特征列
-          <span class="text-[10px] text-slate-400 font-normal ml-2">链式运算由后端在整个工作区上执行</span>
-        </h2>
-        <span v-if="state.derivedCols.length > 0" class="text-[11px] bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-mono font-semibold">已生成 {{ state.derivedCols.length }} 列</span>
-      </div>
-
-      <div class="space-y-1.5">
-        <div v-for="(t, i) in terms" :key="i" class="flex items-center gap-2">
-          <select v-if="i > 0" v-model="t.op" class="w-14 text-xs border border-slate-200 rounded px-2 py-1.5 bg-white font-mono text-center">
-            <option value="+">+</option><option value="-">−</option><option value="*">×</option><option value="/">÷</option>
-          </select>
-          <span v-else class="w-14 text-center text-[10px] text-slate-400 font-mono">起始</span>
-          <select v-model="t.col" class="flex-1 text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:border-indigo-400 outline-none">
-            <option v-for="c in numericCols" :key="c.key" :value="c.key">{{ c.label }}<template v-if="c.label !== c.key"> · {{ c.key }}</template></option>
-          </select>
-          <button v-if="i > 1" @click="removeTerm(i)" class="w-6 h-6 rounded text-slate-300 hover:text-rose-500 hover:bg-rose-50 flex items-center justify-center">
-            <i class="fa-solid fa-xmark text-[10px]"></i>
-          </button>
-          <span v-else class="w-6"></span>
-        </div>
-      </div>
-
-      <div class="flex items-center gap-2 flex-wrap">
-        <button @click="addTerm" class="px-3 py-1.5 border border-dashed border-indigo-300 hover:border-indigo-500 hover:bg-indigo-50 text-indigo-600 rounded-lg text-[11px] font-medium transition-colors flex items-center gap-1">
-          <i class="fa-solid fa-plus text-[9px]"></i>添加操作列
-        </button>
-        <div class="flex-1"></div>
-        <span class="text-slate-400 font-bold text-sm">→</span>
-        <input v-model="newColName" placeholder="新列名" class="w-44 text-xs border border-slate-200 rounded-lg px-2.5 py-2 font-mono bg-white focus:border-indigo-400 outline-none" />
-        <button @click="previewCalc" class="px-3 py-2 border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 rounded-lg text-xs font-medium transition-colors">
-          <i class="fa-solid fa-eye mr-1"></i>本页试算
-        </button>
-        <button @click="doApplyCalc" :disabled="!backendReady || !hasWs || !!state.busy"
-                class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors">
-          <i class="fa-solid fa-plus mr-1"></i>后端生成列
-        </button>
-      </div>
-
-      <div v-if="calcPreview" class="flex items-center gap-3 text-xs font-mono px-3 py-2 bg-indigo-50/70 border border-indigo-200 rounded-lg">
-        <span class="text-indigo-500 font-sans font-semibold text-[11px]">预览公式:</span>
-        <span class="text-indigo-800">{{ calcPreview.formula }}</span>
-        <span class="text-slate-400">|</span>
-        <span class="text-indigo-500 font-sans font-semibold text-[11px]">当前页前 3 行试算:</span>
-        <span class="text-indigo-700">{{ calcPreview.samples.join(', ') }}</span>
-      </div>
-
-      <div v-if="state.derivedCols.length > 0" class="border border-slate-200 rounded-lg overflow-hidden">
-        <div class="bg-slate-50 px-3 py-1.5 border-b border-slate-200 flex items-center justify-between">
-          <span class="text-[11px] font-semibold text-slate-600">已生成的派生列</span>
-          <button @click="doClearDerivedCols" class="text-[10px] text-slate-400 hover:text-rose-600 transition-colors">
-            <i class="fa-solid fa-trash-can mr-0.5"></i>清空全部
-          </button>
-        </div>
-        <div class="max-h-[120px] overflow-auto divide-y divide-slate-100">
-          <div v-for="(c, idx) in state.derivedCols" :key="c.key" class="flex items-center gap-2 px-3 py-1.5 text-[11px]">
-            <i class="fa-solid fa-square-root-variable text-indigo-500 text-[10px]"></i>
-            <span class="font-mono font-bold text-slate-700">{{ c.key }}</span>
-            <span class="text-slate-400 truncate flex-1">= {{ c.formula }}</span>
-            <button @click="doDeleteDerivedCol(idx)" class="text-slate-300 hover:text-rose-600"><i class="fa-solid fa-xmark text-[10px]"></i></button>
+          <div class="col-span-5 flex flex-col gap-2">
+            <div class="border border-slate-200 rounded-lg overflow-hidden flex-1">
+              <div class="bg-slate-50 px-3 py-1.5 border-b border-slate-200 flex items-center justify-between">
+                <span class="text-[11px] font-semibold text-slate-600">已挂上的外生变量列（工作区真实列）</span>
+                <span class="text-[10px] text-slate-400">{{ attachedExo.length }} 列</span>
+              </div>
+              <div class="max-h-[240px] overflow-auto divide-y divide-slate-100">
+                <div v-if="attachedExo.length === 0" class="text-center py-5 text-slate-300 text-[11px]">
+                  <i class="fa-regular fa-object-ungroup text-base block mb-1 opacity-40"></i>
+                  尚未挂任何外生变量
+                </div>
+                <div v-for="col in attachedExo" :key="col.key"
+                     class="flex items-center gap-2.5 px-3 py-2 hover:bg-teal-50/40 transition-colors group">
+                  <div class="w-6 h-6 rounded-md bg-teal-100 flex items-center justify-center shrink-0">
+                    <i class="fa-solid text-teal-600 text-[9px]" :class="(EXO_KIND_META[col.exo?.kind] || EXO_KIND_META.formula).icon"></i>
+                  </div>
+                  <div class="flex-1 min-w-0">
+                    <div class="flex items-center gap-1.5">
+                      <span class="text-[11px] font-bold text-slate-700 font-mono truncate">{{ col.key }}</span>
+                      <span class="px-1 py-0.5 rounded text-[8px] font-bold bg-teal-100 text-teal-700">{{ (EXO_KIND_META[col.exo?.kind] || EXO_KIND_META.formula).label }}</span>
+                      <span v-if="col.label !== col.key" class="text-[9px] text-slate-400 truncate">{{ col.label }}</span>
+                    </div>
+                    <div class="text-[9px] text-slate-400 mt-0.5 font-mono">{{ col.exo?.expr || col.exo?.presetKey || col.exo?.filename || '' }}</div>
+                  </div>
+                  <button @click="doRemoveExo(col)" :disabled="!!state.busy" class="shrink-0 w-5 h-5 rounded flex items-center justify-center text-slate-300 hover:text-rose-600 hover:bg-rose-50 transition-colors opacity-0 group-hover:opacity-100" title="删除该列（走通用删列命令，可撤销）">
+                    <i class="fa-solid fa-xmark text-[10px]"></i>
+                  </button>
+                </div>
+              </div>
+            </div>
           </div>
+        </div>
+      </div>
+
+      <!-- Tab 4: 列运算生成器 -->
+      <div v-show="activeTab === 'calc'" class="p-4 flex flex-col gap-3">
+        <div class="flex items-center justify-between">
+          <h2 class="text-xs font-bold text-slate-700 flex items-center">
+            <i class="fa-solid fa-calculator mr-1.5 text-indigo-600"></i>列运算生成新特征列
+          </h2>
+          <span v-if="state.derivedCols.length > 0" class="text-[11px] bg-indigo-100 text-indigo-700 px-2 py-0.5 rounded-full font-mono font-semibold">已生成 {{ state.derivedCols.length }} 列</span>
+        </div>
+
+        <div class="space-y-1.5">
+          <div v-for="(t, i) in terms" :key="i" class="flex items-center gap-2">
+            <select v-if="i > 0" v-model="t.op" class="w-14 text-xs border border-slate-200 rounded px-2 py-1.5 bg-white font-mono text-center">
+              <option value="+">+</option><option value="-">−</option><option value="*">×</option><option value="/">÷</option>
+            </select>
+            <span v-else class="w-14 text-center text-[10px] text-slate-400 font-mono">起始</span>
+            <select v-model="t.col" class="flex-1 text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:border-indigo-400 outline-none">
+              <option v-for="c in numericCols" :key="c.key" :value="c.key">{{ c.label }}<template v-if="c.label !== c.key"> · {{ c.key }}</template></option>
+            </select>
+            <button v-if="i > 1" @click="removeTerm(i)" class="w-6 h-6 rounded text-slate-300 hover:text-rose-500 hover:bg-rose-50 flex items-center justify-center">
+              <i class="fa-solid fa-xmark text-[10px]"></i>
+            </button>
+            <span v-else class="w-6"></span>
+          </div>
+        </div>
+
+        <div class="flex items-center gap-2 flex-wrap">
+          <button @click="addTerm" class="px-3 py-1.5 border border-dashed border-indigo-300 hover:border-indigo-500 hover:bg-indigo-50 text-indigo-600 rounded-lg text-[11px] font-medium transition-colors flex items-center gap-1">
+            <i class="fa-solid fa-plus text-[9px]"></i>添加操作列
+          </button>
+          <div class="flex-1"></div>
+          <span class="text-slate-400 font-bold text-sm">→</span>
+          <input v-model="newColName" placeholder="新列名" class="w-44 text-xs border border-slate-200 rounded-lg px-2.5 py-2 font-mono bg-white focus:border-indigo-400 outline-none" />
+          <button @click="previewCalc" class="px-3 py-2 border border-slate-200 hover:border-indigo-400 hover:bg-indigo-50 text-slate-600 hover:text-indigo-600 rounded-lg text-xs font-medium transition-colors">
+            <i class="fa-solid fa-eye mr-1"></i>本页试算
+          </button>
+          <button @click="doApplyCalc" :disabled="!backendReady || !hasWs || !!state.busy"
+                  class="px-4 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors">
+            <i class="fa-solid fa-plus mr-1"></i>后端生成列
+          </button>
+        </div>
+
+        <div v-if="calcPreview" class="flex items-center gap-3 text-xs font-mono px-3 py-2 bg-indigo-50/70 border border-indigo-200 rounded-lg">
+          <span class="text-indigo-500 font-sans font-semibold text-[11px]">预览公式:</span>
+          <span class="text-indigo-800">{{ calcPreview.formula }}</span>
+          <span class="text-slate-400">|</span>
+          <span class="text-indigo-500 font-sans font-semibold text-[11px]">当前页前 3 行试算:</span>
+          <span class="text-indigo-700">{{ calcPreview.samples.join(', ') }}</span>
+        </div>
+
+        <div v-if="state.derivedCols.length > 0" class="border border-slate-200 rounded-lg overflow-hidden">
+          <div class="bg-slate-50 px-3 py-1.5 border-b border-slate-200 flex items-center justify-between">
+            <span class="text-[11px] font-semibold text-slate-600">已生成的派生列</span>
+            <button @click="doClearDerivedCols" class="text-[10px] text-slate-400 hover:text-rose-600 transition-colors">
+              <i class="fa-solid fa-trash-can mr-0.5"></i>清空全部
+            </button>
+          </div>
+          <div class="max-h-[120px] overflow-auto divide-y divide-slate-100">
+            <div v-for="(c, idx) in state.derivedCols" :key="c.key" class="flex items-center gap-2 px-3 py-1.5 text-[11px]">
+              <i class="fa-solid fa-square-root-variable text-indigo-500 text-[10px]"></i>
+              <span class="font-mono font-bold text-slate-700">{{ c.key }}</span>
+              <span class="text-slate-400 truncate flex-1">= {{ c.formula }}</span>
+              <button @click="doDeleteDerivedCol(idx)" class="text-slate-300 hover:text-rose-600"><i class="fa-solid fa-xmark text-[10px]"></i></button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- Tab 5: 时序数据集切分 -->
+      <div v-show="activeTab === 'split'" class="p-4 flex flex-col">
+        <div class="flex items-center justify-between mb-2">
+          <h2 class="text-xs font-bold text-slate-700 flex items-center">
+            <i class="fa-solid fa-timeline mr-1.5 text-indigo-600"></i>时序数据集切分 (时序不可打乱)
+          </h2>
+          <span class="text-[11px] font-mono text-slate-500">训练集 {{ state.splitRatio }}% | 验证集 {{ Math.round((100 - state.splitRatio) / 2) }}% | 测试集 {{ 100 - state.splitRatio - Math.round((100 - state.splitRatio) / 2) }}%</span>
+        </div>
+        <div class="w-full h-3.5 rounded-full overflow-hidden flex mb-2 bg-slate-100 p-0.5 border border-slate-200">
+          <div :style="{ width: state.splitRatio + '%' }" class="h-full bg-indigo-500 rounded-l-full transition-all"></div>
+          <div :style="{ width: (Math.round((100 - state.splitRatio) / 2)) + '%' }" class="h-full bg-amber-400 transition-all"></div>
+          <div :style="{ width: (100 - state.splitRatio - Math.round((100 - state.splitRatio) / 2)) + '%' }" class="h-full bg-emerald-400 rounded-r-full transition-all"></div>
+        </div>
+        <div class="flex items-center justify-between gap-4 text-xs">
+          <input type="range" min="50" max="85" v-model.number="state.splitRatio" @change="commitSplit" class="w-full h-1.5 bg-slate-200 rounded-lg cursor-pointer accent-indigo-600" />
+          <div class="shrink-0 flex gap-2 text-[11px]">
+            <span class="flex items-center"><span class="w-2 h-2 rounded-full bg-indigo-500 inline-block mr-1"></span>训练: {{ split.train.toLocaleString() }} 条</span>
+            <span class="flex items-center"><span class="w-2 h-2 rounded-full bg-amber-400 inline-block mr-1"></span>验证: {{ split.val.toLocaleString() }} 条</span>
+            <span class="flex items-center"><span class="w-2 h-2 rounded-full bg-emerald-400 inline-block mr-1"></span>测试: {{ split.test.toLocaleString() }} 条</span>
+          </div>
+        </div>
+        <p class="text-[10px] text-slate-400 mt-2 flex items-center gap-1">
+          <i :class="splitLogged ? 'fa-solid fa-circle-check text-emerald-500' : 'fa-solid fa-circle-info text-slate-300'"></i>
+          {{ splitLogged
+            ? `切分比例已写入操作记录（${state.splitRatio}%），会随流程回放与 Python 代码一起复现`
+            : `当前为默认 ${state.splitRatio}%，尚未写入操作记录；拖动滑杆并松手即记录一次，才会进入回放与导出` }}
+          · 三条行数按后端整表行数 {{ totalRows.toLocaleString() }} 计算
+        </p>
+
+        <!-- 落成真实的一列：比例只是参数，划分列才是随数据走产物 -->
+        <div class="mt-3 border border-slate-200 rounded-lg p-3 bg-slate-50/50 flex items-start gap-3">
+          <div class="flex-1 min-w-0">
+            <h3 class="text-[11px] font-bold text-slate-700 flex items-center gap-1">
+              <i class="fa-solid fa-certificate text-indigo-500"></i>生成数据集划分列
+            </h3>
+            <p class="text-[10px] text-slate-400 mt-1 leading-relaxed">
+              新增 <span class="font-mono text-slate-500">dataset_split</span> 列，逐行写入
+              <span class="font-mono text-indigo-600">train</span> /
+              <span class="font-mono text-amber-600">val</span> /
+              <span class="font-mono text-emerald-600">test</span>：按当前行序前 {{ state.splitRatio }}% 记 train，余下对半分给 val 与 test，时序不打乱。
+              列会出现在下方快照与第五步特征登记表里，宽表导出与 Python 脚本复现的都是同一批标签。
+            </p>
+            <div v-if="splitApplied" class="mt-1.5 text-[10px] font-mono text-emerald-700">
+              已生成：train {{ splitApplied.train.toLocaleString() }} / val {{ splitApplied.val.toLocaleString() }} / test {{ splitApplied.test.toLocaleString() }}
+              · 整表 {{ splitApplied.rows.toLocaleString() }} 行 · 工作区第 {{ d.meta?.version ?? 0 }} 版
+              <span v-if="splitStale" class="text-amber-600 font-sans">（{{ splitStale }}，重新点一次才会与当前数据一致）</span>
+            </div>
+          </div>
+          <button @click="doApplySplit"
+                  :disabled="!backendReady || !hasWs || !!state.busy || totalRows < 3"
+                  class="shrink-0 px-3.5 py-2 bg-indigo-600 hover:bg-indigo-700 disabled:bg-slate-300 disabled:cursor-not-allowed text-white rounded-lg text-[11px] font-semibold shadow-sm transition-colors">
+            <i class="fa-solid fa-play mr-1 text-[9px]"></i>{{ splitApplied ? '重新生成划分列' : '生成划分列' }}
+          </button>
         </div>
       </div>
     </div>
@@ -999,40 +1008,6 @@ function commitSplit() { setSplitRatio(state.splitRatio) }
           </tbody>
         </table>
       </div>
-      <div class="px-4 py-1.5 border-t border-slate-200 bg-slate-50/40 text-[10px] text-slate-400 flex items-center gap-2 flex-wrap">
-        <i class="fa-solid fa-circle-info"></i>
-        <span>表格只渲染后端返回的当前页（一次一页请求），翻页不会把整表搬进浏览器；列名重命名、删除列、单位换算都在后端整表执行。</span>
-      </div>
-    </div>
-
-    <!-- 时序数据集切分 -->
-    <div class="bg-white p-4 rounded-xl border border-slate-200 shadow-sm flex flex-col justify-between">
-      <div class="flex items-center justify-between mb-2">
-        <h2 class="text-xs font-bold text-slate-700 flex items-center">
-          <i class="fa-solid fa-timeline mr-1.5 text-indigo-600"></i>时序数据集切分 (时序不可打乱)
-        </h2>
-        <span class="text-[11px] font-mono text-slate-500">训练集 {{ state.splitRatio }}% | 验证集 {{ Math.round((100 - state.splitRatio) / 2) }}% | 测试集 {{ 100 - state.splitRatio - Math.round((100 - state.splitRatio) / 2) }}%</span>
-      </div>
-      <div class="w-full h-3.5 rounded-full overflow-hidden flex mb-2 bg-slate-100 p-0.5 border border-slate-200">
-        <div :style="{ width: state.splitRatio + '%' }" class="h-full bg-indigo-500 rounded-l-full transition-all"></div>
-        <div :style="{ width: (Math.round((100 - state.splitRatio) / 2)) + '%' }" class="h-full bg-amber-400 transition-all"></div>
-        <div :style="{ width: (100 - state.splitRatio - Math.round((100 - state.splitRatio) / 2)) + '%' }" class="h-full bg-emerald-400 rounded-r-full transition-all"></div>
-      </div>
-      <div class="flex items-center justify-between gap-4 text-xs">
-        <input type="range" min="50" max="85" v-model.number="state.splitRatio" @change="commitSplit" class="w-full h-1.5 bg-slate-200 rounded-lg cursor-pointer accent-indigo-600" />
-        <div class="shrink-0 flex gap-2 text-[11px]">
-          <span class="flex items-center"><span class="w-2 h-2 rounded-full bg-indigo-500 inline-block mr-1"></span>训练: {{ split.train.toLocaleString() }} 条</span>
-          <span class="flex items-center"><span class="w-2 h-2 rounded-full bg-amber-400 inline-block mr-1"></span>验证: {{ split.val.toLocaleString() }} 条</span>
-          <span class="flex items-center"><span class="w-2 h-2 rounded-full bg-emerald-400 inline-block mr-1"></span>测试: {{ split.test.toLocaleString() }} 条</span>
-        </div>
-      </div>
-      <p class="text-[10px] text-slate-400 mt-2 flex items-center gap-1">
-        <i :class="splitLogged ? 'fa-solid fa-circle-check text-emerald-500' : 'fa-solid fa-circle-info text-slate-300'"></i>
-        {{ splitLogged
-          ? `切分比例已写入操作记录（${state.splitRatio}%），会随流程回放与 Python 代码一起复现`
-          : `当前为默认 ${state.splitRatio}%，尚未写入操作记录；拖动滑杆并松手即记录一次，才会进入回放与导出` }}
-        · 三条行数按后端整表行数 {{ totalRows.toLocaleString() }} 计算
-      </p>
     </div>
 
     <div class="flex justify-between gap-3 pt-1">
