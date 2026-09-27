@@ -24,7 +24,7 @@ from ..schemas import (
     FeatureLagRequest, FeatureTimeRequest,
     HolidaysRequest, ImputeRequest, MaskDeleteRequest, MaskGenerateRequest,
     PresetRequest, RenameColumnRequest, ResampleRequest,
-    RestoreRequest, SplitApplyRequest, TimeFormatRequest, DeleteColumnRequest,
+    RestoreRequest, SaveAsRequest, SplitApplyRequest, TimeFormatRequest, DeleteColumnRequest,
 )
 from ..services import dataset_store, exporter, explore, features
 from ..services import workspace as ws_store
@@ -77,7 +77,7 @@ async def create_workspace(file: UploadFile = File(..., description="CSV/Excel/P
     if not content:
         raise HTTPException(status_code=400, detail="上传文件为空")
     if len(content) > MAX_UPLOAD_BYTES:
-        raise HTTPException(status_code=413, detail=f"上传文件超过 {schemas.MAX_UPLOAD_MB}MB 上限")
+        raise HTTPException(status_code=413, detail=f"上传文件超过 {MAX_UPLOAD_MB}MB 上限")
     name = file.filename or "data.csv"
     saved = None
     if persist:
@@ -274,6 +274,44 @@ def export_workspace(ws_id: str, fmt: str = Query("csv", alias="format",
             "Access-Control-Expose-Headers": "Content-Disposition, Content-Length",
         },
     )
+
+
+# ---------------- 另存为数据集：服务端帧 → 数据集目录 ----------------
+
+@router.post("/{ws_id}/save-as")
+def save_as_dataset(ws_id: str, payload: SaveAsRequest,
+                    fmt: str = Query("csv", alias="format",
+                                     pattern="^(csv|xlsx|parquet|feather)$")) -> dict:
+    """把当前帧写进数据集目录：回第一步就能在「最近打开的数据集」里点开这份加工结果。
+
+    与 GET /export 走同一份编码路径（exporter.encode(ws.export_dataframe(), ...)），
+    存进目录的字节与浏览器下载到的字节同源；区别只是目的地在服务端磁盘上，明细不绕网络。
+    重名由 dataset_store 追加时间戳另存，绝不覆盖目录里已有的文件。
+    """
+    ws = _get(ws_id)
+    frame = ws.export_dataframe()
+    rows, cols = int(frame.shape[0]), int(frame.shape[1])
+
+    def build():
+        base = (payload.filename or "").strip() or f"{ws.meta.get('name') or 'workspace'}_v{ws.version}"
+        return exporter.encode(frame, fmt, base)
+
+    data, _media, download_name = _guard(build)
+    try:
+        stored = dataset_store.save_bytes(download_name, data)
+        on_disk = (dataset_store.dataset_dir() / stored).stat().st_size
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=500, detail=f"写入数据集目录失败：{type(exc).__name__}: {exc}") from exc
+    # sizeOnDisk 是写完之后回到磁盘上量的那一份，与 size（内存里编码出的字节数）对得上，
+    # 才说明这份数据集真的落盘了，而不是接口返回了一个没人见过的数字。
+    return {"wsId": ws.id, "version": ws.version, "format": fmt,
+            "filename": stored, "proposed": download_name, "renamed": stored != download_name,
+            "dir": str(dataset_store.dataset_dir()),
+            "size": len(data), "sizeOnDisk": int(on_disk),
+            "sizeText": dataset_store.size_text(len(data)),
+            "rows": rows, "cols": cols}
 
 
 # ---------------- 第五步辅助：特征预览定位 ----------------

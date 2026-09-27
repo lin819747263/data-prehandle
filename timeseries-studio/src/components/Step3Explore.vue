@@ -1,7 +1,7 @@
 <script setup>
 import { ref, computed, reactive, onMounted, onActivated, onBeforeUnmount, nextTick, watch } from 'vue'
 import * as echarts from 'echarts'
-import { state, ds, switchStep, rowCount } from '../store'
+import { state, ds, switchStep, rowCount, toast } from '../store'
 import { wsStats, wsHist, wsSeriesMulti } from '../api'
 
 const COLORS = ['#4f46e5', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#e11d48']
@@ -11,13 +11,30 @@ const colorOf = i => COLORS[i % COLORS.length]
 const d = computed(() => { void state.dataVersion; return { ...ds() } })
 const floatCols = computed(() => d.value.columns.filter(c => c.type === 'float'))
 
-// 本页三块数字各自一次后端整表计算：统计矩阵、叠加曲线、直方图
-const gate = ref({ status: 'idle', note: '' })
+// 本页三块数字各自一次后端整表计算：统计矩阵、叠加曲线、直方图。
+// 三块各自记账（B4）：哪一块没取到就红在哪一块上，绝不出现「整页一条提示都没有、
+// 少了一列数却看着像成功」——旧实现共用一个 gate，后一次成功会把前一次的失败盖掉。
+const BLOCK_NAMES = { stats: '统计矩阵', series: '叠加曲线', hist: '直方图' }
+const err = reactive({ stats: '', series: '', hist: '' })
 const stats = ref(null)
 const chart = ref(null)
 const hist = ref(null)
 const fetching = reactive({ stats: false, series: false, hist: false })
-let loadedVersion = null
+const lastSync = ref('')      // 三块全部取到那一刻的本地时钟：证明下面这排数字是刚算的
+let loadedSig = null
+
+const gate = computed(() => {
+  if (!state.backend.online) return { status: 'offline', note: '后端不在线：本页的整表统计、抽稀曲线与直方图无从计算' }
+  if (!d.value.wsId) return { status: 'noData', note: '尚未接入数据：请先在第一步载入数据集' }
+  const bad = Object.keys(BLOCK_NAMES).filter(k => err[k])
+  if (bad.length) {
+    return { status: 'error', note: bad.map(k => `${BLOCK_NAMES[k]}：${err[k]}`).join('　·　') }
+  }
+  if (fetching.stats || fetching.series || fetching.hist) {
+    return { status: 'loading', note: '正在由后端整表计算统计矩阵、叠加曲线与直方图…' }
+  }
+  return { status: 'ready', note: '' }
+})
 
 const selected = reactive(new Set())
 function ensureSelection() {
@@ -92,31 +109,39 @@ const displayRows = computed(() => (stats.value ? stats.value.rowCount : rowCoun
 const displayCols = computed(() => (stats.value ? stats.value.colCount : floatCols.value.length))
 function fmt(v) { return v === null || v === undefined ? '—' : Number(v).toFixed(1) }
 
-async function loadStats() {
+// 每一块的失败都先记在自己账上；quiet=false（用户直接动作触发）时立刻弹一条，
+// quiet=true（prepare 一次性铺三块）时由 prepare 汇总成一条，避免同一屏叠三条 toast。
+function noteFailure(block, e, quiet) {
+  const msg = String(e?.message || e || '未知错误')
+  err[block] = msg
+  if (!quiet) toast('error', `${BLOCK_NAMES[block]}读取失败：${msg}`)
+}
+
+async function loadStats(quiet = false) {
   const keys = floatCols.value.map(c => c.key)
-  if (!keys.length) { stats.value = null; return }
+  if (!keys.length) { stats.value = null; err.stats = ''; return }
   fetching.stats = true
   try {
     stats.value = await wsStats(d.value.wsId, keys)
+    err.stats = ''
   } catch (e) {
-    gate.value = { status: 'error', note: `统计矩阵获取失败：${e.message || e}` }
-    return
+    noteFailure('stats', e, quiet)
   } finally {
     fetching.stats = false
   }
 }
 
-async function refreshSeries() {
+async function refreshSeries(quiet = false) {
   const keys = selectedList()
-  if (!keys.length) { chart.value = null; drawMain(); return }
+  if (!keys.length) { chart.value = null; err.series = ''; drawMain(); return }
   fetching.series = true
   try {
     chart.value = await wsSeriesMulti(d.value.wsId, keys, downsample.value, pointsCap.value,
       span.value, periodOffset.value)
     periodOffset.value = chart.value?.window?.offset ?? 0
-    if (gate.value.status === 'loading') gate.value = { status: 'ready', note: '' }
+    err.series = ''
   } catch (e) {
-    gate.value = { status: 'error', note: `曲线数据获取失败：${e.message || e}` }
+    noteFailure('series', e, quiet)
     return
   } finally {
     fetching.series = false
@@ -124,13 +149,14 @@ async function refreshSeries() {
   drawMain()
 }
 
-async function refreshHist() {
-  if (!distCol.value) { hist.value = null; drawDist(); return }
+async function refreshHist(quiet = false) {
+  if (!distCol.value) { hist.value = null; err.hist = ''; drawDist(); return }
   fetching.hist = true
   try {
     hist.value = await wsHist(d.value.wsId, distCol.value, binsCount.value)
+    err.hist = ''
   } catch (e) {
-    gate.value = { status: 'error', note: `直方图获取失败：${e.message || e}` }
+    noteFailure('hist', e, quiet)
     return
   } finally {
     fetching.hist = false
@@ -139,16 +165,27 @@ async function refreshHist() {
 }
 
 async function prepare(force = false) {
-  if (!state.backend.online) { gate.value = { status: 'offline', note: '后端不在线：第三步的整表统计无从计算' }; return }
-  if (!d.value.wsId) { gate.value = { status: 'noData', note: '尚未接入数据' }; return }
-  const version = d.value.meta?.version
-  if (!force && loadedVersion === version && gate.value.status === 'ready') return
-  gate.value = { status: 'loading', note: '正在由后端整表计算统计矩阵、叠加曲线与直方图…' }
-  await loadStats()
-  await refreshSeries()
-  await refreshHist()
-  loadedVersion = version
-  if (gate.value.status === 'loading') gate.value = { status: 'ready', note: '' }
+  if (!state.backend.online) { toast('warning', '后端不在线：第三步的整表计算无从执行，本页只读'); return }
+  if (!d.value.wsId) { toast('warning', '尚未载入数据集：请先在第一步接入数据'); return }
+  // 按 (工作区, 版本号) 记这次铺没铺过：版本号只在执行加工命令时前进，翻页与改勾选都不动它
+  const sig = `${d.value.wsId}|${d.value.meta?.version ?? -1}`
+  if (!force && loadedSig === sig) return
+  await loadStats(true)
+  await refreshSeries(true)
+  await refreshHist(true)
+  loadedSig = sig
+  const bad = Object.keys(BLOCK_NAMES).filter(k => err[k])
+  if (bad.length) {
+    // 整页缺块必须说出来：只标红不弹提示，用户会以为自己看到的表是全的
+    toast(bad.length === 3 ? 'error' : 'warning',
+      `${bad.map(k => BLOCK_NAMES[k]).join('、')}没从后端取到${bad.length === 3 ? '，本页没有可用数字' : '，对应区块已标红'}：` +
+      bad.map(k => err[k]).join('　·　'))
+    return
+  }
+  lastSync.value = new Date().toLocaleTimeString()
+  toast('success', `后端整表算完：统计矩阵 ${(stats.value?.rows || []).length} 列 × ` +
+    `${(stats.value?.rowCount ?? 0).toLocaleString()} 行 · 曲线 ${(chart.value?.series || []).length} 条 / ` +
+    `${(chart.value?.points ?? 0).toLocaleString()} 个点 · 直方图 ${hist.value?.bins ?? 0} 桶`)
 }
 
 // 用户拖出来的缩放窗口（百分比）：换列、换抽稀方式都不该被重置，
@@ -305,8 +342,11 @@ onBeforeUnmount(() => {
   chartDist = null
 })
 
-watch(downsample, refreshSeries)
-watch(distCol, refreshHist)
+// 换抽稀方式 / 换直方图列都是用户动作：必须弹得出来。
+// 注意不能写成 watch(downsample, refreshSeries) —— watch 会把新值当第一个参数传进去，
+// 那个字符串会被当成 quiet=true，于是这一路的失败又变回静默。
+watch(downsample, () => refreshSeries())
+watch(distCol, () => refreshHist())
 // 第二步改过数据（重采样/删列/换算）后版本号变了，此前那份整表统计即作废
 watch(() => d.value.meta?.version, () => { prepare(true) })
 watch(() => state.backend.online, on => { if (on) prepare(true) })
@@ -315,12 +355,17 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
 <template>
   <section class="step-panel h-full p-4 flex flex-col gap-3 overflow-y-auto">
     <div v-if="gate.status !== 'ready'" class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
-         :class="gate.status === 'loading' ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-rose-50 border-rose-200 text-rose-700'">
+         :class="gate.status === 'loading' ? 'bg-indigo-50 border-indigo-200 text-indigo-700'
+                 : gate.status === 'error' ? 'bg-rose-50 border-rose-200 text-rose-700'
+                 : 'bg-amber-50 border-amber-200 text-amber-700'">
       <i class="fa-solid mt-0.5" :class="gate.status === 'loading' ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
       <div class="min-w-0">
         <div class="font-semibold">{{ gate.note || '正在计算…' }}</div>
+        <div v-if="gate.status === 'error'" class="mt-0.5 leading-snug opacity-80">
+          缺的区块在页面上各自标红；其余两块数字仍然是后端刚算出来的真实值，可以直接看。
+        </div>
       </div>
-      <button v-if="gate.status !== 'loading'" @click="prepare(true)"
+      <button v-if="gate.status === 'error' || gate.status === 'offline'" @click="prepare(true)"
               class="ml-auto shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
     </div>
 
@@ -341,6 +386,10 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
               <button @click="toggleAll(false)" class="text-[10px] text-slate-500 hover:underline">清空</button>
             </div>
             <span class="text-[10px] text-slate-400 font-mono">已选 {{ selected.size }} 条</span>
+            <!-- 成功也要看得见：这条 chip 记的是三块全部取到那一刻，缺块时它不会更新 -->
+            <span v-if="lastSync" class="text-[10px] font-mono px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-700">
+              <i class="fa-solid fa-check mr-0.5"></i>整表计算于 {{ lastSync }}
+            </span>
           </div>
           <div class="flex items-center gap-2">
             <label class="text-xs font-bold text-slate-600">抽稀方式:</label>
@@ -400,6 +449,9 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
       <div ref="mainEl" class="w-full flex-1"></div>
       <div class="px-2 pb-1 text-[10px] text-slate-400 font-mono flex items-center gap-2 shrink-0">
         <span v-if="fetching.series"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端抽稀中…</span>
+        <span v-else-if="err.series" class="text-rose-500">
+          <i class="fa-solid fa-triangle-exclamation mr-1"></i>叠加曲线没取到：{{ err.series }}
+        </span>
         <template v-else-if="chart">
           <span>整表 {{ chart.rowCount.toLocaleString() }} 行</span>
           <span v-if="chart.window && chart.window.span !== 'all'" class="text-indigo-600">
@@ -423,6 +475,9 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
           </span>
           <span class="text-[10px] text-slate-400 font-mono">
             <span v-if="fetching.stats"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端整表统计中…</span>
+            <span v-else-if="err.stats" class="text-rose-500">
+              <i class="fa-solid fa-triangle-exclamation mr-1"></i>统计矩阵没取到：{{ err.stats }}
+            </span>
             <template v-else>
               {{ displayCols }} 列 × {{ displayRows.toLocaleString() }} 行
               <span :class="gate.status === 'ready' ? 'text-emerald-600' : 'text-rose-500'">
@@ -496,6 +551,9 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
         <div ref="distEl" class="w-full flex-1"></div>
         <div class="px-2 pb-1 text-[10px] text-slate-400 font-mono shrink-0">
           <span v-if="fetching.hist"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端整表计数中…</span>
+          <span v-else-if="err.hist" class="text-rose-500">
+            <i class="fa-solid fa-triangle-exclamation mr-1"></i>直方图没取到：{{ err.hist }}
+          </span>
           <span v-else-if="hist && hist.edges.length">
             {{ hist.bins }} 桶 · {{ hist.n.toLocaleString() }} 个有效值 · 桶宽 {{ hist.binWidth.toFixed(3) }}
             <span v-if="hist.missing" class="text-amber-600">· {{ hist.missing.toLocaleString() }} 缺失（不计桶）</span>

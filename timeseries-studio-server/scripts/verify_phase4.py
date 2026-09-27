@@ -595,18 +595,25 @@ def main() -> int:
     health = api("GET", "/api/health")
     print("== /api/health ==")
     need = ["workspace:stats", "workspace:hist", "workspace:series-multi",
-            "workspace:first-complete", "workspace:export",
-            "export:parquet", "export:feather", "export:csv", "export:xlsx"]
+            "workspace:first-complete", "workspace:export", "export:csv"]
     check("能力声明含第④期全部入口", all(c in health["capabilities"] for c in need),
           [c for c in need if c not in health["capabilities"]])
+    # 二进制格式只在后端真编得出来时才声明（本机没装 pyarrow 时就不该出现）
+    codecs = health.get("exportCodecs") or {}
+    declared = sorted(c for c in health["capabilities"] if c.startswith("export:"))
+    real = sorted(f"export:{f}" for f, why in codecs.items() if why is None)
+    check("声明的 export:* 与后端逐格式探测结果一致", declared == real,
+          {"声明": declared, "能编": real, "缺": {f: w for f, w in codecs.items() if w}})
     check("上限里回带了曲线点数与直方图桶数（界面文案读这两个数）",
           health["limits"]["seriesMaxPoints"] == POINTS or health["limits"]["seriesMaxPoints"] == 6000,
           health["limits"]["seriesMaxPoints"])
     check("直方图桶数与界面默认 25 桶同源", health["limits"]["histogramBins"] == BINS,
           health["limits"]["histogramBins"])
-    check("浏览器整表兜底通道不在能力声明里（能力清单即事实）",
-          not any("replace" in c for c in health["capabilities"]),
-          [c for c in health["capabilities"] if "replace" in c])
+    # 期⑤ 删掉的是「浏览器回传整表覆盖工作区」那条兜底通道；feature-sincos-replace 是第五步
+    # sin/cos 与原列二选一的开关，不是同一种东西，别一起算成漏网
+    leaks = [c for c in health["capabilities"]
+             if "replace" in c and c.startswith(("workspace:", "op:"))]
+    check("浏览器整表兜底通道不在能力声明里（能力清单即事实）", not leaks, leaks)
 
     sections = [
         ("parity", section_parity),

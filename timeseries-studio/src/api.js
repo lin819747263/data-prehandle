@@ -44,6 +44,8 @@ export async function checkBackend() {
     state.backend.online = true
     state.backend.version = body.version || ''
     state.backend.capabilities = body.capabilities || []
+    // 后端逐个真编一次得到的导出可用性：null = 编得出来，字符串 = 失败原因
+    state.backend.exportCodecs = body.exportCodecs || {}
     state.backend.limits = body.limits || null
     state.backend.datasetDir = body.datasetDir || ''
     state.backend.error = ''
@@ -51,6 +53,7 @@ export async function checkBackend() {
     state.backend.online = false
     state.backend.version = ''
     state.backend.capabilities = []
+    state.backend.exportCodecs = {}
     state.backend.limits = null
     state.backend.datasetDir = ''
     state.backend.error = e.name === 'AbortError' ? '请求超时' : (e.message || '不可达')
@@ -193,6 +196,17 @@ export async function wsExport(wsId, format) {
   const name = utf8 ? decodeURIComponent(utf8[1]) : (plain ? plain[1] : `timeseries.${format}`)
   downloadBlob(blob, name, blob.type || 'application/octet-stream')
   return { bytes: blob.size, name }
+}
+
+// 另存为数据集：与 GET /export 同一条编码路径（后端 ws.export_dataframe() + exporter.encode），
+// 只是目的地换成服务端的数据集目录——明细一字节都不绕网络，回第一步就能点开这一份。
+export async function wsSaveAs(wsId, format, filename) {
+  const res = await withTimeout(`/api/ws/${enc(wsId)}/save-as?format=${enc(format)}`, {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ filename: filename || null })
+  }, LONG_TIMEOUT_MS)
+  if (!res.ok) throw await jsonError(res)
+  return res.json()
 }
 
 // 类别列的取值分布：整表计数在后端数，面板上的「预计新增 N 列」与 /op/feature-cat 同一份口径

@@ -219,8 +219,9 @@ export const state = reactive({
   masks: [],            // { key,label,startIdx,endIdx,startTime,endTime,onesCount }
   features: [],         // 第五步特征清单 { key,label,isNew }
   imputeSegAlgos: {},   // colKey -> { segIdx -> algo }
-  // 第四步的诊断结果：GET /quality 的整份回显（缺失统计 + 缺失段 + 重复计数）
-  quality: { wsId: '', version: -1, data: null, loading: false, error: '' },
+  // 第四步的诊断结果：GET /quality 的整份回显（缺失统计 + 缺失段 + 重复计数）。
+  // sig 是这份快照的失效签名（见 sourceSig），不是页码也不是时间戳——它由响应自己算出。
+  quality: { sig: '', version: -1, data: null, loading: false, error: '' },
   // 第五步节假日表：GET /holidays 的整份回显（生效日期 + 可选预设），配置存在后端 meta 上
   holidays: { wsId: '', version: -1, data: null, loading: false, error: '' },
   // 图表与刷选用的降采样曲线：GET /series（含每点的行位置 idx，掩码区间靠它换算）
@@ -235,13 +236,54 @@ export const state = reactive({
     saving: false, error: ''
   },
   busy: '',           // 后端在算 thing，界面据此禁用按钮
-  backend: { online: false, checking: true, version: '', capabilities: [], limits: null, error: '', checkedAt: '', datasetDir: '' }
+  backend: { online: false, checking: true, version: '', capabilities: [], exportCodecs: {}, limits: null, error: '', checkedAt: '', datasetDir: '' }
 })
 
 export function ds() { return datasets[state.currentKey] }
 
 export function touch() {
   state.dataVersion++
+}
+
+// ---- 失效粒度（C10）----
+// state.dataVersion 每与后端同步一次就 +1：翻一页、读一次整表统计都算，它回答的是
+// 「界面该重算了」，不回答「后端那份整表结果还成立吗」。拿它当失效依据，一次只读分页
+// 就能把第四步的整表缺失扫描连同抽稀曲线整摞重打一遍。
+// 后端给出的答案叫 valueEpoch：只有改动既有数值的命令推进它（新增列、改配置、掩码都不动），
+// 而 /quality 的口径正是「非特征列」（workspace.quality()）——所以整表诊断的签名是
+// 工作区 + 数值代 + 行数 + 非特征列集合，四者全等时这份快照必然还是当前帧的。
+// 这里读 dataVersion 只为让监听者醒过来：datasets 是普通对象，meta 换了新对象也通知不到 Vue。
+// 醒来后比的还是下面这个签名，翻一页那种「同步过但数值没变」照旧不会重打整表。
+export function sourceSig(d = ds()) {
+  void state.dataVersion
+  const m = d?.meta
+  if (!d?.wsId || !m) return ''
+  // 服务端没给 valueEpoch（老日志/老后端）时退回版本号：宁可多刷一次，不读旧数字
+  const epoch = m.valueEpoch ?? `v${m.version ?? -1}`
+  const keys = (m.columns || []).filter(c => !c.feature).map(c => c.key).sort().join(',')
+  return `${d.wsId}|${epoch}|${m.rowCount ?? 0}|${keys}`
+}
+
+// 整表诊断的缓存键由 /quality 的响应自己算出：它带着自己读的是哪一代数值、哪几列，
+// 请求在途时帧又被改了 → 两边签名对不上 → 这份结果不会被当成当前这一版的。
+function snapshotSig(snap) {
+  if (!snap?.wsId) return ''
+  const epoch = snap.valueEpoch ?? `v${snap.version ?? -1}`
+  const keys = (snap.columns || []).map(c => c.key).sort().join(',')
+  return `${snap.wsId}|${epoch}|${snap.rowCount ?? 0}|${keys}`
+}
+
+// 抽稀曲线的签名只看被画到的那几列：全是原始列时用数值代（第五步生成特征不动它们，
+// 曲线的数字必然还是那一份）；一旦选了特征列就退回整表版本号——重生成特征不推进数值代，
+// 只有 version 盯得住它，画出来的线不会停留在上一批特征上。
+function seriesSig(cols) {
+  const d = ds()
+  const m = d?.meta
+  if (!d?.wsId || !m) return ''
+  const byKey = new Map((m.columns || []).map(c => [c.key, c]))
+  const epoch = cols.some(k => byKey.get(k)?.feature)
+    ? `v${m.version ?? -1}` : (m.valueEpoch ?? `v${m.version ?? -1}`)
+  return `${d.wsId}|${epoch}|${m.rowCount ?? 0}|${[...cols].sort().join(',')}`
 }
 
 export function toast(type, msg) {
@@ -322,7 +364,7 @@ export function resetWorkspace() {
   state.features = []
   state.imputeSegAlgos = {}
   state.lastAnomaly = null
-  state.quality = { wsId: '', version: -1, data: null, loading: false, error: '' }
+  state.quality = { sig: '', version: -1, data: null, loading: false, error: '' }
   invalidateSeries()
 }
 
@@ -593,12 +635,14 @@ export const ANOMALY_NAMES = {
   iforest_sklearn: '孤立森林(sklearn)', expr: '自定义表达式'
 }
 
-// 诊断快照按 (wsId, version) 认人：任何一条加工命令都会让版本号前进，
-// 旧的缺失段行号从此指向另一颗帧，必须作废而不是继续拿去填补。
+// 诊断快照按 sourceSig 认人（工作区 + 数值代 + 行数 + 非特征列集合）：
+// 版本号每执行一条命令都会前进，可「缺失段还指向哪颗帧」只由数值代决定。
+// 生成特征、加掩码、改时间格式这些命令不动既有数值，旧快照的行号依然对得上；
+// 反过来，任何一次真正改值的清洗都会让签名变化，旧的缺失段行号从此作废而不是继续拿去填补。
 export function qualityData() {
   const q = state.quality
-  const d = ds()
-  if (!d?.wsId || q.wsId !== d.wsId || q.version !== (d.meta?.version ?? -1)) return null
+  const sig = sourceSig()
+  if (!sig || !q.data || q.sig !== sig) return null
   return q.data
 }
 
@@ -608,15 +652,17 @@ export async function loadQuality({ force = false } = {}) {
   const version = d.meta?.version ?? -1
   if (!force && qualityData()) return state.quality.data
   if (!requireBackend('质量诊断')) return null
-  state.quality = { wsId: d.wsId, version, data: null, loading: true, error: '' }
+  state.quality = { sig: '', version, data: null, loading: true, error: '' }
   try {
     const snap = await ws.wsQuality(d.wsId)
-    // 服务端会顺带回最新 meta（含异常缓存的新鲜度），版本在这里对不上就说明帧被改过
-    state.quality = { wsId: snap.wsId || d.wsId, version: snap.version ?? version, data: snap, loading: false, error: '' }
+    // 缓存键取服务端此刻这一份快照自己的签名（含它读到的 valueEpoch 与列集合）：
+    // 请求在途时帧又被改过，这个签名就不会等于界面上的 sourceSig()，结果自动不被认账。
+    state.quality = { sig: snapshotSig(snap), version: snap.version ?? version,
+                      data: snap, loading: false, error: '' }
     if ((snap.version ?? version) !== version) applyMeta(d, await ws.wsMeta(d.wsId))
     return snap
   } catch (e) {
-    state.quality = { wsId: d.wsId, version, data: null, loading: false, error: e.message }
+    state.quality = { sig: '', version, data: null, loading: false, error: e.message }
     toast('error', `质量诊断失败：${e.message}`)
     return null
   }
@@ -797,7 +843,8 @@ export async function loadSeries(keys, maxPoints = 1200) {
   const detTag = la && la.wsId === d.wsId ? `${la.version}:${la.stale ? 'stale' : 'fresh'}` : 'none'
   // 勾选顺序不该多打一次后端：列名排序后作键
   const colTag = [...cols].sort().join(',')
-  const key = `${d.wsId}|${d.meta?.version ?? -1}|${colTag}|${maxPoints}|${detTag}`
+  const key = `${seriesSig(cols)}|${maxPoints}|${detTag}`
+  if (!key) return null
   const hit = seriesCache.get(key)
   if (hit) {
     if (state.series.key !== key) state.series = { key, data: hit }
@@ -1206,7 +1253,10 @@ const catDistCache = new Map()
 export async function catColumnDistribution(selectedKeys, method) {
   const d = ds()
   if (!d?.wsId || selectedKeys.length === 0) return null
-  const cacheKey = `${d.wsId}|${selectedKeys.join(',')}|${method}|v${d.meta?.version ?? -1}`
+  // 类别列的取值分布只随数值代作废：第五步生成特征（不改既有数值）时这份分布照样成立，
+  // 用整表版本号作键会让每点一次「生成分组统计」都重打一次整表 value_counts。
+  const cacheKey = `${d.wsId}|${selectedKeys.sort().join(',')}|${method}|` +
+    `${d.meta?.valueEpoch ?? `v${d.meta?.version ?? -1}`}#${d.meta?.rowCount ?? 0}`
   const hit = catDistCache.get(cacheKey)
   if (hit) return hit
   try {
@@ -1223,7 +1273,7 @@ export async function catColumnDistribution(selectedKeys, method) {
       truncated: c.truncated
     }))
     const out = { rows, totalNewCols: r.totalNewCols, rowCount: r.rowCount }
-    if (catDistCache.size > 24) catDistCache.clear()   // 键里带版本号，每次改表都会添一条
+    if (catDistCache.size > 24) catDistCache.clear()   // 键里带数值代，每改一次值都会添一条
     catDistCache.set(cacheKey, out)
     return out
   } catch (e) {
@@ -2409,14 +2459,17 @@ async function restoreTo(version, verb) {
     const resp = await ws.wsRestore(d.wsId, target, d.page?.limit ?? PAGE_SIZE)
     applyMeta(d, resp.meta)
     applyPage(d, resp.page)
-    // restore 会清掉服务端的检测结果与诊断缓存：界面这两份投影必须同步作废，
-    // 否则第四步会拿着"上一版帧"的缺失段继续画图
+    // restore 会清掉服务端留存的检测结果：界面这份投影必须跟着作废，否则画的是上一版帧的异常点。
+    // 诊断快照与抽稀曲线不用整摞清空——它们按 sourceSig 认人，数值代没变（撤销的是一条只加列的
+    // 命令）时旧快照仍然成立，变了则下一次读取自动落空并重取，两种情况都不会读到错的数据。
     state.lastAnomaly = null
-    state.quality = { wsId: '', version: -1, data: null, loading: false, error: '' }
-    invalidateSeries()
     touch()
+    // 后端这次的真实代价：从哪一版起步、重放了几条命令（命中帧缓存时是 0 条，只换个指针）
+    const tr = resp.meta?.restoreTrace
+    const cost = tr ? (tr.cacheHit ? ` · 帧缓存命中，重放 0 条命令` :
+      ` · ${tr.replayedOps ? `从第 ${tr.fromVersion} 版起步` : '从载入帧起步'}，重放 ${tr.replayedOps} 条命令`) : ''
     toast('success', `${verb}${label ? `：${label}` : ''} · 工作区 ${d.wsId} 现在在第 ${resp.meta.version} 版` +
-      `（${resp.meta.rowCount.toLocaleString()} 行 × ${resp.meta.colCount} 列）`)
+      `（${resp.meta.rowCount.toLocaleString()} 行 × ${resp.meta.colCount} 列）${cost}`)
     return true
   } catch (e) {
     toast('error', `${verb}失败：${e.message}`)
@@ -2607,7 +2660,7 @@ export async function restoreSession() {
     state.busy = ''
   }
   state.lastAnomaly = null
-  state.quality = { wsId: '', version: -1, data: null, loading: false, error: '' }
+  state.quality = { sig: '', version: -1, data: null, loading: false, error: '' }
   invalidateSeries()
   // 数据集是上面那个循环才注册进来的，applySessionUi 跑在它之前，所以游标只能在循环之后指过去。
   // 早先那句 datasets[doc.currentKey] 守卫对目录/上传来的那一份（key 不在预置的 pv/load 里）

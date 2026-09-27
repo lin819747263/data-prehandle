@@ -33,8 +33,9 @@
   POST   /api/ws/{id}/op/exo-file    侧表按时间戳对齐挂列（只引用文件名 + sha，不重传文件）
   GET    /api/exo/presets            预设清单与公式变量表（界面下拉选项读它，不再自己抄）
   POST   /api/exo/inspect            侧表先看后挂：落盘并回表头 / 可用变量名 / 时间列候选
-  POST   /api/ws/{id}/restore        回到某个版本号（撤销的服务端实现）
+  POST   /api/ws/{id}/restore        回到某个版本号（撤销的服务端实现，从最近帧缓存就近重放）
   GET    /api/ws/{id}/export         宽表直出 csv/xlsx/parquet/feather（明细不过网络）
+  POST   /api/ws/{id}/save-as        把当前帧写进数据集目录，下次从第一步「最近打开」点开
   DELETE /api/ws/{id}                关闭工作区（同时删掉它的命令日志）
 
   GET    /api/session                读回上次会话：服务端逐个重建/核对其引用的工作区再返回
@@ -59,7 +60,7 @@ from .routers import session as session_router
 from .routers import workspace as workspace_router
 from .schemas import ExportRequest
 from .services import dataset_store, exo, explore, features, state_store
-from .services.exporter import build_export
+from .services.exporter import build_export, codec_status
 
 app = FastAPI(
     title="TimeSeries Studio Server",
@@ -82,6 +83,9 @@ app.include_router(session_router.router)
 
 @app.get("/api/health")
 def health() -> dict:
+    # 导出格式逐个真编一次再声明：装了 pandas 不代表装了 pyarrow / openpyxl，
+    # 界面「后端可用」徽章读这份能力清单，不能凭分支写了就报可用。
+    codecs = codec_status()
     return {
         "status": "ok",
         "version": __version__,
@@ -90,7 +94,7 @@ def health() -> dict:
             "workspace:columns", "workspace:overview", "workspace:restore",
             "workspace:quality", "workspace:series", "workspace:anomaly",
             "workspace:stats", "workspace:hist", "workspace:series-multi",
-            "workspace:first-complete", "workspace:export",
+            "workspace:first-complete", "workspace:export", "workspace:save-as",
             "op:time-format", "op:rename-column", "op:delete-column", "op:convert-unit",
             "op:derived-column", "op:resample", "op:split",
             "op:impute", "op:anomaly-repair", "op:mask-generate", "op:mask-delete",
@@ -101,18 +105,27 @@ def health() -> dict:
             "series-window:year-month-week-day", "series-period-paging",
             # 期⑤：外生变量三条来源全部在服务端生成，浏览器不再回传整列
             "op:exo-preset", "op:exo-formula", "op:exo-file", "exo:presets", "exo:inspect",
-            "export:parquet", "export:feather", "export:csv", "export:xlsx",
+            # 撤销不再整段重放：服务端留住最近几版帧，回退一步就是换个指针
+            "undo:frame-cache",
+            # 只有探测真编得出来的格式才进能力清单
+            *[f"export:{fmt}" for fmt, why in codecs.items() if why is None],
             "datasets:list",
             # 期⑤：历史与会话搬到服务端。reopen 是「进程里没有、按日志重放出来」，
             # 前端据此判断刷新/重启之后还能不能接着撤销
             "workspace:reopen", "workspace:list-durable",
             "session:get", "session:set", "session:clear",
         ],
+        # 每种格式探测时真实编码一次的结果：None = 编得出来，否则是失败原因。
+        # 界面据此把「后端可用」换成「缺依赖 · 原因」，而不是把用不了的按钮照原样点亮。
+        "exportCodecs": codecs,
         "limits": {
             "workspaces": workspace_router.ws_store.MAX_WORKSPACES,
             "cellsPerWorkspace": workspace_router.ws_store.MAX_CELLS,
             "maxPageRows": workspace_router.MAX_PAGE,
             "maxUploadBytes": schemas.MAX_UPLOAD_BYTES,
+            # 撤销重放的帧缓存上限：超过字节上限的大帧不留档，退回从载入帧整段重放
+            "snapshotVersions": workspace_router.ws_store.SNAP_MAX_VERSIONS,
+            "snapshotMaxBytes": workspace_router.ws_store.SNAP_MAX_BYTES,
             "featureColsPerOp": workspace_router.ws_store.MAX_FEATURE_COLS_PER_OP,
             "onehotLevels": workspace_router.ws_store.MAX_ONEHOT_LEVELS,
             "featureWindow": features.MAX_WINDOW,

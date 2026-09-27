@@ -3,7 +3,7 @@ import { ref, reactive, computed, onMounted, onActivated, onBeforeUnmount, nextT
 import * as echarts from 'echarts'
 import { ElMessageBox } from 'element-plus'
 import {
-  state, ds, switchStep, toast, requireBackend,
+  state, ds, switchStep, toast, requireBackend, sourceSig,
   loadQuality, qualityData, columnMissingStats, segmentsOf, segmentsTruncated,
   segAlgo, setSegAlgo, applySegmentImpute, applyAllSegmentsImpute, imputeAllAndDedupe,
   detectAnomalies, repairAnomalies, loadSeries,
@@ -414,7 +414,10 @@ onBeforeUnmount(() => {
   chart && chart.dispose()
   chart = null
 })
-watch(() => state.dataVersion, () => { if (state.currentStep === 4) refreshAll() })
+// 整页重算的开关不能是 state.dataVersion：翻一页、读一次整表统计都会碰它，
+// 那样每次只读访问都会把 /quality 与 /series 这两趟整表扫描重打一遍。
+// 只有「这一页读的那批数值真的变了」才重算——签名见 store.sourceSig。
+watch(() => sourceSig(), () => { if (state.currentStep === 4) refreshAll() })
 watch(tab, t => { if (t === 'mask') nextTick(() => chart && applyBrushCursor()) })
 watch(selectionKey, () => { ensureSeries().then(renderChart) })
 </script>

@@ -25,6 +25,15 @@ class ExportRequest(BaseModel):
     filename: Optional[str] = None
 
 
+class SaveAsRequest(BaseModel):
+    """另存为数据集：把服务端工作区当前帧写进数据集目录。
+
+    文件名留空则由后端用「工作区名 + 版本号」起名；重名时 dataset_store 追加时间戳，
+    绝不覆盖已有文件。
+    """
+    filename: Optional[str] = Field(None, description="不含扩展名的文件名，留空用工作区名 + 版本号")
+
+
 # ---------------- 第四步：清洗与异常 ----------------
 
 class ImputeTarget(BaseModel):

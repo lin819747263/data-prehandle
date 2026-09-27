@@ -6,6 +6,8 @@
 - 注册表 ws_id → Workspace（进程内，有条数与单元格上限，超量按最久未访问淘汰）；
 - 每次加工以"命令"形式记进 ops，当前帧 = base 帧按顺序重放，
   所以撤销不必存全量拷贝，回到版本号 v 就是重放 ops[:v]；
+  最近访问过的几版帧会留在内存里（见 Workspace._remember），重放从就近的一版起步，
+  于是"撤销一步"通常是换个指针而不是把整条历史再跑一遍；
 - 行数据只在浏览器留在当前页窗口（默认 50 行），统计量全部在后端算；
 - 命令日志同时落盘到 state 目录（`state_store`），所以撤销/重做的历史**跨页面刷新、
   跨后端重启**都还在：工作区被淘汰或服务端重启后，第一次访问那个 wsId 会按
@@ -36,6 +38,12 @@ MAX_WORKSPACES = 8
 MAX_CELLS = 5_000_000          # 单个工作区单元格上限（11000×40 是 44 万，留足余量）
 MAX_PAGE = 500                 # 单次行窗口上限
 DEFAULT_PAGE = 50
+# 撤销重放的帧缓存（见 Workspace._remember）：一颗帧的 dtype 字节数超过这个数就不留档，
+# 退回"从载入帧整段重放"的老行为；连同下面的版本条数上限，缓存不会变成第二份内存压力。
+SNAP_MAX_BYTES = 64 * 1024 * 1024
+SNAP_MAX_VERSIONS = 3
+# 重放跨这么多条命令以上时，在中途留一颗检查点：继续往前翻版本就不用每次从头重放
+SNAP_CHECKPOINT_GAP = 8
 
 _LOCK = threading.RLock()
 _REGISTRY: dict[str, "Workspace"] = {}
@@ -542,6 +550,11 @@ class Workspace:
     # 日志落盘失败只降级为「历史不跨重启」，不能让一条已经执行成功的命令假装报错返回：
     # 版本号已经涨了，此时回 4xx 会让界面与后端的版本对不上。失败原因记在这里，由 meta 透出去。
     log_error: str = ""
+    # 撤销重放的帧缓存：版本号 → {"df","meta","epoch","bytes"}，机制见 _remember 的说明。
+    snaps: dict = field(default_factory=dict)
+    snap_bytes: int = 0
+    # 最近一次 restore 的真实代价（从哪一版起步、重放了几条命令），界面与验收脚本读它。
+    restore_trace: dict = field(default_factory=dict)
 
     def __post_init__(self):
         self.df = self.base_df
@@ -650,6 +663,15 @@ class Workspace:
             "timeDetect": m.get("timeDetect"),
             "derivedCols": m.get("derivedCols", []),
             "version": self.version,
+            # valueEpoch = 到目前为止改动了既有数值的命令条数（新增列、只改配置的命令不推进它）。
+            # version 每执行一条命令都前进，所以「第④步的整表扫描要不要重来」不能看 version，
+            # 只能看这颗帧的数值有没有真的变过——界面据此把缓存的失效粒度收到后端这一份计数上。
+            "valueEpoch": self.value_epoch,
+            # 撤销重放用的帧缓存此刻装着哪几版：决定下一次撤销是从载入帧整段重放还是就近起步
+            "frameCache": {"versions": sorted(self.snaps), "bytes": self.snap_bytes,
+                           "maxVersions": SNAP_MAX_VERSIONS, "maxBytes": SNAP_MAX_BYTES},
+            # 上一次撤销/重做的真实代价（从哪一版起步、重放了几条命令），界面把它的数字念出来
+            "restoreTrace": dict(self.restore_trace) or None,
             "anomaly": self.anomaly_summary(),
             # 撤销/重做是服务端游标的属性：按钮能不能点、下一次叫什么，全部由这里给
             **self.history_view(),
@@ -762,7 +784,9 @@ class Workspace:
         snap = quality.quality_snapshot(
             self.df, [c for c in self.meta["columns"] if not c.get("feature")],
             self.time_col, self.time_labels())
-        return {"wsId": self.id, "version": self.version, **snap}
+        # valueEpoch 一起回：界面按「这份快照属于哪一代数值」缓存，而不是按版本号——
+        # 版本号每执行一条命令都前进（生成特征也前进），但那些命令一改这份快照的内容。
+        return {"wsId": self.id, "version": self.version, "valueEpoch": self.value_epoch, **snap}
 
     # ---- 异常检测缓存（检测改数据之外的第四步计算）----
     def anomaly_stale(self) -> bool:
@@ -796,7 +820,64 @@ class Workspace:
             return quality.detection_view(detection, False)
 
     # ---- 加工命令 ----
-    # ---- 加工命令 ----
+    # ---- 撤销重放的帧缓存 ----
+    # restore(v) 的朴素写法是「从载入帧重放 ops[:v]」：撤销一步也要把前面所有命令重跑一遍，
+    # 数据量一大就是 O(版本数 × 整帧)，这正是这次 Python 化要解决的开销。这里留住最近访问过的
+    # 几版帧，重放就近起步：
+    #   · apply() 不会就地改旧帧（新命令拿的是它的深拷贝），所以给「执行前那一版」留档零拷贝，
+    #     只是多握一个引用；撤销一步因此就是换个指针；
+    #   · 从缓存往回重放前先复制那一版，缓存自身永远干净；
+    #   · 长距离重放（≥ SNAP_CHECKPOINT_GAP 条）在中途补一颗检查点，继续往前翻不必再从头放；
+    #   · 只缓存够小的帧（按 dtype 字节数，见 SNAP_MAX_BYTES）：超大帧退回整段重放，
+    #     宁可慢也不能让缓存变成第二份内存压力。
+    @staticmethod
+    def _frame_bytes(frame: pd.DataFrame) -> int:
+        # deep=False：只按 dtype 求和，object 列会低估，但这是每条命令都要问一次的数字，不能贵
+        return int(frame.memory_usage(index=False, deep=False).sum())
+
+    def _remember(self, version: int, frame: pd.DataFrame, meta: dict, epoch: int,
+                  near: int | None = None) -> None:
+        size = self._frame_bytes(frame)
+        if size > SNAP_MAX_BYTES:
+            return
+        # 先摘再插 = 移到队尾：新摸到的那一版永远是最新的一份，淘汰时才不会被它自己挤掉
+        old = self.snaps.pop(version, None)
+        if old is not None:
+            self.snap_bytes -= old["bytes"]
+        # handler 会就地改 self.meta（rebuild_meta_columns），所以留档必须单独抄一份。
+        # 帧本身不抄：调用方要么给的是刚复制出来的私有帧，要么是没人再改的旧帧。
+        self.snaps[version] = {"df": frame, "meta": copy.deepcopy(meta), "epoch": epoch, "bytes": size}
+        self.snap_bytes += size
+        # near = 这一次围绕哪一版在忙。重放中途补检查点时游标还没挪过去，
+        # 拿旧游标算距离会把刚补的那颗当场淘汰掉（实测就会这样），所以由调用方指定。
+        self._trim_snaps(self.cursor if near is None else near)
+
+    def _trim_snaps(self, near: int) -> None:
+        """淘汰：离 `near` 最远的那一版先走。
+
+        撤销/重做一步通常就在游标 ±1 里，留着它才是热的那几颗；中途补的检查点离得远，
+        真要用时（翻很远）它的价值才体现出来，所以按"离参照版本的距离"淘汰而不是按插入顺序。
+        """
+        while len(self.snaps) > SNAP_MAX_VERSIONS or self.snap_bytes > SNAP_MAX_BYTES:
+            if not self.snaps:
+                return
+            # 距离最远的那版先走；同样远时摘旧的一版 —— 游标通常往前翻（重做），留着新的更划算
+            victim = max(self.snaps, key=lambda v: (abs(v - near), -v))
+            self.snap_bytes -= self.snaps.pop(victim)["bytes"]
+
+    def _snap_up_to(self, version: int) -> tuple[int, dict | None]:
+        """≤ version 里最靠近的那一版缓存（命令不可逆，重放只能往前走）。"""
+        candidates = [v for v in self.snaps if v <= version]
+        if not candidates:
+            return 0, None
+        src = max(candidates)
+        return src, self.snaps[src]
+
+    def _forget_snaps_after(self, version: int) -> None:
+        """回退后又执行新命令时，游标之后那段日志被截掉，属于它的那些帧缓存从此不再成立。"""
+        for v in [k for k in self.snaps if k > version]:
+            self.snap_bytes -= self.snaps.pop(v)["bytes"]
+
     def _execute(self, frame: pd.DataFrame, op: dict) -> tuple[pd.DataFrame, dict]:
         handler = _OPS.get(op["kind"])
         if handler is None:
@@ -816,9 +897,15 @@ class Workspace:
         """执行一条命令并记进 ops，返回 {result, version, meta}。"""
         with _LOCK:
             # 游标之后还留着「被撤销、等待重做」的那段日志：新命令会把当前帧改到另一条分支上，
-            # 那条尾巴从此不再成立，先截掉再记新的。
+            # 那条尾巴从此不再成立，先截掉再记新的（那几版的帧缓存也一起作废）。
             if self.cursor < len(self.ops):
                 del self.ops[self.cursor:]
+                self._forget_snaps_after(self.cursor)
+            prev_version, prev_frame, prev_epoch = self.cursor, self.df, self.value_epoch
+            # 旧帧接下来不会被任何人改动（新命令拿的是深拷贝），所以能零拷贝留档；
+            # 它的 meta 却会被就地改，要提前抄一份才配得上「执行前那一版」。
+            cacheable = self._frame_bytes(prev_frame) <= SNAP_MAX_BYTES
+            prev_meta = copy.deepcopy(self.meta) if cacheable else None
             frame, result = self._execute(self.df.copy(deep=True), op)
             self.df = frame
             # _valueChange：命令是否改动了既有数值。掩码列只是新增一列，行列位置不变，
@@ -840,6 +927,10 @@ class Workspace:
             self.updated_at = record["at"]
             if self.anomaly is not None and self.anomaly_stale():
                 self.anomaly["stale"] = True
+            # 两版都留：撤销一步直接换回执行前那颗帧，重做回来时同样不用重放
+            if cacheable:
+                self._remember(prev_version, prev_frame, prev_meta, prev_epoch)
+            self._remember(self.version, self.df, self.meta, self.value_epoch)
             # 先落盘再回 meta：logError 要一起带出去
             self.persist_log()
             result["version"] = self.version
@@ -847,7 +938,7 @@ class Workspace:
             return result
 
     def restore(self, version: int) -> dict:
-        """把当前帧重放到第 version 个版本：从 base 帧按顺序重放，不占额外内存。
+        """把当前帧重放到第 version 个版本：从最近的帧缓存起步，没有缓存才回到载入帧。
 
         必须可逆：撤销把游标往回挪、重做把它往回推，两种情况都从同一份日志重放，
         日志本身不截断（截断会让重做永远拿不到那一版，界面上就是一个报错的按钮）。
@@ -860,19 +951,50 @@ class Workspace:
         if version < 0 or version > len(self.ops):
             raise ValueError(f"版本号越界：{version}（日志共 {len(self.ops)} 条，当前第 {self.cursor} 版）")
         with _LOCK:
-            meta = copy.deepcopy(self.base_meta)
-            frame = self.base_df.copy(deep=True)
-            epoch = 0
-            keep_ops = self.ops[:version]
+            src_version, snap = self._snap_up_to(version)
             backup = (self.meta, self.df, self.value_epoch, self.cursor, self.anomaly)
-            self.meta, self.df, self.value_epoch = meta, frame, epoch
+            replayed = 0
+            checkpoint_at = None
+            checkpoint_laid = None
             try:
-                for o in keep_ops:
+                if snap is not None and src_version == version:
+                    # 命中：这一版的帧就在缓存里，换个指针，一条命令都不用重放。
+                    # meta 必须复制：下一次 apply 会就地改 self.meta，缓存那份要留着下次换回来。
+                    self.meta = copy.deepcopy(snap["meta"])
+                    self.df = snap["df"]
+                    self.value_epoch = snap["epoch"]
+                else:
+                    if snap is None:
+                        src_frame, src_meta, src_epoch = self.base_df, self.base_meta, 0
+                    else:
+                        src_frame, src_meta, src_epoch = snap["df"], snap["meta"], snap["epoch"]
+                    # 重放是就地改帧的，所以先把起步那一版复制出来；缓存与载入帧都不碰
+                    meta = copy.deepcopy(src_meta)
+                    frame = src_frame.copy(deep=True)
                     # handler 会就地改 self.meta（rebuild_meta_columns），所以重放期间先挂上草稿
-                    frame, result = self._execute(self.df, o)
-                    self.df = frame
-                    if result.get("_valueChange", True):
-                        self.value_epoch += 1
+                    self.meta, self.df, self.value_epoch = meta, frame, src_epoch
+                    gap = version - src_version
+                    # 长距离重放中途补一颗检查点：继续往前翻版本就不用再从头放一遍
+                    checkpoint_at = src_version + gap // 2 if gap >= SNAP_CHECKPOINT_GAP else None
+                    # 快到站的那几版顺手留档：连着往回撤销是最常见的动作，只存目的地的话
+                    # 下一步又要从载入帧整段重放，一路退到底就是 O(版本数²)
+                    tail_from = version - (SNAP_MAX_VERSIONS - 1)
+                    for o in self.ops[src_version:version]:
+                        frame, result = self._execute(self.df, o)
+                        self.df = frame
+                        replayed += 1
+                        if result.get("_valueChange", True):
+                            self.value_epoch += 1
+                        v_now = src_version + replayed
+                        if checkpoint_at == v_now:
+                            self._remember(checkpoint_at, self.df.copy(deep=True), self.meta,
+                                           self.value_epoch, near=version)
+                            checkpoint_laid = checkpoint_at
+                            checkpoint_at = None   # 一次重放只补一颗，别把缓存全吃在别人身上
+                        elif tail_from <= v_now < version:
+                            # 这一版之后还会被就地改，所以留档要自己抄一份
+                            self._remember(v_now, self.df.copy(deep=True), self.meta,
+                                           self.value_epoch, near=version)
             except Exception as exc:
                 self.meta, self.df, self.value_epoch, self.cursor, self.anomaly = backup
                 raise ValueError(f"重放到版本 {version} 失败，已回到原来的帧：{exc}") from exc
@@ -880,6 +1002,16 @@ class Workspace:
             # 检测索引是按某一颗帧算的，回退后一律要求重测（界面据此把结果标成失效）
             self.anomaly = None
             self.updated_at = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            self._remember(version, self.df, self.meta, self.value_epoch)
+            # 这一次撤销到底花了多少真功夫：命中缓存还是要重放、从哪一版起步
+            self.restore_trace = {
+                "requested": version, "fromVersion": src_version, "replayedOps": replayed,
+                # 命中 = 目的地那一版就在缓存里；从载入帧起步放回 0 条命令不算命中（那是本来就不用放）
+                "cacheHit": snap is not None and replayed == 0,
+                "fromBase": snap is None,
+                "checkpointAt": checkpoint_laid,
+                "cachedVersions": sorted(self.snaps), "snapBytes": self.snap_bytes,
+            }
             # 游标位置本身也是历史的一部分：重启后要回到同一版，靠的就是落盘的 cursor
             self.persist_log()
             return self.meta_view()

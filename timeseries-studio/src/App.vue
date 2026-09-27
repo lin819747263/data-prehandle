@@ -1,5 +1,5 @@
 <script setup>
-import { computed, ref, onMounted, onUnmounted } from 'vue'
+import { computed, ref, watch, onMounted, onUnmounted } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import {
   state, ds, touch, switchStep, toast, logAction, rowCount,
@@ -7,7 +7,7 @@ import {
   replayActionLog, clearImportedLog, generatePythonCode, visibleActionLog,
   undo, redo, initSession, restoreSession, clearSession
 } from './store'
-import { checkBackend, wsExport, API_BASE } from './api'
+import { checkBackend, wsExport, wsSaveAs, API_BASE } from './api'
 import Step1Load from './components/Step1Load.vue'
 import Step2Config from './components/Step2Config.vue'
 import Step3Explore from './components/Step3Explore.vue'
@@ -162,12 +162,31 @@ const EXPORT_FORMATS = { csv: 'CSV', xlsx: 'EXCEL', parquet: 'PARQUET', feather:
 const exportCols = computed(() => { void state.dataVersion; return ds()?.columns?.length || 0 })
 const exporting = ref('')
 
+// 后端逐个格式真编一次探测出来的结果（null = 编得出来，字符串 = 缺依赖之类的理由）。
+// 「后端可用」只能读这个，不能读「前端有这条分支」——本机没装 pyarrow 时 parquet 会 422。
+const codecReason = fmt => state.backend.online ? state.backend.exportCodecs[fmt] : '后端未连接'
+const canEncode = fmt => state.backend.online && state.backend.exportCodecs[fmt] === null
+const codecBadge = fmt => exporting.value === fmt ? '编码中…' : (canEncode(fmt) ? '后端可用' : '后端编不出')
+const codecTitle = fmt => canEncode(fmt) ? '后端已用一行的表真编过一次这个格式' : String(codecReason(fmt)).slice(0, 160)
+const saveFormats = computed(() => Object.fromEntries(
+  Object.entries(EXPORT_FORMATS).filter(([fmt]) => canEncode(fmt))))
+const missingFormats = computed(() => {
+  if (!state.backend.online) return []
+  return Object.entries(EXPORT_FORMATS)
+    .filter(([fmt]) => !canEncode(fmt))
+    .map(([fmt]) => ({ label: EXPORT_FORMATS[fmt], reason: String(codecReason(fmt)) }))
+})
+
 async function doExport(kind) {
   if (kind === 'py') { state.showCodeModal = true; state.showExportModal = false; return }
   if (!EXPORT_FORMATS[kind]) return
   if (exporting.value) return
   if (!state.backend.online) {
     toast('info', `导出需要后端在线（${API_BASE}）：宽表由服务端从工作区直出，浏览器端不再保留整表编码兜底`)
+    return
+  }
+  if (!canEncode(kind)) {
+    toast('warning', `后端编不出 ${EXPORT_FORMATS[kind]}：${codecReason(kind)}，换一种格式或补上依赖（parquet/feather 需要 pyarrow，xlsx 需要 openpyxl）`)
     return
   }
   const d = ds()
@@ -185,6 +204,53 @@ async function doExport(kind) {
     toast('error', `导出失败：${e.message}`)
   } finally {
     exporting.value = ''
+  }
+}
+
+// ---- 另存为数据集：同一条编码路径，目的地换成服务端的数据集目录 ----
+// 与上面的 doExport 共用 ws.export_dataframe()：存进目录的字节与浏览器下载到的字节同源，
+// 区别只是明细不绕网络 —— 第七步想拿这份结果当新数据的起点，回第一步点开就行。
+const saveName = ref('')
+const saveFmt = ref('csv')
+const saving = ref(false)
+// 存成功那句话要在模态里留着：toast 三秒就走，人还在这个框里，需要就地看到落到盘上的那个文件名
+const savedOk = ref('')
+watch(() => state.showExportModal, v => { if (v) savedOk.value = '' })
+// 只让用户选后端真编得出来的格式；默认值编不出来就换到第一个能用的
+watch(saveFormats, m => {
+  const keys = Object.keys(m)
+  if (keys.length && !keys.includes(saveFmt.value)) saveFmt.value = keys[0]
+}, { immediate: true })
+
+async function doSaveAsDataset() {
+  if (saving.value) return
+  if (!state.backend.online) {
+    toast('info', `另存为数据集需要后端在线（${API_BASE}）：宽表由服务端直接写进数据集目录，浏览器不持有整表`)
+    return
+  }
+  const d = ds()
+  if (!d?.wsId) { toast('warning', '还没有载入数据集'); return }
+  if (!canEncode(saveFmt.value)) {
+    toast('warning', `后端编不出 ${EXPORT_FORMATS[saveFmt.value]}：${codecReason(saveFmt.value)}`)
+    return
+  }
+  saving.value = true
+  try {
+    const r = await wsSaveAs(d.wsId, saveFmt.value, saveName.value.trim())
+    savedOk.value = `${r.filename} · ${r.sizeText} · ${r.rows.toLocaleString()} 行 × ${r.cols} 列` +
+      (r.renamed ? `（${r.proposed} 已存在，另存为新名）` : '')
+    toast('success', `已存进数据集目录：${r.filename} · ${r.sizeText} · ${r.rows.toLocaleString()} 行 × ${r.cols} 列` +
+      (r.renamed ? `（${r.proposed} 已存在，另存为新名）` : '') + ' · 回第一步「最近打开的数据集」可直接点开')
+    logAction(5, 'dataset', `另存为数据集（${EXPORT_FORMATS[saveFmt.value]}）`,
+      `${r.filename} · ${r.rows.toLocaleString()} 行 × ${r.cols} 列 · ${r.sizeText}` +
+      (r.renamed ? ` · 同名已存在，原名 ${r.proposed} 另存` : ''),
+      { type: 'save_as_dataset', format: r.format, filename: r.filename,
+        rows: r.rows, cols: r.cols, bytes: r.size, version: r.version })
+  } catch (e) {
+    savedOk.value = ''
+    toast('error', `另存为数据集失败：${e.message}`)
+  } finally {
+    saving.value = false
   }
 }
 
@@ -451,8 +517,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <span class="block text-xs font-bold text-slate-700">Parquet 列式归档 (.parquet)</span>
               <span class="block text-[11px] text-slate-400">snappy 压缩，含全部清洗结果与特征列</span>
             </span>
-            <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-600 border border-emerald-200 shrink-0">
-              <i class="fa-solid fa-circle-check mr-0.5"></i>{{ exporting === 'parquet' ? '编码中…' : '后端可用' }}
+            <span class="text-[10px] px-1.5 py-0.5 rounded shrink-0 border"
+                  :class="canEncode('parquet') ? 'bg-emerald-50 text-emerald-600 border-emerald-200' : 'bg-rose-50 text-rose-600 border-rose-200'"
+                  :title="codecTitle('parquet')">
+              <i class="fa-solid mr-0.5" :class="canEncode('parquet') ? 'fa-circle-check' : 'fa-triangle-exclamation'"></i>{{ codecBadge('parquet') }}
             </span>
           </button>
           <button @click="doExport('feather')" :disabled="exporting === 'feather'"
@@ -462,8 +530,10 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
               <span class="block text-xs font-bold text-slate-700">Feather 高速格式 (.feather)</span>
               <span class="block text-[11px] text-slate-400">读写最快，适合本地流水线中转</span>
             </span>
-            <span class="text-[10px] px-1.5 py-0.5 rounded bg-emerald-50 text-emerald-600 border border-emerald-200 shrink-0">
-              <i class="fa-solid fa-circle-check mr-0.5"></i>{{ exporting === 'feather' ? '编码中…' : '后端可用' }}
+            <span class="text-[10px] px-1.5 py-0.5 rounded shrink-0 border"
+                  :class="canEncode('feather') ? 'bg-emerald-50 text-emerald-600 border-emerald-200' : 'bg-rose-50 text-rose-600 border-rose-200'"
+                  :title="codecTitle('feather')">
+              <i class="fa-solid mr-0.5" :class="canEncode('feather') ? 'fa-circle-check' : 'fa-triangle-exclamation'"></i>{{ codecBadge('feather') }}
             </span>
           </button>
         </template>
@@ -474,6 +544,41 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <span class="block text-[11px] text-rose-500">后端未连接（{{ API_BASE }}）· 四种格式都要由服务端从工作区直出，浏览器端不再兜底编码</span>
           </span>
           <button @click="checkBackend()" class="text-[10px] px-2 py-1 rounded border border-slate-300 text-slate-500 hover:text-indigo-600 hover:border-indigo-300 shrink-0">重试</button>
+        </div>
+      </div>
+      <div class="px-5 pb-4">
+        <div class="rounded-lg border border-slate-200 bg-slate-50/70 p-3">
+          <div class="flex items-center gap-2 text-[11px] font-semibold text-slate-600">
+            <i class="fa-solid fa-folder-plus text-indigo-600"></i>
+            <span>不下载，直接存进数据集目录</span>
+          </div>
+          <div class="mt-1 text-[11px] text-slate-400 leading-snug">
+            与上面的导出同一条编码路径（后端工作区宽表直出），字节只落到服务端磁盘；
+            存完回第一步「最近打开的数据集」就能把这份结果当新数据点开。同名不覆盖，后端另起一个带时间戳的文件名。
+          </div>
+          <div class="mt-2.5 flex items-center gap-2">
+            <input v-model="saveName" type="text" spellcheck="false" :placeholder="`${dsName}_v${state.history.version || 0}（留空即用这个）`"
+                   class="min-w-0 flex-1 rounded-md border border-slate-200 bg-white px-2.5 py-1.5 text-[11px] text-slate-700 outline-none focus:border-indigo-400" />
+            <select v-model="saveFmt" class="rounded-md border border-slate-200 bg-white px-2 py-1.5 text-[11px] text-slate-600 outline-none focus:border-indigo-400 shrink-0">
+              <option v-for="(label, k) in saveFormats" :key="k" :value="k">{{ label }}</option>
+            </select>
+            <button @click="doSaveAsDataset" :disabled="saving || !state.backend.online"
+                    class="shrink-0 px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold disabled:opacity-60">
+              <i class="fa-solid fa-arrow-down-to-bracket mr-1"></i>{{ saving ? '写入中…' : '存为数据集' }}
+            </button>
+          </div>
+          <div v-if="savedOk" class="mt-2 flex items-start gap-1.5 text-[11px] text-emerald-700 leading-snug break-words">
+            <i class="fa-solid fa-circle-check mt-0.5 shrink-0"></i>
+            <span class="min-w-0">已写进服务端数据集目录：{{ savedOk }} —— 第一步「最近打开的数据集」列表刷新后就是这一份</span>
+          </div>
+          <!-- 后端编不出的格式从下拉里收起，并把探测到的整段原因写在原地说清楚，而不是让人点了才吃 422 -->
+          <div v-if="missingFormats.length" class="mt-2 space-y-1">
+            <div v-for="m in missingFormats" :key="m.label"
+                 class="flex items-start gap-1.5 text-[11px] text-rose-600 leading-snug break-words">
+              <i class="fa-solid fa-triangle-exclamation mt-0.5 shrink-0"></i>
+              <span class="min-w-0">{{ m.label }} 后端编不出 · {{ m.reason }}</span>
+            </div>
+          </div>
         </div>
       </div>
       <div class="px-5 py-3 bg-slate-50 border-t border-slate-200 text-[11px] text-slate-400">

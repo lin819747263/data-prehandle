@@ -15,12 +15,24 @@ const d = computed(() => { void state.dataVersion; return { ...ds() } })
 const limits = computed(() => state.backend.limits || {})
 const running = ref(false)
 // 一次只跑一个构建：连点两次会把同一批特征建第二遍（第二次只是「新增 0 列」，白跑一趟后端）
+// 两处分支都必须出声，否则界面上就是「点了没反应」：
+//   · 被闸门挡下来 → 说清为什么这一次没提交；
+//   · 构建没落成 → 说清表里没变（失败原因由 store 的 runOp 先弹一条，这里补结论）；
+//   返回值给调用方（commitHolidays 靠它决定要不要回填草稿），不再一律 undefined。
 async function runBuild(fn, onOk) {
-  if (running.value) return
+  if (running.value) {
+    toast('info', '上一次特征构建还在执行：等它跑完再提交，避免同一批列建两遍')
+    return false
+  }
   running.value = true
   try {
     const r = await fn()
-    if (r) onOk(r)
+    if (!r) {
+      toast('warning', '本次提交没有改动表里的任何列（原因见上一条提示）')
+      return false
+    }
+    onOk(r)
+    return true
   } finally {
     running.value = false
   }
@@ -53,18 +65,32 @@ const PIPE_CHIPS = [
 
 // 每张卡片自己那一族在表里已有几列：数的是后端列注册表上的 feature 标记，
 // 不是「上一次点按钮成功没有」——撤销、回放、换数据集都会让这个数变，卡片得跟着变。
-// lag_roll / diff_freq 是拆分前那一条命令留下的族名，老列仍算进对应的卡片里。
-const familyCount = computed(() => {
+// lag_roll / diff_freq 是拆分前那一条命令留下的族名，老列同样算进对应的卡片里。
+const familyTally = computed(() => {
   void state.dataVersion
   const m = {}
   d.value.columns.forEach(c => { if (c.feature) m[c.feature] = (m[c.feature] || 0) + 1 })
   return {
+    time: m.time || 0,
     lag: (m.lag || 0) + (m.lag_roll || 0),
     window: m.window || 0,
     diff: (m.diff || 0) + (m.diff_freq || 0),
-    fft: m.fft || 0
+    fft: m.fft || 0,
+    cat: m.cat || 0,
+    split: m.split || 0
   }
 })
+const familyCount = computed(() => familyTally.value)
+
+// 收尾那条横幅：列数取 meta.colCount（导出宽表就是这一份列数），各族特征数按注册表归族
+const colTotal = computed(() => {
+  void state.dataVersion
+  return d.value.meta?.colCount ?? d.value.columns.length
+})
+const BUILT_LABELS = [['时间', 'time'], ['滞后', 'lag'], ['窗口', 'window'],
+  ['差分', 'diff'], ['频域', 'fft'], ['编码', 'cat'], ['划分', 'split']]
+const builtFamilies = computed(() => BUILT_LABELS.map(([label, key]) => [label, familyTally.value[key] || 0]))
+const featureTotal = computed(() => builtFamilies.value.reduce((s, [, n]) => s + n, 0))
 
 // ---- Tab 1: 时间与日历特征 ----
 // 勾选集一律用 { key: bool } 映射：模板的 v-model="x[k]" 写的是对象属性，
@@ -417,7 +443,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
 </script>
 
 <template>
-  <section class="h-full p-4 flex flex-col gap-3 overflow-y-auto">
+  <section class="step-panel h-full p-4 flex flex-col gap-3 overflow-y-auto">
     <div v-if="!state.backend.online || running" class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
          :class="state.backend.online ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-rose-50 border-rose-200 text-rose-700'">
       <i class="fa-solid mt-0.5" :class="running ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
@@ -1099,11 +1125,30 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
       </div>
     </div>
 
-    <!-- 底部只留返回：Python Pipeline 与宽表导出统一走顶栏「导出处理结果」 -->
-    <div class="flex justify-between items-center shrink-0">
-      <button @click="switchStep(4)" class="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium">
-        <i class="fa-solid fa-arrow-left mr-1"></i>返回质量清洗
-      </button>
+    <!-- 本步的出口：这一页的产物就是那张宽表，所以收尾既给向前的动作（导出 / 存为数据集），
+         也把真正的交付物念出来。行数、列数、各族特征数全部取自 meta 与后端列注册表的当前值。 -->
+    <div class="flex items-center justify-between gap-3 shrink-0 rounded-xl border border-slate-200 bg-white px-3 py-2.5">
+      <div class="min-w-0 flex flex-wrap items-center gap-x-2 gap-y-1 text-[11px] text-slate-500">
+        <span class="font-semibold text-slate-700"><i class="fa-solid fa-cube text-emerald-600 mr-1"></i>本轮产出</span>
+        <span class="font-mono text-slate-700">{{ rowCount().toLocaleString() }} 行 × {{ colTotal }} 列</span>
+        <span class="text-slate-300">|</span>
+        <span>特征列 <b class="font-mono text-emerald-600">{{ featureTotal }}</b> 颗</span>
+        <span v-for="[label, n] in builtFamilies" :key="label"
+              class="px-1.5 py-0.5 rounded border font-mono"
+              :class="n ? 'border-emerald-200 bg-emerald-50 text-emerald-700' : 'border-slate-200 bg-slate-50 text-slate-400'">
+          {{ label }} {{ n }}
+        </span>
+        <span v-if="!featureTotal" class="text-amber-600">还没有生成任何特征列</span>
+      </div>
+      <div class="flex items-center gap-2 shrink-0">
+        <button @click="switchStep(4)" class="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium">
+          <i class="fa-solid fa-arrow-left mr-1"></i>返回质量清洗
+        </button>
+        <button @click="state.showExportModal = true" :disabled="!d.wsId"
+                class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold disabled:opacity-50">
+          导出结果 / 存为数据集<i class="fa-solid fa-arrow-right ml-1"></i>
+        </button>
+      </div>
     </div>
   </section>
 </template>
