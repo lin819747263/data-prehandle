@@ -99,6 +99,16 @@ export async function wsCreateFile(file, { persist = true, limit } = {}) {
   return res.json()
 }
 
+// 多文件合并导入：拼表与按时间排序都在后端做，浏览器把 N 份原始文件一次递过去
+export async function wsCreateFiles(files, { persist = true, limit } = {}) {
+  const fd = new FormData()
+  for (const f of files) fd.append('files', f, f.name)
+  const q = `?persist=${persist ? 'true' : 'false'}${limit ? `&limit=${limit}` : ''}`
+  const res = await withTimeout('/api/ws/merge', { method: 'POST', body: fd }, LONG_TIMEOUT_MS)
+  if (!res.ok) throw await jsonError(res)
+  return res.json()
+}
+
 export function wsOpenDataset(filename, limit) {
   return wsJson(`/api/ws/dataset${limit ? `?limit=${limit}` : ''}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
@@ -124,8 +134,10 @@ export function wsQuality(wsId) {
     .then(async (res) => { if (!res.ok) throw await jsonError(res); return res.json() })
 }
 
-// 多列共享一条抽稀时间轴，后端逐列带回缺失标记与异常覆盖层（整表不出后端）
-export function wsSeries(wsId, keys, points = 1200) {
+// 多列共享一条时间轴，后端逐列带回缺失标记与异常覆盖层（整表不出后端）。
+// points=0（默认）= 全量：整表每一行都画进折线，后端一个点都不抽；格子数超限时后端报 400 说明原因。
+// points>0 才走抽稀档，留给脚本对照用。
+export function wsSeries(wsId, keys, points = 0) {
   const q = `cols=${keys.map(enc).join(',')}&points=${points}`
   return withTimeout(`/api/ws/${enc(wsId)}/series?${q}`, {}, LONG_TIMEOUT_MS)
     .then(async (res) => { if (!res.ok) throw await jsonError(res); return res.json() })
@@ -144,6 +156,15 @@ export function wsAnomalyDetect(wsId, payload) {
 
 export function wsResamplePreview(wsId, targetMinutes) {
   return wsJson(`/api/ws/${enc(wsId)}/resample-preview?targetMinutes=${targetMinutes}`)
+}
+
+// 时间列判定：整列在 backend 真解析一次，浏览器只拿到命中率、解析数和三个样本
+// （一页样本推不出整表结论，所以这里绝不自己按页猜格式）。
+// srcFmt 是自动认不出时用户手填的**源**格式，只影响解析，不影响显示。
+export function wsTimeDetect(wsId, col, srcFmt) {
+  const q = new URLSearchParams({ col })
+  if (srcFmt) q.set('format', srcFmt)
+  return wsJson(`/api/ws/${enc(wsId)}/time-detect?${q}`)
 }
 
 // long：整表级算法（第五步的特征构建）在几十万格上要几十秒，不能被 20 秒的统一超时砍掉

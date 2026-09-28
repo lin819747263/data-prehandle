@@ -106,7 +106,15 @@ def save_bytes(filename: str, content: bytes) -> str:
     target = root / name
     if target.exists():
         stem, ext = Path(name).stem, Path(name).suffix
-        name = f"{stem}__{datetime.now():%Y%m%d_%H%M%S}{ext}"
+        stamp = f"{datetime.now():%Y%m%d_%H%M%S}"
+        candidate = f"{stem}__{stamp}{ext}"
+        # 一次合并导入里可能有两份同名文件落在同一秒：继续加序号，直到不覆盖已有文件。
+        # 合并帧的重建依赖"每份文件各自一个名字"，同名互相覆盖就等于把来源文件弄丢了。
+        k = 1
+        while (root / candidate).exists():
+            candidate = f"{stem}__{stamp}_{k}{ext}"
+            k += 1
+        name = candidate
         target = root / name
     target.write_bytes(content)
     return name

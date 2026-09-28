@@ -600,8 +600,8 @@ def main() -> int:
     check("回退版本后检测缓存被清空", back["meta"]["anomaly"] is None, back["meta"]["anomaly"])
     close_workspace(w)
 
-    # ---------- 8. 曲线 /series（多列）----------
-    print("\n== 8. GET /series：多列共享抽稀时间轴、原始行号与逐列覆盖层 ==")
+    # ---------- 8. 曲线 /series（多列，默认全量 + 可选抽稀档）----------
+    print("\n== 8. GET /series：多列共享时间轴（默认全量一行不抽）、原始行号与逐列覆盖层 ==")
     w = upload(probe_csv())["meta"]["wsId"]
     s = api("GET", f"/api/ws/{w}/series?cols=flow&points=20")
     sc = s["series"][0]
@@ -636,7 +636,48 @@ def main() -> int:
           and per_col["flow"]["anomalies"] == sc2["anomalies"],
           f"{sc2['anomalyCount']} vs {per_col['flow']['anomalyCount']}")
     check("曲线响应很小（明细不出后端）", len(json.dumps(s2)) < 16384, f"{len(json.dumps(s2))} 字节")
+
+    # ---- 全量档（界面第四步默认：points=0，折线一行不抽）----
+    f1 = api("GET", f"/api/ws/{w}/series?cols=flow&points=0")
+    f_default = api("GET", f"/api/ws/{w}/series?cols=flow")
+    check("不带 points 参数 = 全量档，与显式 points=0 同一份结果",
+          f_default == f1 and f1["decimated"] is False and f1["maxPoints"] is None,
+          f"{f1['points']} 点 / {f1['rowCount']} 行 · maxPoints={f1['maxPoints']}")
+    check("全量档点数 = 整表行数（页头那句「N 点 = N 行」要有依据）",
+          f1["points"] == f1["rowCount"] == len(f1["x"]) == len(f1["idx"]),
+          f"{f1['points']} 点 / {f1['rowCount']} 行")
+    check("全量档的轴就是整表行序（idx 为 0..行数-1，框选吸附到的即真实行号）",
+          f1["idx"] == list(range(f1["rowCount"])), f1["idx"])
+    fc = f1["series"][0]
+    col_flow = column_of(w, "flow")
+    bad = [i for i, v in enumerate(col_flow)
+           if (fc["y"][i] is None) != (v is None)
+           or (v is not None and not close_enough(fc["y"][i], v))]
+    check("全量档逐格等于整列真值（一格不抽、一格不改）", not bad, bad[:6])
+    check("全量档仍随响应给出两类覆盖层的每列预算（界面那句「画不全」要报真实数字）",
+          f1["overlayCaps"] == {"missingMarksPerCol": 80, "anomalyPointsPerCol": 4000},
+          f1["overlayCaps"])
+    check("全量档没有抽点，所以缺失虚线少画只可能是撞上每列上限（此表 5 格缺失，全画）",
+          len(fc["missingMarks"]) == fc["missingCount"] and fc["marksTruncated"] is False,
+          f"画 {len(fc['missingMarks'])}/{fc['missingCount']} 条 · 截断={fc['marksTruncated']}")
     close_workspace(w)
+
+    # 稀疏缺失（150/300 行）：折线仍给满 300 点，虚线只能撞上每列 80 条上限——这一条必须点亮截断
+    sparse_csv = "timestamp,gap\n" + "\n".join(
+        f"2024-06-01 {i // 60:02d}:{i % 60:02d}:00," + ("" if i % 2 else str(float(i)))
+        for i in range(300))
+    w2 = upload(sparse_csv, "sparse_gap.csv")["meta"]["wsId"]
+    f2 = api("GET", f"/api/ws/{w2}/series?cols=gap&points=0")
+    m2 = f2["series"][0]
+    check("稀疏缺失表：全量档折线仍是 300 点一行不抽",
+          f2["points"] == 300 and f2["decimated"] is False and len(m2["y"]) == 300,
+          f"{f2['points']} 点 / {f2['rowCount']} 行")
+    check("全量档下缺失虚线撞上每列 80 条上限，截断标志点亮（图不能自称画完了）",
+          m2["missingCount"] == 150 and len(m2["missingMarks"]) == 80 and m2["marksTruncated"] is True,
+          f"画 {len(m2['missingMarks'])}/{m2['missingCount']} 条 · 截断={m2['marksTruncated']}")
+    check("画出的虚线全都落在轴上（类目轴落不回去的标签宁可不画）",
+          all(t in f2["x"] for t in m2["missingMarks"]), m2["missingMarks"][:2])
+    close_workspace(w2)
 
     # ---------- 9. 掩码列 ----------
     print("\n== 9. 掩码：生成 / 删除 / 类型保留 ==")
@@ -807,9 +848,9 @@ def main() -> int:
     status, payload = call("GET", f"/api/ws/{bw}/series?cols=%E4%BC%A0%E6%84%9F%E5%99%A801,%E4%BC%A0%E6%84%9F%E5%99%A802&points=1200")
     bs = json.loads(payload.decode("utf-8"))
     b0 = bs["series"][0]
-    show("/series(2 列)", f"{(time.perf_counter()-t0)*1000:.0f} ms · {len(bs['x'])} 点 · 响应 "
+    show("/series(2 列·抽稀档 points=1200)", f"{(time.perf_counter()-t0)*1000:.0f} ms · {len(bs['x'])} 点 · 响应 "
          f"{len(payload)/1024:.1f} KiB · 覆盖层 {b0['anomalyCount']} 点（画 {len(b0['anomalies'])} 个）")
-    check("抽稀后点数远小于行数", len(bs["x"]) <= 1200 and len(bs["x"]) < bs["rowCount"] / 4,
+    check("显式抽稀档（points=1200）仍受上限约束、点数远小于行数", len(bs["x"]) <= 1200 and len(bs["x"]) < bs["rowCount"] / 4,
           f"{len(bs['x'])} / {bs['rowCount']}")
     check("每列都按同一条时间轴返回", all(len(m["y"]) == len(bs["x"]) for m in bs["series"])
           and len(bs["series"]) == 2, [m["col"] for m in bs["series"]])
@@ -838,7 +879,111 @@ def main() -> int:
               len(m["missingMarks"]) == len(na_rows & axis) == m["missingCount"] - len(na_rows - axis)
               and m["marksTruncated"] is (len(na_rows & axis) < m["missingCount"]),
               f"画 {len(m['missingMarks'])} 条 / 整列缺失 {m['missingCount']} 格 · 截断={m['marksTruncated']}")
+
+    # ---- 全量档（第四步界面默认：points=0，折线整表一行不抽）----
+    two = urllib.parse.quote("传感器01,传感器02")
+    t0 = time.perf_counter()
+    status, payload = call("GET", f"/api/ws/{bw}/series?cols={two}&points=0")
+    fbig = json.loads(payload.decode("utf-8"))
+    show("/series(2 列·全量档)", f"{(time.perf_counter()-t0)*1000:.0f} ms · {len(fbig['x']):,} 点 · 响应 "
+         f"{len(payload)/1024:.1f} KiB")
+    check("全量档在 11000 行大表上一行不抽（点数 = 行数、decimated 为假、maxPoints 为 null）",
+          fbig["decimated"] is False and fbig["maxPoints"] is None
+          and fbig["points"] == fbig["rowCount"] == len(fbig["x"]) == len(fbig["idx"]),
+          f"{fbig['points']:,} 点 / {fbig['rowCount']:,} 行")
+    check("全量档的轴就是整表行序（框选边界吸附到的即真实行号）",
+          fbig["idx"] == list(range(fbig["rowCount"])), fbig["idx"][:4])
+    mismatch = []
+    for m in fbig["series"]:
+        col = pd.to_numeric(ref[m["col"]], errors="coerce").to_numpy(dtype="float64")
+        if len(m["y"]) != col.size:
+            mismatch.append((m["col"], "长度不等")); continue
+        for i, v in enumerate(col):
+            got = m["y"][i]
+            if math.isnan(v):
+                if got is not None:
+                    mismatch.append((m["col"], i, got, None)); break
+            elif got is None or not close_enough(got, float(v)):
+                mismatch.append((m["col"], i, got, float(v))); break
+    check("全量档逐格等于 pandas 整列真值（11000 行 × 2 列，一格不抽、一格不改）",
+          not mismatch, mismatch[:4])
+    for m in fbig["series"]:
+        na_rows = int(pd.to_numeric(ref[m["col"]], errors="coerce").isna().sum())
+        check(f"全量档 {m['col']}：整列缺失 {na_rows} 格全部在轴上，虚线少画只可能是撞上每列 {fbig['overlayCaps']['missingMarksPerCol']} 条上限",
+              m["missingCount"] == na_rows
+              and len(m["missingMarks"]) == min(na_rows, fbig["overlayCaps"]["missingMarksPerCol"])
+              and m["marksTruncated"] is (na_rows > fbig["overlayCaps"]["missingMarksPerCol"]),
+              f"画 {len(m['missingMarks'])}/{m['missingCount']} 条 · 截断={m['marksTruncated']}")
+    check("全量档的异常覆盖层仍是每列预算（这一档没抽点，所以少画只可能来自预算）",
+          fbig["series"][0]["anomalyCount"] == b0["anomalyCount"]
+          and len(fbig["series"][0]["anomalies"]) == min(b0["anomalyCount"], fbig["overlayCaps"]["anomalyPointsPerCol"]),
+          f"{len(fbig['series'][0]['anomalies'])} 个 / 检出 {fbig['series'][0]['anomalyCount']} 个"
+          f" · 预算 {fbig['overlayCaps']['anomalyPointsPerCol']}")
+
+    float_all = [c["key"] for c in big["meta"]["columns"] if c["type"] == "float"]
+    t0 = time.perf_counter()
+    status, payload = call("GET", f"/api/ws/{bw}/series?cols={urllib.parse.quote(','.join(float_all))}&points=0")
+    fall = json.loads(payload.decode("utf-8")) if status < 400 else {}
+    show(f"/series(全部 {len(float_all)} 列·全量档)",
+         f"{(time.perf_counter()-t0)*1000:.0f} ms · {fall.get('points', 0):,} 点 × {len(float_all)} 列 · 响应 "
+         f"{len(payload)/1024/1024:.2f} MiB")
+    check(f"整表 {big['meta']['rowCount']:,} 行 × {len(float_all)} 数值列 = "
+          f"{big['meta']['rowCount'] * len(float_all):,} 格在上限内，全量档全选照样一行不抽",
+          status == 200 and fall.get("points") == fall.get("rowCount")
+          and all(len(m["y"]) == fall["points"] for m in fall["series"]),
+          f"{fall.get('points')} 点 · {status}")
+
+    # 叠满 39 列时异常散点会撞上每列预算（4000 ÷ 39 → 兜底 200），这一条必须点亮截断并报出真实总数
+    status, payload = call("POST", f"/api/ws/{bw}/anomaly-detect", {"algo": "expr", "expr": "v > -100000"})
+    ed = json.loads(payload.decode("utf-8"))["detection"]
+    check("表达式检测把每行的每个数值都判成异常（只为造出远超预算的覆盖层）",
+          status < 400 and ed["summary"]["totalAnomalies"] > 200 * len(float_all),
+          f"{ed['summary']['totalAnomalies']:,} 点 / {len(float_all)} 列")
+    fall2 = api("GET", f"/api/ws/{bw}/series?cols={urllib.parse.quote(','.join(float_all))}&points=0")
+    budget = fall2["overlayCaps"]["anomalyPointsPerCol"]
+    drawn = [len(m["anomalies"]) for m in fall2["series"]]
+    counts = [m["anomalyCount"] for m in fall2["series"]]
+    check(f"全量档折线仍是一行不抽，但异常散点撞上每列 {budget} 点预算：画到预算就停、截断点亮、总数照实报",
+          fall2["points"] == fall2["rowCount"] and budget == 200
+          and all(d == min(c, budget) for d, c in zip(drawn, counts))
+          and all(m["anomaliesTruncated"] is True for m in fall2["series"]),
+          f"共画 {sum(drawn):,} 个 / 检出 {sum(counts):,} 个 · 预算 {budget}")
     close_workspace(bw)
+
+    # ---------- 11b. 全量档的格子数上限：超了必须报错，不许偷偷抽点 ----------
+    print("\n== 11b. 第四步全量档撞上格子数上限 ==")
+    probe_path = ROOT / "dataset" / "zz_series_full_guard_probe.csv"
+    rows, ncols = 31_000, 20            # 62 万格 > 60 万上限
+    if probe_path.exists():
+        probe_path.unlink()
+    try:
+        with probe_path.open("w", encoding="utf-8") as f:
+            f.write("采集时刻," + ",".join(f"c{i}" for i in range(ncols)) + "\n")
+            for r in range(rows):
+                f.write("2024-01-01 {:02d}:{:02d}:00,".format(r // 60 % 24, r % 60)
+                        + ",".join(f"{(r + i) % 97}.5" for i in range(ncols)) + "\n")
+        gw = upload(probe_path.read_text(encoding="utf-8"), "zz_series_full_guard_probe.csv")["meta"]["wsId"]
+        all_cols = urllib.parse.quote(",".join(f"c{i}" for i in range(ncols)))
+        st, pl = call("GET", f"/api/ws/{gw}/series?cols={all_cols}&points=0")
+        gd = json.loads(pl.decode("utf-8", "replace"))
+        detail = str(gd.get("detail", ""))
+        check("撞上上限的 31000 行 × 20 列全量档报 400（不是偷偷抽点）", st == 400, f"{st} · {detail[:90]}")
+        check("报错里点名行数、列数、格子数与上限，并给出可执行的收窄办法",
+              all(s in detail for s in ("31,000", "20", "620,000", "600,000"))
+              and "减少绘图列" in detail and "最多画 19 列" in detail, detail[:200])
+        st2, pl2 = call("GET", f"/api/ws/{gw}/series?cols=c0,c1&points=0")
+        g2 = json.loads(pl2.decode("utf-8"))
+        check("同一份表只画 2 列（6.2 万格）时全量档照样给满 31000 点",
+              st2 == 200 and g2["points"] == rows and g2["decimated"] is False,
+              f"{g2.get('points')} 点 / {rows:,} 行")
+        st3, pl3 = call("GET", f"/api/ws/{gw}/series?cols={all_cols}&points=3000")
+        g3 = json.loads(pl3.decode("utf-8"))
+        check("撞上上限的只有全量档：抽稀档同表 20 列照样给到点数上限",
+              st3 == 200 and g3["decimated"] is True and g3["points"] <= 3000,
+              f"{g3.get('points')} 点 · 上限 {g3.get('maxPoints')}")
+        close_workspace(gw)
+    finally:
+        probe_path.unlink(missing_ok=True)
 
     print("\n== 结果 ==")
     if FAILURES:

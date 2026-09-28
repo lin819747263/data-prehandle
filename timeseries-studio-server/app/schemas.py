@@ -218,6 +218,16 @@ class TimeFormatRequest(BaseModel):
     customFormat: Optional[str] = None
 
 
+class SetTimeColRequest(BaseModel):
+    """指定哪一列是时间列：服务端按整列真解析一次，解析不动就直接拒绝这条请求。
+
+    format/customFormat 可选：自动识别认不出时，调用方把手写的源格式带进来再试一次。
+    """
+    key: str = Field(..., min_length=1)
+    format: Optional[str] = None
+    customFormat: Optional[str] = None
+
+
 class ResampleRequest(BaseModel):
     targetMinutes: int = Field(..., ge=1, le=1440)
     method: Literal["mean", "sum", "first", "interpolate"] = "mean"

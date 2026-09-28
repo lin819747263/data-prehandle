@@ -10,8 +10,10 @@
 - 直方图固定 25 桶、桶宽 (max-min)/25，全列同值时桶宽退化为 1，末值并入最后一桶；
 - 窗口均值降采样沿用的是旧浏览器实现：步长 4、只对区间内的有效值求平均、结果 parseFloat(x.toFixed(2))。
 
-曲线为什么必须抽稀：叠加曲线原先把整表的每一行都送进浏览器（11000 行 × 12 列就是 13 万个数），
-数据量一大光 JSON 就几 MB。现在由后端按点数上限抽稀，并如实回说抽了多少。
+曲线为什么必须降采样：叠加曲线原先把整表的每一行都送进浏览器（11000 行 × 12 列就是 13 万个数），
+数据量一大光 JSON 就几 MB。现在由后端按点数上限降采样（默认 LTTB），并如实回说抽了多少；
+「全量」这一档例外——它把窗口内每一行都送回，一个点都不抽，格子数超过上限时直接报错而不偷偷抽点。
+第四步的质量曲线折线默认就是这一档（全量），只有覆盖层仍受每列预算约束，见 series_quality。
 """
 from __future__ import annotations
 
@@ -27,8 +29,10 @@ DEFAULT_POINTS = 3000
 MAX_POINTS = 6000                 # 与第④期曲线同一上限（quality.MAX_ENVELOPE_POINTS）
 MEAN_WINDOW_TRIGGER = 500         # 旧实现：行数 > 500 才做窗口均值
 MEAN_STEP = 4
-MIN_COLUMN_BUDGET = 200           # 抽稀时单列至少保留这么多点，否则叠十几列就只剩噪声
-SERIES_MODES = ("raw", "extremes", "mean")
+MIN_COLUMN_BUDGET = 200           # 降采样时单列至少保留这么多点，否则叠十几列就只剩噪声
+FULL_RAW_MAX_VALUES = 600_000     # 「全量」一次回传的格子数上限（行 × 列）：超了就明确报错，绝不偷偷抽点
+SERIES_MODES = ("raw", "extremes", "mean", "lttb")
+DEFAULT_MODE = "lttb"
 # 第三步的时间窗口档位：按自然周期筛行，并且能在这些周期之间左右翻页（offset）。
 # 不是「最近 N 天」也不是「按行数估算的百分比」——界面上写的窗口必须与后端筛的行同源。
 SPANS = ("all", "year", "month", "week", "day")
@@ -120,6 +124,63 @@ def _stride(positions: list[int], cap: int) -> list[int]:
     return kept
 
 
+def _fill_nan(arr: np.ndarray) -> tuple[np.ndarray, float]:
+    """缺失值代入本列有效均值得到一份纯数值序列，并给出极差（全列同值或全缺失时极差取 1）。
+
+    LTTB 靠三角形面积选点，面积一旦碰上 NaN 整段就塌成不可比较；用均值代入只影响"选哪一行"，
+    回传给画图的取值仍是原始数组，缺失行照旧是 null —— 降采样不该把空洞抹平成直线。
+    """
+    valid = arr[~np.isnan(arr)]
+    filler = float(valid.mean()) if valid.size else 0.0
+    filled = np.where(np.isnan(arr), filler, arr)
+    span = (float(valid.max()) - float(valid.min())) if valid.size else 0.0
+    return filled, (span or 1.0)
+
+
+def lttb_positions(arrays: list[np.ndarray], threshold: int) -> list[int]:
+    """LTTB（最大三角形三桶）降采样：把 n 个点降到 threshold 个，尽量保住折线的视觉形态。
+
+    桶边界与叉积面积按 Steinarsson 的原始定义实现（见 scripts/verify_step3_downsample.py 里
+    那份纯 JS 参照实现，单列时逐点比对）。多列共用一条时间轴时，每个桶取的是
+    **各列归一化面积之和**最大的那一行：面积除以该列极差，量纲不同的列才能相加，
+    而且这样选出的点不取决于用户先勾了哪一列（按首列选点会让后勾的列的尖峰随机消失）。
+    单列时归一化只是一个常数因子，与标准 LTTB 逐点相同。
+    """
+    n = min((int(a.size) for a in arrays), default=0)
+    t = int(threshold)
+    if n <= t or t < 3:
+        return list(range(n))
+    prepared = [_fill_nan(a) for a in arrays]
+    filled = np.vstack([p[0] for p in prepared])          # k × n
+    norms = np.array([p[1] for p in prepared], dtype=float)
+    xs = np.arange(n, dtype=float)
+
+    keep = [0]
+    a = 0
+    every = (n - 2) / (t - 2)
+    for i in range(t - 2):
+        cur_s = int(i * every) + 1
+        cur_e = min(int((i + 1) * every) + 1, n)
+        nxt_s = cur_e
+        nxt_e = min(int((i + 2) * every) + 1, n)
+        if nxt_e <= nxt_s:
+            nxt_e = min(nxt_s + 1, n)
+        if cur_e <= cur_s or nxt_e <= nxt_s or cur_s >= n:
+            break
+        avg_x = float(xs[nxt_s:nxt_e].mean())
+        avg_y = filled[:, nxt_s:nxt_e].mean(axis=1)       # 每列下一桶的均值点
+        left_x = float(a)
+        left_y = filled[:, a]
+        idx = xs[cur_s:cur_e]
+        areas = np.abs((left_x - avg_x) * (filled[:, cur_s:cur_e] - left_y[:, None])
+                       - (left_x - idx[None, :]) * (avg_y - left_y)[:, None])
+        score = (areas / norms[:, None]).sum(axis=0)
+        a = cur_s + int(np.argmax(score))                 # 并列取靠前的那一行（与 > 比较同效）
+        keep.append(a)
+    keep.append(n - 1)
+    return keep
+
+
 def _mean_chunks(arr: np.ndarray, positions: list[int], step: int) -> list:
     """每个窗口取区间内**有效值**的算术平均，空窗口给 None；平均后按 parseFloat(x.toFixed(2)) 舍入。"""
     out = []
@@ -206,14 +267,16 @@ def resolve_window(ts: pd.Series | None, span: str, offset: int = 0) -> tuple[np
 
 
 def series_multi(frame: pd.DataFrame, keys: list[str], labels: list[str],
-                 mode: str = "extremes", points: int = DEFAULT_POINTS,
+                 mode: str = DEFAULT_MODE, points: int = DEFAULT_POINTS,
                  labels_by_key: dict[str, str] | None = None,
                  ts: pd.Series | None = None, span: str = "all", offset: int = 0) -> dict:
-    """多列叠加曲线：共享一份时间轴，每列一条抽稀后的序列，抽稀只在 span 窗口内做。
+    """多列叠加曲线：共享一份时间轴，每列一条降采样后的序列，降采样只在 span 窗口内做。
 
-    - raw      全量点（窗口内行数超过 points 时等距抽稀，decimated 会说明）
+    - raw      全量：窗口内每一行都送回，**不做任何抽取**（格子数超过 FULL_RAW_MAX_VALUES 时直接报错，
+               而不是偷偷抽点——一抽点，界面上写的「全量」就成了假话）
     - extremes 每列各取桶内极值/缺失端点，再取并集（尖峰不会被抽掉，同 quality.envelope）
     - mean     每 MEAN_STEP 行取窗口均值（旧界面「窗口均值降采样」那一档）
+    - lttb     LTTB 三角形面积降采样（默认）：点数按上限摊到各桶，形态起伏最保真
 
     span 与 offset 决定取哪段行（见 resolve_window）：窗口内的点数上限与整表同值，所以「看一天」
     拿到的是这一天自己的 3000 个点，而不是整年 3000 个点里漏下的几颗。
@@ -231,13 +294,20 @@ def series_multi(frame: pd.DataFrame, keys: list[str], labels: list[str],
     step = 1
     if m == 0:
         local: list[int] = []
+    elif mode == "raw":
+        values = m * len(keys)
+        if values > FULL_RAW_MAX_VALUES:
+            raise ValueError(
+                f"全量模式要送回 {m:,} 行 × {len(keys)} 列 = {values:,} 个格子，"
+                f"超过单次上限 {FULL_RAW_MAX_VALUES:,}；请把时间窗口收窄到更小的周期，或改用降采样方式")
+        local = list(range(m))
     elif mode == "mean":
         step = MEAN_STEP if m > MEAN_WINDOW_TRIGGER else 1
         local = list(range(0, m, step))
-    elif mode == "raw":
-        local = _stride(list(range(m)), cap)
-    else:
+    elif mode == "extremes":
         local = _shared_positions(sub, keys, cap)
+    else:
+        local = lttb_positions([sub[key] for key in keys], cap)
 
     series = []
     for key in keys:
@@ -253,7 +323,7 @@ def series_multi(frame: pd.DataFrame, keys: list[str], labels: list[str],
     return {
         "mode": mode, "rowCount": n, "points": len(local),
         "windowRows": m, "window": window,
-        "windowStep": step, "maxPoints": cap,
+        "windowStep": step, "maxPoints": None if mode == "raw" else cap,
         "decimated": len(local) < m,
         "x": [labels[i] if i < len(labels) else str(i) for i in idx],
         "idx": idx,
@@ -268,21 +338,39 @@ def _label_at(labels: list, i: int) -> str:
 
 
 def series_quality(frame: pd.DataFrame, keys: list[str], labels: list[str],
-                   points: int = quality.MAX_ENVELOPE_POINTS,
+                   points: int = 0,
                    labels_by_key: dict[str, str] | None = None,
                    detection: dict | None = None, stale: bool = False) -> dict:
     """第四步的多列质量曲线：与叠加曲线同一套取点，另外带每列的缺失标记与异常覆盖层。
 
+    - points = 0（默认，全量）：整表每一行都送回折线，**一个点都不抽**。格子数（行 × 列）超过
+      FULL_RAW_MAX_VALUES 时直接报错，而不是偷偷抽点——一抽点，界面上写的「全量」就成了假话。
+    - points > 0：按该上限抽稀（与第三步 extremes 档同一套取点），供脚本与旧调用方使用。
+
     与 series_multi 的区别只在「如实说明画不出来的部分」：折线的 markLine 与 scatter 都按时间
     标签匹配类目轴，抽稀后不在轴上的标签根本落不回去，所以这里只回能落到轴上的标记，
     同时把整列的真实缺失数/异常数与截断标志一起给出，界面不能说「图上没有」就是「数据里没有」。
+    折线走全量后仍少画的只有两类覆盖层：缺失虚线每列 MAX_MISSING_MARKS 条、
+    异常散点每列 overlay_budget 个——那是渲染与 JSON 的预算，不是抽点。
     """
     if not keys:
         raise ValueError("没有要绘制的列")
     arrays = _float_arrays(frame, keys)
     n = int(frame.shape[0])
-    cap = max(20, min(int(points), MAX_POINTS))
-    positions = _shared_positions(arrays, keys, cap) if n else []
+    requested = int(points or 0)
+    full = requested <= 0
+    cap = None if full else max(20, min(requested, MAX_POINTS))
+    if full:
+        values = n * len(keys)
+        if values > FULL_RAW_MAX_VALUES:
+            # 上限是按格子数（行 × 列）算的，所以能直接告诉界面这张表一次最多画几列——
+            # 第四步没有降采样开关，用户看得懂的补救动作只有「少勾几列」。
+            raise ValueError(
+                f"全量曲线要送回 {n:,} 行 × {len(keys)} 列 = {values:,} 个格子，"
+                f"超过单次上限 {FULL_RAW_MAX_VALUES:,}：这张表一次最多画 {FULL_RAW_MAX_VALUES // n} 列，请减少绘图列")
+        positions = list(range(n))
+    else:
+        positions = _shared_positions(arrays, keys, cap) if n else []
     on_axis = np.zeros(n, dtype=bool)
     on_axis[positions] = True
     # 覆盖层的预算按列数分摊：叠十几列时 4000 点 × 列数 会把响应撑到几 MB
@@ -319,6 +407,9 @@ def series_quality(frame: pd.DataFrame, keys: list[str], labels: list[str],
     return {
         "rowCount": n, "points": len(positions), "maxPoints": cap,
         "decimated": len(positions) < n,
+        # 覆盖层的每列预算随响应给出：界面那句「画不全」要报真实数字，不能自己写死
+        "overlayCaps": {"missingMarksPerCol": quality.MAX_MISSING_MARKS,
+                        "anomalyPointsPerCol": overlay_budget},
         "x": [_label_at(labels, i) for i in positions],
         "idx": list(positions),
         "anomaly": None if not detection else {

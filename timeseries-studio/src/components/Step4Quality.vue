@@ -39,7 +39,7 @@ const TAB_COLORS = {
   mask: 'border-teal-500 text-teal-700 bg-white'
 }
 
-// ============ 图表（服务端抽稀曲线，多列共享一条时间轴）============
+// ============ 图表（服务端整表回传的全量曲线，多列共享一条时间轴）============
 const COLORS = ['#4f46e5', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#06b6d4', '#ec4899', '#84cc16', '#f97316', '#6366f1', '#14b8a6', '#e11d48']
 const colorOf = i => COLORS[i % COLORS.length]
 // 颜色按「这一列在所有数值列里的位置」定，勾掉中间一列时其余列的颜色不会串位
@@ -53,6 +53,11 @@ let chart = null
 const brushActive = ref(false)
 const brushRange = ref(null)
 const sd = ref(null)          // 当前勾选列的 /series 响应：{ x, idx, series:[{col,y,missingMarks,anomalies…}] }
+// 曲线取数失败（例如全量档撞上后端格子数上限）：图会空，原因得写在页面上
+const seriesError = computed(() => {
+  void state.dataVersion
+  return state.series.error || ''
+})
 
 const floatCols = computed(() => d.value.columns.filter(c => c.type === 'float'))
 const selected = reactive(new Set())
@@ -75,9 +80,16 @@ const selectedCols = computed(() => floatCols.value.filter(c => selected.has(c.k
 // 只有列集合真的变了才重新取数（勾选顺序不同不该多打一次后端）
 const selectionKey = computed(() => selectedCols.value.map(c => c.key).join('|'))
 
-// 覆盖层/虚线画不全时逐列汇总：抽稀抽掉的与超出预算的都算「图上没有、数据里有」。
+// 覆盖层/虚线画不全时逐列汇总：超出每列预算（以及后端真抽了点时的抽稀）都算「图上没有、数据里有」。
 // 叠 39 列时逐列报会把这一行撑成十几屏，所以点名前 NOTE_COLS 列，但总数一律给全。
 const NOTE_COLS = 5
+// 折线默认全量（后端 points=0，一行不抽）；只有后端不认全量档、退回抽稀时 decimated 才为真，
+// 界面那句「画不全的原因」必须跟着它写，不许在整表都画出来的图上还提降采样。
+const decimated = computed(() => !!(sd.value && sd.value.decimated))
+function capNote(field, fallback) {
+  const caps = sd.value && sd.value.overlayCaps
+  return caps && typeof caps[field] === 'number' ? caps[field] : fallback
+}
 function summarizeNote(rows) {
   const bad = rows.filter(r => r.truncated)
   if (!bad.length) return null
@@ -107,6 +119,14 @@ const marksNote = computed(() => {
   return summarizeNote(rows)
 })
 const staleChart = computed(() => !!(sd.value && sd.value.anomaly && sd.value.anomaly.stale))
+// 页头那句点数说明必须与后端回的一句话对上：全量就说「N 行 = N 点」，抽了才报抽稀。
+const seriesChip = computed(() => {
+  const s = sd.value
+  if (!s) return ''
+  const cols = selectedCols.value.length
+  if (s.decimated) return `服务端降采样 ${s.x.length.toLocaleString()} 点 / ${s.rowCount.toLocaleString()} 行 · ${cols} 列`
+  return `全量 ${s.x.length.toLocaleString()} 点 = ${s.rowCount.toLocaleString()} 行 · ${cols} 列（服务端整表回传，一个点都不抽）`
+})
 
 async function renderChart() {
   if (!chart) return
@@ -216,7 +236,8 @@ async function refreshAll() {
 
 async function ensureSeries() {
   const keys = selectedCols.value.map(c => c.key)
-  sd.value = keys.length ? await loadSeries(keys, 1200) : null
+  // 0 = 全量档：后端把整表每一行都送回折线，一个点都不抽
+  sd.value = keys.length ? await loadSeries(keys, 0) : null
 }
 
 // ============ Tab1 缺失与重复 ============
@@ -430,7 +451,7 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
       <i class="fa-solid mt-0.5" :class="diagError ? 'fa-triangle-exclamation' : 'fa-spinner fa-spin'"></i>
       <div class="min-w-0">
         <div class="font-semibold">{{ diagError ? '本步为只读：下方数字尚未从后端取到' : '正在从后端读取质量诊断…' }}</div>
-        <div class="mt-0.5 leading-snug opacity-80">{{ diagError || `${d.wsId} · 缺失扫描与抽稀曲线由服务端计算` }}</div>
+        <div class="mt-0.5 leading-snug opacity-80">{{ diagError || `${d.wsId} · 缺失扫描与全量曲线（每行一个点）由服务端计算` }}</div>
       </div>
       <button v-if="diagError" @click="state.backend.online ? refreshAll() : checkBackend().then(refreshAll)"
               class="ml-auto shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
@@ -444,7 +465,7 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
           <span class="text-[11px] bg-rose-50 text-rose-600 border border-rose-200 px-2 py-0.5 rounded-full font-medium truncate">{{ summaryPill }}</span>
         </div>
         <div class="flex items-center gap-2 shrink-0">
-          <span v-if="sd" class="text-[10px] text-slate-400">服务端抽稀 {{ sd.x.length.toLocaleString() }} 点 / {{ sd.rowCount.toLocaleString() }} 行 · {{ selectedCols.length }} 列</span>
+          <span v-if="sd" class="text-[10px] text-slate-400">{{ seriesChip }}</span>
           <button @click="toggleBrush"
                   class="px-2.5 py-1 text-xs rounded border font-medium flex items-center transition-colors"
                   :class="brushActive ? 'border-rose-400 bg-rose-50 text-rose-700' : 'border-indigo-300 text-indigo-700 hover:bg-indigo-50'">
@@ -471,13 +492,18 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
         <span v-if="!floatCols.length" class="text-[10px] text-slate-400">没有数值列可画</span>
       </div>
 
+      <div v-if="seriesError" class="px-3 pt-0.5 text-[10px] text-rose-600 shrink-0">
+        <i class="fa-solid fa-triangle-exclamation mr-1"></i>曲线没取到，图上现在没有任何点：{{ seriesError }}
+      </div>
       <div v-if="overlayNote" class="px-3 pt-0.5 text-[10px] text-amber-600 shrink-0">
-        <i class="fa-solid fa-circle-exclamation mr-1"></i>有列的异常点没画全（被抽稀抽掉、或超出每列覆盖层预算）：
+        <i class="fa-solid fa-circle-exclamation mr-1"></i>折线画的是整表每行，但有列的异常散点没画全
+        （{{ decimated ? '被降采样抽掉、或' : '' }}超出每列 {{ capNote('anomalyPointsPerCol', 200) }} 点的覆盖层预算）：
         图上共 {{ overlayNote.drawn }} 个 / 检出共 {{ overlayNote.total }} 个。画不全的列（图上/真实数）：
         <span v-for="(r, i) in overlayNote.shown" :key="r.label">{{ r.label }} {{ r.drawn }}/{{ r.total }}<span v-if="i < overlayNote.shown.length - 1">、</span></span><span v-if="overlayNote.hidden"> 等</span>，共 {{ overlayNote.allCols }} 列（完整数量见下方表格）
       </div>
       <div v-if="marksNote" class="px-3 pt-0.5 text-[10px] text-amber-600 shrink-0">
-        <i class="fa-solid fa-circle-exclamation mr-1"></i>有列的缺失虚线没画全（被抽稀抽掉、或超出每列虚线上限）：
+        <i class="fa-solid fa-circle-exclamation mr-1"></i>折线画的是整表每行，但有列的缺失虚线没画全
+        （{{ decimated ? '被降采样抽掉、或' : '' }}超出每列 {{ capNote('missingMarksPerCol', 80) }} 条的虚线上限）：
         图上共 {{ marksNote.drawn }} 条 / 缺失格共 {{ marksNote.total }} 个。画不全的列（虚线/缺失格）：
         <span v-for="(r, i) in marksNote.shown" :key="r.label">{{ r.label }} {{ r.drawn }}/{{ r.total }}<span v-if="i < marksNote.shown.length - 1">、</span></span><span v-if="marksNote.hidden"> 等</span>，共 {{ marksNote.allCols }} 列（完整数量见下方表格）
       </div>
@@ -837,7 +863,7 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
                   <template v-if="brushRange">{{ brushRange.start }} ~ {{ brushRange.end }} (索引 {{ brushRange.startIdx }}–{{ brushRange.endIdx }})</template>
                   <template v-else>未框选 — 请先在上方图表上拖拽选取时段</template>
                 </div>
-                <p class="text-[10px] text-slate-400 mt-1.5">图表只画服务端抽稀后的点，框选边界会吸附到最近的真实行号（行号即工作区当前帧的行位置）</p>
+                <p class="text-[10px] text-slate-400 mt-1.5">图表画的是整表每一行（服务端全量回传，不抽点），框选边界吸附到的就是真实行号（行号即工作区当前帧的行位置）</p>
               </div>
               <div>
                 <label class="text-[11px] text-slate-500 block mb-1.5">自定义掩码特征列名</label>

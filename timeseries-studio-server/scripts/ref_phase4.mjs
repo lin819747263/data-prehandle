@@ -169,6 +169,52 @@ function meanChunks(arr, positions, step) {
   })
 }
 
+// LTTB 的独立实现（与 app/services/explore.py 同一份规格，代码各写一遍）：
+// 缺失值代入本列有效均值只用于选点，极差用于把各列面积归一后再相加。
+function lttb(cols, columns, threshold) {
+  const n = columns[cols[0]].length
+  if (n <= threshold || threshold < 3) return Array.from({ length: n }, (_, i) => i)
+  const prep = cols.map(key => {
+    const arr = columns[key]
+    const valid = arr.filter(v => !Number.isNaN(v))
+    const mean = valid.length ? valid.reduce((a, b) => a + b, 0) / valid.length : 0
+    const span = valid.length ? Math.max(...valid) - Math.min(...valid) : 0
+    return { arr: arr.map(v => (Number.isNaN(v) ? mean : v)), norm: span || 1 }
+  })
+  const keep = [0]
+  const every = (n - 2) / (threshold - 2)
+  let a = 0
+  for (let i = 0; i < threshold - 2; i++) {
+    const curS = Math.floor(i * every) + 1
+    const curE = Math.min(Math.floor((i + 1) * every) + 1, n)
+    let nxtS = curE
+    let nxtE = Math.min(Math.floor((i + 2) * every) + 1, n)
+    if (nxtE <= nxtS) nxtE = Math.min(nxtS + 1, n)
+    if (curE <= curS || nxtE <= nxtS || curS >= n) break
+    let sumX = 0, sumY = prep.map(() => 0)
+    for (let j = nxtS; j < nxtE; j++) {
+      sumX += j
+      prep.forEach((p, ci) => { sumY[ci] += p.arr[j] })
+    }
+    const cnt = nxtE - nxtS
+    const avgX = sumX / cnt
+    const avgY = sumY.map(v => v / cnt)
+    let best = curS, bestScore = -1
+    for (let j = curS; j < curE; j++) {
+      let score = 0
+      prep.forEach((p, ci) => {
+        const ay = p.arr[a]
+        score += Math.abs((a - avgX) * (p.arr[j] - ay) - (a - j) * (avgY[ci] - ay)) / p.norm
+      })
+      if (score > bestScore) { bestScore = score; best = j }
+    }
+    a = best
+    keep.push(a)
+  }
+  keep.push(n - 1)
+  return keep
+}
+
 function seriesMulti(mode) {
   const cap = Math.max(20, Math.min(points, 6000))
   let step = 1
@@ -179,7 +225,10 @@ function seriesMulti(mode) {
     positions = []
     for (let i = 0; i < rowCount; i += step) positions.push(i)
   } else if (mode === 'raw') {
-    positions = stride(Array.from({ length: rowCount }, (_, i) => i), cap)
+    // 全量：窗口内每一行都留下，不做任何抽取
+    positions = Array.from({ length: rowCount }, (_, i) => i)
+  } else if (mode === 'lttb') {
+    positions = lttb(cols, columns, cap)
   } else {
     const budget = Math.max(200, Math.floor(cap / cols.length))
     const keep = new Set()
@@ -192,7 +241,8 @@ function seriesMulti(mode) {
       : positions.map(i => (Number.isNaN(arr[i]) ? null : arr[i]))
     return { col: key, y: ys, missing: ys.filter(v => v === null).length }
   })
-  return { mode, rowCount, points: positions.length, windowStep: step, maxPoints: cap,
+  return { mode, rowCount, points: positions.length, windowStep: step,
+           maxPoints: mode === 'raw' ? null : cap,
            decimated: positions.length < rowCount,
            x: positions.map(i => labels[i] ?? String(i)), series }
 }

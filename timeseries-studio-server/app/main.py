@@ -15,10 +15,10 @@
   GET    /api/ws/{id}/columns        整列取数（外生变量按时间戳对齐这类必须要整列的操作用）
   GET    /api/ws/{id}/overview       缺失率 / 重复率 / 时间范围等整表统计
   GET    /api/ws/{id}/quality        第四步诊断：每列缺失统计 + 缺失段区间 + 重复时间戳
-  GET    /api/ws/{id}/series         第四步质量曲线：多列共享抽稀时间轴（含原始行号、逐列缺失标记与异常覆盖层）
+  GET    /api/ws/{id}/series         第四步质量曲线：默认全量（一行不抽）共享时间轴，含原始行号、逐列缺失标记与异常覆盖层
   GET    /api/ws/{id}/stats          第三步统计矩阵：Count/Mean/Std/四分位/Min/Max/缺失率
   GET    /api/ws/{id}/hist           第三步直方图：25 桶计数 + 均值/中位数所在桶
-  GET    /api/ws/{id}/series-multi   第三步叠加曲线：多列共享时间轴，服务端按点数上限抽稀（span 取年/月/周/日窗口）
+  GET    /api/ws/{id}/series-multi   第三步叠加曲线：多列共享时间轴，服务端按点数上限降采样（raw 全量不抽点；span 取年/月/周/日窗口）
   GET    /api/ws/{id}/first-complete 新特征列的首个完整行号（长窗口特征开头必为空）
   GET    /api/ws/{id}/anomaly        服务端留存的最近一次检测结果（索引不外泄）
   POST   /api/ws/{id}/anomaly-detect 3σ / IQR / 滑窗 MAD / sklearn 孤立森林 / 表达式
@@ -91,11 +91,13 @@ def health() -> dict:
         "version": __version__,
         "capabilities": [
             "workspace:create", "workspace:preset", "workspace:open", "workspace:rows",
+            # 多文件按行合并 + 按时间排序：拼表在后端做，浏览器只拿回执
+            "workspace:merge",
             "workspace:columns", "workspace:overview", "workspace:restore",
-            "workspace:quality", "workspace:series", "workspace:anomaly",
+            "workspace:quality", "workspace:series", "workspace:series-full", "workspace:anomaly",
             "workspace:stats", "workspace:hist", "workspace:series-multi",
             "workspace:first-complete", "workspace:export", "workspace:save-as",
-            "op:time-format", "op:rename-column", "op:delete-column", "op:convert-unit",
+            "op:time-format", "op:time-col", "workspace:time-detect", "op:rename-column", "op:delete-column", "op:convert-unit",
             "op:derived-column", "op:resample", "op:split",
             "op:impute", "op:anomaly-repair", "op:mask-generate", "op:mask-delete",
             "anomaly:detect",
@@ -123,6 +125,17 @@ def health() -> dict:
             "cellsPerWorkspace": workspace_router.ws_store.MAX_CELLS,
             "maxPageRows": workspace_router.MAX_PAGE,
             "maxUploadBytes": schemas.MAX_UPLOAD_BYTES,
+            # 一次合并导入最多带几份文件（前端据此决定"多文件"要不要提示后端过旧）
+            "mergeFiles": workspace_router.ws_store.MAX_MERGE_FILES,
+            # 一列要当时间列，至少这么多有值样本能按已知格式解析出来；界面把这条写成话术，
+            # 不再靠"列名像不像时间"猜（列名只是试的顺序，不是结论）
+            "minTimeHitRate": workspace_router.ws_store.MIN_TIME_HIT_RATE,
+            # 可切换的显示格式白名单：界面那个下拉照这份列，custom 另填模板
+            "displayFormats": list(workspace_router.ws_store.DISPLAY_FORMATS),
+            # 自动识别覆盖的源格式：界面「识别不到就手填格式」那里照这份提示，
+            # 用户填的模板按占位符翻译，所以 tokens 也一并给出（yyyy/hh/dd 会自动归一）
+            "parseFormats": [f for f, _, _ in workspace_router.ws_store.TIME_FORMAT_PATTERNS],
+            "formatTokens": ["YYYY", "MM", "DD", "HH", "mm", "ss", "SSS"],
             # 撤销重放的帧缓存上限：超过字节上限的大帧不留档，退回从载入帧整段重放
             "snapshotVersions": workspace_router.ws_store.SNAP_MAX_VERSIONS,
             "snapshotMaxBytes": workspace_router.ws_store.SNAP_MAX_BYTES,
@@ -130,8 +143,12 @@ def health() -> dict:
             "onehotLevels": workspace_router.ws_store.MAX_ONEHOT_LEVELS,
             "featureWindow": features.MAX_WINDOW,
             "uniqueValuesReported": features.MAX_UNIQUE_VALUES,
-            # 第三步曲线一次最多回这么多点：叠加曲线的抽稀上限，界面按它摆「跨度」按钮
+            # 第三步曲线一次最多回这么多点：降采样档位（extremes/lttb/mean）的上限，
+            # raw「全量」不受它约束——那一档要送回窗口内每一行，只受下面的格子数上限管
             "seriesMaxPoints": explore.MAX_POINTS,
+            "seriesModes": list(explore.SERIES_MODES),
+            "seriesDefaultMode": explore.DEFAULT_MODE,
+            "seriesFullRawMaxValues": explore.FULL_RAW_MAX_VALUES,
             "seriesSpans": list(explore.SPANS),
             "histogramBins": explore.DEFAULT_BINS,
             # 默认节假日表（内置预设）的天数与清单：每个工作区可以在它之上改出自己的那份，

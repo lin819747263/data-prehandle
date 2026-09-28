@@ -24,7 +24,7 @@ const lastSync = ref('')      // 三块全部取到那一刻的本地时钟：�
 let loadedSig = null
 
 const gate = computed(() => {
-  if (!state.backend.online) return { status: 'offline', note: '后端不在线：本页的整表统计、抽稀曲线与直方图无从计算' }
+  if (!state.backend.online) return { status: 'offline', note: '后端不在线：本页的整表统计、降采样曲线与直方图无从计算' }
   if (!d.value.wsId) return { status: 'noData', note: '尚未接入数据：请先在第一步载入数据集' }
   const bad = Object.keys(BLOCK_NAMES).filter(k => err[k])
   if (bad.length) {
@@ -58,10 +58,12 @@ function selectedList() {
   return floatCols.value.filter(c => selected.has(c.key)).map(c => c.key)
 }
 
-// 抽稀在后端执行（旧的那档 LTTB 是渲染期算法，随浏览器整表视图一起退场）
-const MODE_LABELS = { raw: '原始全量', extremes: '极值抽稀', mean: '窗口均值' }
-const downsample = ref('extremes')
+// 降采样在后端执行（旧的那档 LTTB 是渲染期算法，随浏览器整表视图一起退场；
+// 现在这一档由 explore.lttb_positions 真算，默认档位直接读后端声明的 seriesDefaultMode）
+const MODE_LABELS = { raw: '全量（不抽点）', extremes: '极值', mean: '窗口均值', lttb: 'LTTB 三角形面积' }
+const downsample = ref(state.backend.limits?.seriesDefaultMode || 'lttb')
 const pointsCap = computed(() => state.backend.limits?.seriesMaxPoints || 3000)
+const fullRawCap = computed(() => state.backend.limits?.seriesFullRawMaxValues || 600000)
 const binsCount = computed(() => state.backend.limits?.histogramBins || 25)
 
 // 时间窗口档位：由后端按自然周期筛行（explore.resolve_window），不是旧版那种「按采样间隔估百分比」
@@ -182,13 +184,12 @@ async function prepare(force = false) {
       bad.map(k => err[k]).join('　·　'))
     return
   }
+  // 取数成功不弹提示：本页的数字、曲线点数与直方图桶数就摆在区块里，
+  // 「整表计算于 …」那条 chip 已经说明这排数字是刚算的
   lastSync.value = new Date().toLocaleTimeString()
-  toast('success', `后端整表算完：统计矩阵 ${(stats.value?.rows || []).length} 列 × ` +
-    `${(stats.value?.rowCount ?? 0).toLocaleString()} 行 · 曲线 ${(chart.value?.series || []).length} 条 / ` +
-    `${(chart.value?.points ?? 0).toLocaleString()} 个点 · 直方图 ${hist.value?.bins ?? 0} 桶`)
 }
 
-// 用户拖出来的缩放窗口（百分比）：换列、换抽稀方式都不该被重置，
+// 用户拖出来的缩放窗口（百分比）：换列、换降采样方式都不该被重置，
 // 只有显式换时间窗口（换的是另一段行）才回到整段。旧实现每次 setOption 都带 start:0,end:30，
 // 叠一份 notMerge，于是勾掉一列就等于把图缩回开头。
 const zoom = reactive({ start: 0, end: 100 })
@@ -353,7 +354,10 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
 </script>
 
 <template>
-  <section class="step-panel h-full p-4 flex flex-col gap-3 overflow-y-auto">
+  <section class="step-panel h-full p-4 flex flex-col gap-3">
+    <!-- 页脚单独留在滚动区外面：列一多，统计矩阵就把「下一步」顶到几百像素以下、甚至被卡片盖住，
+         现在无论多少列，返回/下一步都钉在页面底部不动。 -->
+    <div class="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-0.5">
     <div v-if="gate.status !== 'ready'" class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
          :class="gate.status === 'loading' ? 'bg-indigo-50 border-indigo-200 text-indigo-700'
                  : gate.status === 'error' ? 'bg-rose-50 border-rose-200 text-rose-700'
@@ -385,17 +389,18 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
               <span class="text-slate-300">|</span>
               <button @click="toggleAll(false)" class="text-[10px] text-slate-500 hover:underline">清空</button>
             </div>
-            <span class="text-[10px] text-slate-400 font-mono">已选 {{ selected.size }} 条</span>
+            <span class="text-[10px] text-slate-400 font-mono">已选 {{ selected.size }} / {{ floatCols.length }} 列</span>
             <!-- 成功也要看得见：这条 chip 记的是三块全部取到那一刻，缺块时它不会更新 -->
             <span v-if="lastSync" class="text-[10px] font-mono px-1.5 py-0.5 rounded border border-emerald-200 bg-emerald-50 text-emerald-700">
               <i class="fa-solid fa-check mr-0.5"></i>整表计算于 {{ lastSync }}
             </span>
           </div>
           <div class="flex items-center gap-2">
-            <label class="text-xs font-bold text-slate-600">抽稀方式:</label>
+            <label class="text-xs font-bold text-slate-600">降采样方式:</label>
             <select v-model="downsample" class="text-xs border border-slate-300 rounded px-2 py-1 bg-white">
-              <option value="raw">原始全量（超后端点数上限时等距抽稀）</option>
-              <option value="extremes">极值抽稀（每桶留最小/最大，尖峰不丢）</option>
+              <option value="lttb">LTTB 降采样（按三角形面积选点，形态最保真 · 默认）</option>
+              <option value="raw">全量（窗口内每一行都画，绝不抽点 · 单次最多 {{ fullRawCap.toLocaleString() }} 格）</option>
+              <option value="extremes">极值降采样（每桶留最小/最大，尖峰不丢）</option>
               <option value="mean">窗口均值降采样（4 行一桶取均值）</option>
             </select>
           </div>
@@ -434,7 +439,7 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
           </div>
         </div>
       </div>
-      <div class="flex flex-wrap gap-1.5">
+      <div class="flex flex-wrap gap-1.5 max-h-[104px] overflow-y-auto pr-1">
         <label v-for="(c, i) in floatCols" :key="c.key"
                class="inline-flex items-center gap-1 px-2 py-1 rounded-md border cursor-pointer transition-all text-[11px] font-medium"
                :class="selected.has(c.key) ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-200 hover:bg-indigo-50/50'">
@@ -445,10 +450,10 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
       </div>
     </div>
 
-    <div class="h-[52%] min-h-[360px] shrink-0 bg-white rounded-xl border border-slate-200 shadow-sm p-2 flex flex-col">
-      <div ref="mainEl" class="w-full flex-1"></div>
+    <div class="h-[52%] min-h-[300px] shrink-0 bg-white rounded-xl border border-slate-200 shadow-sm p-2 flex flex-col">
+      <div ref="mainEl" class="w-full flex-1 min-h-0"></div>
       <div class="px-2 pb-1 text-[10px] text-slate-400 font-mono flex items-center gap-2 shrink-0">
-        <span v-if="fetching.series"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端抽稀中…</span>
+        <span v-if="fetching.series"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端降采样中…</span>
         <span v-else-if="err.series" class="text-rose-500">
           <i class="fa-solid fa-triangle-exclamation mr-1"></i>叠加曲线没取到：{{ err.series }}
         </span>
@@ -459,16 +464,20 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
             {{ chart.window.from }} ~ {{ chart.window.to }}（含起不含止）{{ chart.windowRows.toLocaleString() }} 行
             <span v-if="chart.window.clamped" class="text-amber-600">（该档只有 {{ chart.window.periodTotal }} 期，已贴到端点）</span>
           </span>
-          <span>→ 图上 {{ chart.points.toLocaleString() }} 点 · {{ MODE_LABELS[chart.mode] }}</span>
-          <span v-if="chart.decimated" class="text-amber-600">已抽稀（放大不会补回被抽掉的行）</span>
-          <span v-else class="text-emerald-600">逐行未抽稀</span>
+          <span>→ 图上 {{ chart.points.toLocaleString() }} 点 · {{ MODE_LABELS[chart.mode] || chart.mode }}</span>
+          <span v-if="chart.decimated" class="text-amber-600">
+            已降采样：窗口 {{ chart.windowRows.toLocaleString() }} 行留 {{ chart.points.toLocaleString() }} 点（放大不会补回被抽掉的行）
+          </span>
+          <span v-else class="text-emerald-600">窗口 {{ chart.windowRows.toLocaleString() }} 行逐行都在图上，未降采样</span>
           <span v-if="chart.windowStep > 1">窗口 {{ chart.windowStep }} 行</span>
         </template>
       </div>
     </div>
 
-    <div class="flex-1 grid grid-cols-12 gap-3 min-h-[300px]">
-      <div class="col-span-7 bg-white rounded-xl border border-slate-200 shadow-sm p-3 flex flex-col">
+    <!-- grid-template-rows: minmax(0,1fr) 是让表格真正在卡片里滚起来的那一环：
+         默认 auto 行会按内容撑开，60 列的统计矩阵就把卡片顶到几千像素高，「下一步」被压在卡片底下。 -->
+    <div class="flex-1 grid grid-cols-12 grid-rows-[minmax(0,1fr)] gap-3 min-h-[300px]">
+      <div class="col-span-7 min-h-0 bg-white rounded-xl border border-slate-200 shadow-sm p-3 flex flex-col">
         <div class="flex justify-between items-center mb-2">
           <span class="text-xs font-bold text-slate-700 flex items-center gap-1.5">
             <i class="fa-solid fa-table-columns text-indigo-500 text-[10px]"></i>多列统计特征矩阵
@@ -486,7 +495,7 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
             </template>
           </span>
         </div>
-        <div class="flex-1 overflow-auto">
+        <div class="flex-1 min-h-0 overflow-auto">
           <table class="w-full text-[11px] text-left border-collapse">
             <thead class="sticky top-0 bg-slate-100 text-slate-600 border-b border-slate-200 z-10">
               <tr>
@@ -541,14 +550,14 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
         </div>
       </div>
 
-      <div class="col-span-5 bg-white rounded-xl border border-slate-200 shadow-sm p-2 flex flex-col">
+      <div class="col-span-5 min-h-0 bg-white rounded-xl border border-slate-200 shadow-sm p-2 flex flex-col">
         <div class="flex items-center justify-between px-2 pt-1 gap-2">
           <span class="text-xs font-bold text-slate-700 shrink-0">数据分布直方图</span>
           <select v-model="distCol" class="text-[11px] border border-slate-200 rounded px-1.5 py-0.5 bg-white text-indigo-700 font-medium max-w-[180px] truncate outline-none focus:border-indigo-400">
             <option v-for="c in floatCols" :key="c.key" :value="c.key">{{ c.label }}</option>
           </select>
         </div>
-        <div ref="distEl" class="w-full flex-1"></div>
+        <div ref="distEl" class="w-full flex-1 min-h-0"></div>
         <div class="px-2 pb-1 text-[10px] text-slate-400 font-mono shrink-0">
           <span v-if="fetching.hist"><i class="fa-solid fa-spinner fa-spin mr-1"></i>后端整表计数中…</span>
           <span v-else-if="err.hist" class="text-rose-500">
@@ -561,6 +570,8 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
           <span v-else>该列没有有效数值</span>
         </div>
       </div>
+    </div>
+
     </div>
 
     <div class="flex justify-between items-center shrink-0">

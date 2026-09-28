@@ -11,7 +11,7 @@
 import { reactive, watch } from 'vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import {
-  detectTimeFormatOfSamples, isMissing,
+  isMissing,
   RESAMPLE_RATE_MAP, RESAMPLE_RATE_NAMES, RESAMPLE_METHOD_NAMES,
   downloadBlob
 } from './utils'
@@ -51,9 +51,13 @@ function applyMeta(d, meta) {
   d.wsId = meta.wsId || d.wsId
   d.meta = meta
   d.columns = meta.columns || d.columns
-  d.timeCol = meta.timeCol || d.timeCol
+  // timeCol 要照实镜像：后端说"这一份工作区没有时间列"就是没有。
+  // 写成 `meta.timeCol || d.timeCol` 会让上一份数据的列名残留下来，界面据此把
+  // 一列中文文本当时间列去转换，正好复现"没有时间却认错列"那个 bug。
+  d.timeCol = meta.timeCol ?? ''
   d.timeFormat = meta.timeFormat || d.timeFormat
-  d.timeDetect = meta.timeDetect || d.timeDetect
+  d.timeDetect = meta.timeDetect ?? null
+  d.timeRejected = meta.timeRejected || []
   d.freqMinutes = meta.freqMinutes ?? null
   d.freq = meta.freqLabel || ''
   d.name = meta.name || d.name
@@ -179,17 +183,48 @@ export async function loadPresetData(key) {
   }
 }
 
-// 导入：后端落盘到 dataset 目录 + 建工作区；多文件按行拼接需要整表，
-// 本期仍只支持"首个文件建区"，其余文件明确提示，不再静默塞进同一张表。
+// 导入：后端落盘到 dataset 目录 + 建工作区。单份走这条，两份以上走下面的合并通道。
 export async function loadFileAsWorkspace(file) {
   const resp = await ws.wsCreateFile(file, { persist: true, limit: PAGE_SIZE })
   const key = 'custom'
   const d = await adoptWorkspace(key, resp, {
     name: (resp.meta.name || file.name), format: resp.meta.format
   })
-  const saved = resp.persisted?.filename ? ` · 已落盘 ${resp.persisted.filename}` : ''
+  const saved = persistedName(resp)
   logAction(1, 'dataset', '导入并加载数据文件',
-    `${file.name} · ${d.meta.rowCount.toLocaleString()}行×${d.meta.colCount}列 · 后端解析${saved}`)
+    `${file.name} · ${d.meta.rowCount.toLocaleString()}行×${d.meta.colCount}列 · 后端解析${saved ? ` · 已落盘 ${saved}` : ''}`)
+  return d
+}
+
+// 后端把落盘后的真实文件名放在 persisted（字符串）里；重名时它带时间戳后缀，
+// 所以最近列表里看到的可能是另一个名字，回执必须照后端给的写。
+function persistedName(resp) {
+  const p = resp?.persisted
+  if (typeof p === 'string') return p
+  return p?.filename || ''
+}
+
+// 多文件导入：两份以上一律交给后端 /api/ws/merge 拼表并按时间排序，浏览器不自己接表。
+// 合并回执（每份几行、并集多出哪些列、排序前后各是多少）全部来自后端那一次计算。
+export async function loadFilesAsWorkspace(files) {
+  const list = Array.from(files || [])
+  if (list.length === 0) throw new Error('没有待导入的文件')
+  if (list.length === 1) return loadFileAsWorkspace(list[0])
+  if (!state.backend.capabilities.includes('workspace:merge')) {
+    throw new Error(`当前后端未提供合并导入（能力清单里没有 workspace:merge）：`
+      + `请更新 timeseries-studio-server 并重启后再合并 ${list.length} 份文件`)
+  }
+  const resp = await ws.wsCreateFiles(list, { persist: true, limit: PAGE_SIZE })
+  const d = await adoptWorkspace('custom', resp, {
+    name: resp.meta.name || `${list[0].name} 等 ${list.length} 份合并`,
+    format: resp.meta.format
+  })
+  const r = resp.merge || {}
+  const saved = (resp.persisted || []).filter(Boolean)
+  logAction(1, 'dataset', '多文件合并导入',
+    `${list.map(f => f.name).join(' + ')} · 合并 ${r.totalRows ?? d.meta.rowCount} 行 × `
+    + `${r.colCount ?? d.meta.colCount} 列（按 ${r.timeCol || '—'} 升序，位移 ${r.rowsMoved ?? 0} 行）`
+    + (saved.length ? ` · 原始 ${saved.length} 份已落盘` : ''))
   return d
 }
 
@@ -224,8 +259,8 @@ export const state = reactive({
   quality: { sig: '', version: -1, data: null, loading: false, error: '' },
   // 第五步节假日表：GET /holidays 的整份回显（生效日期 + 可选预设），配置存在后端 meta 上
   holidays: { wsId: '', version: -1, data: null, loading: false, error: '' },
-  // 图表与刷选用的降采样曲线：GET /series（含每点的行位置 idx，掩码区间靠它换算）
-  series: { key: '', data: null },
+  // 图表与刷选用的质量曲线：GET /series（默认全量，含每点的行位置 idx，掩码区间靠它换算）
+  series: { key: '', data: null, error: '' },
   lastAnomaly: null,    // 后端 detection_view()：{ algo, expr, results, summary, stale, anomalyIndices }
   splitRatio: 70,
   // 撤销/重做：整份投影自服务端 meta_view()（游标 + 命令日志），浏览器不存历史
@@ -416,15 +451,36 @@ export async function convertColumnUnit(idx, factor, offset, newUnit) {
   return !!r
 }
 
-// ---- 时间格式（后端只做渲染，内部一律 datetime64）----
-export function detectTimeFormat(timeColKey) {
+// ---- 时间列与时间格式：判定与渲染都在后端按整列真解析，浏览器只转述回执 ----
+// 这里没有"按当前页猜格式"的兜底了：一页 500 行推不出 11000 行的结论，
+// 猜错的代价是整列被洗成 NaT 或 1970 年的假时间，界面上一个错字都不留。
+export async function timeFormatDetect(colKey, srcFmt) {
   const d = ds()
-  if (d.timeDetect && (!timeColKey || timeColKey === d.timeCol)) {
-    return { format: d.timeDetect.displayFormat || d.timeDetect.format, ...d.timeDetect }
+  if (!d.wsId || !requireBackend('时间格式识别')) return null
+  try {
+    return await ws.wsTimeDetect(d.wsId, colKey || d.timeCol, srcFmt || '')
+  } catch (e) {
+    toast('error', `时间格式识别失败：${e.message}`)
+    return null
   }
-  const samples = pageColumnValues(timeColKey || d.timeCol).filter(v => !isMissing(v)).slice(0, 20)
-  if (!samples.length) return null
-  return detectTimeFormatOfSamples(samples)
+}
+
+// 把某一列指定成时间列：后端整列解析过闸门才改 dtype。srcFmt 是自动识别认不出时手填的源格式。
+export async function setTimeColumn(colKey, srcFmt) {
+  const r = await runOp('time-col', { key: colKey, format: srcFmt || null, customFormat: null }, {
+    step: 2, icon: 'clock', title: '指定时间列',
+    detail: res => `${res.timeCol}（按 ${res.format} 解析出 ${res.parsedCount.toLocaleString()}/${res.rowCount.toLocaleString()} 个值，命中率 ${res.matchRate.toFixed(1)}%）`,
+    params: { type: 'time_col', key: colKey, srcFmt: srcFmt || '' }
+  })
+  return r
+}
+
+// 元数据里那份识别回执（后端在载入/指定时算好带回来的，不是浏览器算的）
+export function savedTimeDetect(colKey) {
+  const d = ds()
+  if (!d.timeDetect) return null
+  if (!colKey || colKey === d.timeCol) return { format: d.timeDetect.displayFormat || d.timeDetect.format, ...d.timeDetect }
+  return null
 }
 
 // 页窗口是 array-of-arrays，取某一列的显示值统一走这里
@@ -469,7 +525,10 @@ export async function resampleDataset(targetRate, method) {
     params: { type: 'resample', targetRate, method, detail: `${RESAMPLE_RATE_NAMES[targetRate]} / ${RESAMPLE_METHOD_NAMES[method]}` }
   })
   if (!r) return null
-  return { oldCount: r.oldCount, newCount: r.newCount }
+  return {
+    oldCount: r.oldCount, newCount: r.newCount, summary: r.summary,
+    direction: r.direction, directionLabel: r.directionLabel, fillNote: r.fillNote
+  }
 }
 
 // 实时质量指标：来自后端 overview 的真实整表统计
@@ -826,37 +885,43 @@ export async function repairAnomalies(mode) {
   return r
 }
 
-// ---- 曲线抽稀（画图不再需要整表）----
+// ---- 曲线取数（画图不再需要整表）----
+// 第四步默认要全量（maxPoints = 0 → 后端 points=0，整表一行不抽）；只有对照场景才传正数走抽稀档。
 const seriesCache = new Map()
 
 export function invalidateSeries() {
   seriesCache.clear()
-  state.series = { key: '', data: null }
+  state.series = { key: '', data: null, error: '' }
 }
 
-export async function loadSeries(keys, maxPoints = 1200) {
+export async function loadSeries(keys, maxPoints = 0) {
   const d = ds()
   const cols = (Array.isArray(keys) ? keys : [keys]).filter(Boolean)
   if (!d?.wsId || !cols.length) return null
   if (!state.backend.online) return null
   const la = state.lastAnomaly
   const detTag = la && la.wsId === d.wsId ? `${la.version}:${la.stale ? 'stale' : 'fresh'}` : 'none'
-  // 勾选顺序不该多打一次后端：列名排序后作键
-  const colTag = [...cols].sort().join(',')
-  const key = `${seriesSig(cols)}|${maxPoints}|${detTag}`
+  // 后端不认 points=0（能力清单没有 workspace:series-full）时退回抽稀档：
+  // 是否真的抽了点由响应里的 decimated 说了算，界面照它写，不许自称全量。
+  // 点数就在键上，所以退回档与全量档各存各的，不会互相顶掉。
+  const pts = maxPoints <= 0 && !state.backend.capabilities.includes('workspace:series-full') ? 1200 : maxPoints
+  const key = `${seriesSig(cols)}|${pts}|${detTag}`
   if (!key) return null
   const hit = seriesCache.get(key)
   if (hit) {
-    if (state.series.key !== key) state.series = { key, data: hit }
+    if (state.series.key !== key) state.series = { key, data: hit, error: '' }
     return hit
   }
   try {
-    const resp = await ws.wsSeries(d.wsId, cols, maxPoints)
+    const resp = await ws.wsSeries(d.wsId, cols, pts)
     if (seriesCache.size > 24) seriesCache.clear()
     seriesCache.set(key, resp)
-    state.series = { key, data: resp }
+    state.series = { key, data: resp, error: '' }
     return resp
   } catch (e) {
+    // 全量档撞上限（行 × 列 的格子数超过后端守卫）就是这条路：图会空，
+    // 原因必须留在 state 上给页面说明，不能只靠那一闪而过的 toast。
+    state.series = { key: '', data: null, error: e.message }
     toast('error', `读取曲线失败：${e.message}`)
     return null
   }
@@ -1416,6 +1481,14 @@ async function replaySingleOp(op) {
   const p = op.params
   const relabel = t => { const last = state.actionLog[state.actionLog.length - 1]; if (last) last.title = t }
   switch (p.type) {
+    case 'time_col': {
+      if (!p.key) return false
+      if (d.timeCol === p.key) return true   // 已经是那一列：重放不需要再做一次
+      const r = await setTimeColumn(p.key, p.srcFmt)
+      if (!r) return false
+      relabel('[回放] 指定时间列')
+      return true
+    }
     case 'time_convert': {
       const fmt = p.targetFmt || 'YYYY-MM-DD HH:mm:ss'
       const changed = await convertTimeColumn(p.timeCol || d.timeCol, fmt, p.customFmt)
@@ -1726,7 +1799,14 @@ export function generatePythonCode() {
   else if (fmt === 'feather') lines.push(`df = pd.read_feather("${base}.feather")`)
   else if (fmt === 'xlsx' || fmt === 'xls') lines.push(`df = pd.read_excel("${base}.xlsx", engine="openpyxl")`)
   else lines.push(`df = pd.read_csv("${base}.csv")`)
-  lines.push(`df['${loadTimeCol}'] = pd.to_datetime(df['${loadTimeCol}'])`)
+  // 读入时按后端真正用的那个源格式解析（GET /time-detect 的 format），不写 format 就等于
+  // 让 pandas 自己猜 —— 它会做出与界面不同的决定，导出脚本就复现不了界面上的数字了。
+  const srcFmt = d.timeDetect && !String(d.timeDetect.format).startsWith('epoch_')
+    && d.timeDetect.format ? pyStrftime(d.timeDetect.format) : ''
+  const srcUnit = String(d.timeDetect?.format || '').startsWith('epoch_')
+    ? (d.timeDetect.format === 'epoch_ms' ? 'ms' : 's') : ''
+  lines.push(`df['${loadTimeCol}'] = pd.to_datetime(df['${loadTimeCol}']` +
+    `${srcUnit ? `, unit='${srcUnit}'` : srcFmt ? `, format='${srcFmt}'` : ''})`)
   lines.push(`df = df.sort_values('${loadTimeCol}').reset_index(drop=True)`)
 
   let section = 1
@@ -2058,9 +2138,23 @@ export function generatePythonCode() {
     if (p.type === 'time_convert' && !done.has('time_convert')) {
       done.add('time_convert')
       nextHeader('时间格式标准化')
-      lines.push(`# 目标格式: ${p.targetFmt}`)
-      lines.push(`df['${p.timeCol || tc}'] = pd.to_datetime(df['${p.timeCol || tc}']).dt.strftime('${pyStrftime(p.targetFmt)}')`)
-      lines.push(`df['${p.timeCol || tc}'] = pd.to_datetime(df['${p.timeCol || tc}'])`)
+      const col = p.timeCol || tc
+      const tf = String(p.targetFmt || '')
+      lines.push(`# 目标格式: ${tf}`)
+      if (tf === 'epoch_ms' || tf === 'epoch_s') {
+        // 与后端同一条规则：naive 时间按"本机时区"读，换算要减掉这段偏移
+        lines.push('from datetime import datetime')
+        lines.push('_tz_off = int(datetime.now().astimezone().utcoffset().total_seconds())')
+        lines.push(`df['${col}'] = pd.to_datetime(df['${col}']).astype('int64') // ` +
+          (tf === 'epoch_ms' ? `1_000_000 - _tz_off * 1_000` : `1_000_000_000 - _tz_off`))
+      } else if (tf.includes('SSS')) {
+        lines.push(`df['${col}'] = pd.to_datetime(df['${col}']).dt.strftime('${pyStrftime(tf)}')` +
+          `.str.replace(r'\\.(\\d{3})\\d{3}', r'.\\1', regex=True)`)
+        lines.push(`df['${col}'] = pd.to_datetime(df['${col}'])`)
+      } else {
+        lines.push(`df['${col}'] = pd.to_datetime(df['${col}']).dt.strftime('${pyStrftime(tf)}')`)
+        lines.push(`df['${col}'] = pd.to_datetime(df['${col}'])`)
+      }
     }
     if (p.type === 'resample' && !done.has('resample')) {
       done.add('resample')
@@ -2432,10 +2526,23 @@ export function generatePythonCode() {
   return lines.join('\n')
 }
 
+// 占位符模板 → strftime：与后端 `_iter_template` 同一套从左到右的切分规则。
+// 不能写成连续 str.replace：引入单字母占位符（M/D/H/m）之后，"MM"→"%m" 里那个 m
+// 会被下一条 "m"→"%M" 再吃一遍，格式串当场作废。
+const PY_FORMAT_TOKENS = [['YYYY', '%Y'], ['SSS', '%f'], ['MM', '%m'], ['DD', '%d'],
+  ['HH', '%H'], ['mm', '%M'], ['ss', '%S'], ['M', '%m'], ['D', '%d'], ['H', '%H'], ['m', '%M']]
+
 function pyStrftime(fmt) {
-  return String(fmt)
-    .replace(/YYYY/g, '%Y').replace(/MM/g, '%m').replace(/DD/g, '%d')
-    .replace(/HH/g, '%H').replace(/mm/g, '%M').replace(/ss/g, '%S')
+  const tpl = String(fmt)
+  let out = ''
+  let i = 0
+  while (i < tpl.length) {
+    const hit = PY_FORMAT_TOKENS.find(([tok]) => tpl.startsWith(tok, i))
+    if (hit) { out += hit[1]; i += hit[0].length; continue }
+    out += tpl[i] === '%' ? '%%' : tpl[i]
+    i += 1
+  }
+  return out
 }
 
 // ============================================================

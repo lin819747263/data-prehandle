@@ -1,5 +1,5 @@
 // ============================================================
-// 通用工具：格式化 / 时间识别与转换 / 异常判定表达式 / 下载与文件图标
+// 通用工具：格式化 / 异常判定表达式 / 下载与文件图标
 // 整表级的统计、抽稀、重采样、清洗都在服务端算，这里不放算法
 // ============================================================
 
@@ -12,84 +12,11 @@ export function formatFileSize(bytes) {
   return (bytes / 1024 / 1024 / 1024).toFixed(2) + ' GB'
 }
 
-// ---- 时间格式识别 ----
-const TIME_FORMAT_PATTERNS = [
-  { regex: /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$/, format: 'YYYY-MM-DD HH:mm:ss', confidence: 98 },
-  { regex: /^\d{4}\/\d{2}\/\d{2} \d{2}:\d{2}$/,     format: 'YYYY/MM/DD HH:mm',     confidence: 95 },
-  { regex: /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/,  format: 'YYYY-MM-DDTHH:mm:ss',  confidence: 96 },
-  { regex: /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/,        format: 'YYYY-MM-DD HH:mm',     confidence: 92 },
-  { regex: /^\d{4}-\d{2}-\d{2}$/,                     format: 'YYYY-MM-DD',           confidence: 90 },
-  { regex: /^\d{4}\/\d{2}\/\d{2}$/,                   format: 'YYYY/MM/DD',           confidence: 88 },
-  { regex: /^\d{13}$/,                                 format: 'epoch_ms',             confidence: 99 },
-  { regex: /^\d{10}$/,                                 format: 'epoch_s',              confidence: 97 },
-  { regex: /^\d{14}$/,                                 format: 'YYYYMMDDHHmmss',       confidence: 94 },
-  { regex: /^\d{4}\d{2}\d{2}$/,                        format: 'YYYYMMDD',             confidence: 85 },
-  { regex: /^\d{2}\/\d{2}\/\d{4}/,                     format: 'MM/DD/YYYY',           confidence: 80 },
-  { regex: /^\d{2}-\d{2}-\d{4}/,                       format: 'DD-MM-YYYY',           confidence: 78 }
-]
-
-function parseTimeValue(value) {
-  const str = String(value).trim()
-  if (/^\d{13}$/.test(str)) return new Date(Number(str))
-  if (/^\d{10}$/.test(str)) return new Date(Number(str) * 1000)
-  if (/^\d{14}$/.test(str)) {
-    return new Date(+str.slice(0, 4), +str.slice(4, 6) - 1, +str.slice(6, 8), +str.slice(8, 10), +str.slice(10, 12), +str.slice(12, 14))
-  }
-  return new Date(str.replace(/\//g, '-').replace('T', ' '))
-}
-
-export function convertSingleTime(value, targetFmt) {
-  const str = String(value).trim()
-  const d = parseTimeValue(str)
-  if (isNaN(d.getTime())) return str
-
-  switch (targetFmt) {
-    case 'YYYY-MM-DD HH:mm:ss': return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-    case 'YYYY-MM-DD HH:mm':    return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-    case 'YYYY-MM-DD':          return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}`
-    case 'YYYY/MM/DD HH:mm':    return `${d.getFullYear()}/${pad(d.getMonth()+1)}/${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`
-    case 'YYYY/MM/DD':          return `${d.getFullYear()}/${pad(d.getMonth()+1)}/${pad(d.getDate())}`
-    case 'YYYY-MM-DDTHH:mm:ss': return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`
-    case 'YYYYMMDDHHmmss':      return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`
-    case 'YYYYMMDD':            return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}`
-    case 'epoch_ms':            return String(d.getTime())
-    case 'epoch_s':             return String(Math.floor(d.getTime() / 1000))
-    default: return str
-  }
-}
-
-// 对样本值做格式投票识别，返回 { format, confidence, matchRate }
-export function detectTimeFormatOfSamples(samples) {
-  const votes = {}
-  TIME_FORMAT_PATTERNS.forEach(p => { votes[p.format] = 0 })
-  samples.forEach(s => {
-    const str = String(s).trim()
-    TIME_FORMAT_PATTERNS.forEach(p => {
-      if (p.regex.test(str)) votes[p.format] = (votes[p.format] || 0) + 1
-    })
-  })
-  let bestFormat = 'YYYY-MM-DD HH:mm:ss', bestCount = 0
-  Object.entries(votes).forEach(([fmt, count]) => {
-    if (count > bestCount) { bestCount = count; bestFormat = fmt }
-  })
-  const pattern = TIME_FORMAT_PATTERNS.find(p => p.format === bestFormat)
-  const confidence = pattern ? pattern.confidence : 80
-  const matchRate = samples.length ? (bestCount / samples.length) * 100 : 0
-  return { format: bestFormat, confidence, matchRate, matched: bestCount }
-}
-
-// 自定义格式字符串（仅支持 YYYY MM DD HH mm ss 占位符）
-export function convertWithCustomFormat(value, customFmt) {
-  const d = parseTimeValue(value)
-  if (isNaN(d.getTime())) return String(value)
-  return customFmt
-    .replace(/YYYY/g, d.getFullYear())
-    .replace(/MM/g, pad(d.getMonth() + 1))
-    .replace(/DD/g, pad(d.getDate()))
-    .replace(/HH/g, pad(d.getHours()))
-    .replace(/mm/g, pad(d.getMinutes()))
-    .replace(/ss/g, pad(d.getSeconds()))
-}
+// ---- 时间格式的识别与渲染不在这里 ----
+// 浏览器只拿到当前页窗口的几个样本，按这几个字符串猜整表格式曾经把「站点」列认成年月日、
+// 把中文「昨天/下周三」洗成假时间、也把 YYYY-MM-DD HH:mm:ss.SSS 认成不带毫秒的那一种。
+// 现在唯一的判定入口是后端 GET /api/ws/{id}/time-detect（整列真解析）+ POST /op/time-col、
+// /op/time-format，这里不留任何一份"看着像同一件事"的 JS 实现。
 
 // ---- 统计 ----
 // 整表级统计（Count/Mean/Std/分位数/缺失率）只有后端一份实现：

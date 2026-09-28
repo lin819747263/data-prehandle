@@ -1,13 +1,13 @@
 <script setup>
 import { ref, computed, onActivated, watch } from 'vue'
-import { state, loadPresetData, loadFileAsWorkspace, openDatasetFile, switchStep, toast } from '../store'
+import { state, loadPresetData, loadFilesAsWorkspace, openDatasetFile, switchStep, toast } from '../store'
 import { formatFileSize, getFileIconMeta } from '../utils'
 import { listDatasets, checkBackend, API_BASE } from '../api'
 
 // 内置合成示例（由后端 preset 接口生成，非 dataset 目录文件）
 const BUILTIN = [
-  { key: 'pv', label: '光伏电站实测出力 PV-15min', icon: 'fa-solar-panel' },
-  { key: 'load', label: '区域工商业负荷 Load-60min', icon: 'fa-bolt' }
+  { key: 'pv', label: 'PV 光伏 15min', icon: 'fa-solar-panel' },
+  { key: 'load', label: 'Load 负荷 60min', icon: 'fa-bolt' }
 ]
 
 const dragOver = ref(false)
@@ -16,6 +16,13 @@ const loading = ref(false)
 const opening = ref('')
 
 const acceptAttr = '.csv,.xlsx,.xls,.txt,.tsv,.parquet,.feather,.ft'
+// 与后端 detect_format / dataset_store.ALLOWED_EXTS 逐项对应的真实白名单
+const SUPPORTED = ['.csv', '.tsv', '.txt', '.xlsx', '.xls', '.parquet', '.feather', '.ft']
+
+// 「按行合并 + 按时间排序」是后端能力，不是前端承诺：旧后端没这条时话要说得准
+const canMerge = computed(() => state.backend.online
+  && (state.backend.capabilities || []).includes('workspace:merge'))
+const maxMerge = computed(() => state.backend.limits?.mergeFiles ?? 12)
 
 // ---- 最近打开的数据集：后端 dataset 目录的真实文件 ----
 const recent = ref([])
@@ -47,6 +54,7 @@ onActivated(() => { refreshRecent() })
 watch(() => state.backend.online, v => { if (v && recentState.value !== 'ready') refreshRecent() })
 
 const totalSize = computed(() => state.pendingFiles.reduce((s, f) => s + f.size, 0))
+const multiSelect = computed(() => state.pendingFiles.length > 1)
 
 function addFiles(list) {
   if (!list || list.length === 0) return
@@ -60,24 +68,25 @@ async function confirmLoad() {
   if (state.pendingFiles.length === 0) { toast('warning', '请先选择或上传数据文件！'); return }
   if (!state.backend.online) await checkBackend()
   if (!state.backend.online) {
-    toast('error', `解析与加工已全部改由后端执行，${API_BASE} 不可达时无法载入数据` +
-      `：请在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000`)
+    toast('error', `解析与加工已全部改由后端执行，${API_BASE} 不可达时无法载入数据`
+      + `：请在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000`)
     return
   }
-  const first = state.pendingFiles[0]
-  if (state.pendingFiles.length > 1) {
-    toast('warning', `多文件按行拼接需要后端合并（阶段②提供），本次只载入第 1 个：${first.name}`)
-  }
+  const files = state.pendingFiles.map(p => p.file)
   loading.value = true
   try {
-    const d = await loadFileAsWorkspace(first.file)
+    const d = await loadFilesAsWorkspace(files)
+    const r = d.meta.merge
     clearFiles()
-    toast('success', `已由后端解析 ${first.name}：${d.meta.rowCount.toLocaleString()} 行 × ${d.meta.colCount} 列` +
-      `（工作区 ${d.wsId}，浏览器只缓存前 ${d.page.rows.length} 行）`)
+    toast('success', r
+      ? `后端已合并 ${r.fileCount} 份：${r.totalRows.toLocaleString()} 行 × ${r.colCount} 列，`
+        + `按「${r.timeCol}」升序（${r.rowsMoved.toLocaleString()} 行挪了位置，工作区 ${d.wsId}）`
+      : `已由后端解析 ${files[0].name}：${d.meta.rowCount.toLocaleString()} 行 × ${d.meta.colCount} 列`
+        + `（工作区 ${d.wsId}，浏览器只缓存前 ${d.page.rows.length} 行）`)
     refreshRecent()
     switchStep(2)
   } catch (e) {
-    toast('error', `导入失败：${e.message}`)
+    toast('error', files.length > 1 ? `合并导入失败：${e.message}` : `导入失败：${e.message}`)
   } finally {
     loading.value = false
   }
@@ -116,7 +125,7 @@ function relTime(mtime) {
     <div class="flex-1 flex flex-col gap-4 min-h-0">
       <div class="flex flex-col gap-3 shrink-0">
         <div
-          class="bg-white rounded-2xl border-2 border-dashed shadow-sm flex flex-col items-center justify-center cursor-pointer transition-all duration-200 py-8"
+          class="bg-white rounded-2xl border-2 border-dashed shadow-sm flex flex-col items-center justify-center cursor-pointer transition-all duration-200 py-10"
           :class="dragOver ? 'border-indigo-500 bg-indigo-50/60' : 'border-slate-300 hover:border-indigo-400 hover:bg-indigo-50/30'"
           @click="fileInput.click()"
           @dragover.prevent="dragOver = true"
@@ -124,43 +133,24 @@ function relTime(mtime) {
           @drop.prevent="dragOver = false; addFiles($event.dataTransfer.files)"
         >
           <input ref="fileInput" type="file" multiple :accept="acceptAttr" class="hidden" @change="addFiles($event.target.files); $event.target.value = ''" />
-          <div class="text-center px-8">
+          <div class="text-center px-8 max-w-[760px]">
             <div class="w-14 h-14 mx-auto rounded-full bg-indigo-50 flex items-center justify-center mb-3">
               <i class="fa-solid fa-cloud-arrow-up text-2xl text-indigo-500"></i>
             </div>
-            <h3 class="text-base font-semibold text-slate-700 mb-1">拖拽文件到此处上传</h3>
-            <p class="text-xs text-slate-500 mb-3">或点击下方按钮选择文件</p>
-            <div class="flex items-center justify-center gap-2 mb-3">
-              <span v-for="ext in ['.csv', '.xlsx', '.xls']" :key="ext" class="px-2.5 py-1 bg-slate-100 rounded text-[11px] font-mono text-slate-600">{{ ext }}</span>
-              <span v-for="ext in ['.parquet', '.feather']" :key="ext"
-                    class="px-2.5 py-1 rounded text-[11px] font-mono border"
-                    :class="state.backend.online ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-orange-50 border-orange-200 text-orange-600'"
-                    :title="`由后端 pyarrow 真实解码 · ${API_BASE}`">
-                {{ ext }} <i v-if="state.backend.online" class="fa-solid fa-circle-check text-[9px]"></i><template v-else>(后端解码)</template>
-              </span>
-            </div>
-            <div class="flex items-center justify-center gap-2">
-              <button @click.stop="fileInput.click()" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors">
-                <i class="fa-solid fa-folder-open mr-1.5"></i>选择文件
-              </button>
-              <button v-for="b in BUILTIN" :key="b.key" @click.stop="loadSample(b.key)"
-                      class="px-4 py-2 border border-slate-300 hover:border-indigo-400 hover:text-indigo-600 bg-white rounded-lg text-xs font-medium transition-colors">
-                <i class="fa-solid mr-1.5" :class="b.icon"></i>{{ b.label }}
-              </button>
-            </div>
-            <p class="text-[11px] text-slate-400 mt-3 flex items-center justify-center gap-1">
-              <i class="fa-solid fa-circle-info"></i>单文件建议 ≤ 64MB · 多文件按行拼接需后端合并（阶段②）
-              <template v-if="!state.backend.online">· 后端未连接：工作台只读，无法解析或加工数据</template>
+            <h3 class="text-base font-semibold text-slate-700 mb-1.5">拖拽文件到此处上传</h3>
+            <p class="text-xs text-slate-500 mb-5">
+              支持一次拖入或多选<span v-if="canMerge">多份文件</span>
+              <template v-if="canMerge">，两份以上由后端按行合并并按时间列升序排序（单次最多 {{ maxMerge }} 份）</template>
+              <template v-else-if="!state.backend.online">；后端离线时无法解析或合并</template>
+              <template v-else>；当前后端未提供合并能力，多份文件请逐个导入</template>
             </p>
-            <div class="mt-3 flex items-center justify-center">
-              <span class="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full text-[11px] border"
-                    :class="state.backend.online ? 'bg-emerald-50 border-emerald-200 text-emerald-700' : 'bg-slate-50 border-slate-200 text-slate-500'">
-                <span class="w-1.5 h-1.5 rounded-full" :class="state.backend.online ? 'bg-emerald-500' : (state.backend.checking ? 'bg-amber-400 animate-pulse' : 'bg-slate-400')"></span>
-                <i class="fa-solid fa-server text-[10px]"></i>
-                <span>{{ state.backend.checking ? '正在探测后端…' : (state.backend.online ? `后端在线 v${state.backend.version} · ${API_BASE}` : `后端离线 · ${state.backend.error || '未连接'}`) }}</span>
-                <button @click="checkBackend().then(refreshRecent)" class="underline hover:no-underline ml-0.5">重试</button>
-              </span>
+            <div class="flex items-center justify-center flex-wrap gap-1.5 mb-6">
+              <span v-for="ext in SUPPORTED" :key="ext"
+                    class="px-2.5 py-1 rounded-md bg-slate-100 border border-slate-200 text-[11px] font-mono text-slate-600">{{ ext }}</span>
             </div>
+            <button @click.stop="fileInput.click()" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow-sm transition-colors">
+              <i class="fa-solid fa-folder-open mr-1.5"></i>选择文件
+            </button>
           </div>
         </div>
 
@@ -171,11 +161,11 @@ function relTime(mtime) {
               <span class="px-2 py-0.5 rounded-full text-[11px] font-mono bg-indigo-100 text-indigo-800 font-semibold">
                 {{ state.pendingFiles.length }} 个文件 · {{ formatFileSize(totalSize) }}
               </span>
-              <span v-if="state.backend.online" class="text-[10px] text-teal-600 bg-teal-50 border border-teal-200 rounded px-1.5 py-0.5">
-                <i class="fa-solid fa-floppy-disk mr-0.5"></i>确认后将写入 dataset 目录并在后端建工作区
+              <span v-if="state.pendingFiles.length > 1 && canMerge" class="text-[10px] text-indigo-600 bg-indigo-50 border border-indigo-200 rounded px-1.5 py-0.5">
+                <i class="fa-solid fa-code-merge mr-0.5"></i>后端按行合并 · 按时间升序
               </span>
-              <span v-else class="text-[10px] text-rose-600 bg-rose-50 border border-rose-200 rounded px-1.5 py-0.5">
-                <i class="fa-solid fa-lock mr-0.5"></i>后端离线：只能浏览，不能导入
+              <span v-else-if="!state.backend.online" class="text-[10px] text-rose-600 bg-rose-50 border border-rose-200 rounded px-1.5 py-0.5">
+                <i class="fa-solid fa-lock mr-0.5"></i>后端离线：无法导入
               </span>
             </div>
             <div class="flex items-center gap-2">
@@ -184,7 +174,8 @@ function relTime(mtime) {
               </button>
               <button @click="confirmLoad()" :disabled="loading"
                       class="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded text-[11px] font-semibold shadow-sm flex items-center gap-1">
-                {{ loading ? '导入中…' : '确认导入' }} <i class="fa-solid fa-arrow-right text-[10px]"></i>
+                {{ loading ? (multiSelect ? '合并中…' : '导入中…') : (multiSelect ? `合并导入 ${state.pendingFiles.length} 份` : '确认导入') }}
+                <i class="fa-solid text-[10px]" :class="multiSelect ? 'fa-code-merge' : 'fa-arrow-right'"></i>
               </button>
             </div>
           </div>
@@ -221,6 +212,14 @@ function relTime(mtime) {
               <i class="fa-solid fa-rotate mr-0.5" :class="recentState === 'loading' ? 'fa-spin' : ''"></i>刷新
             </button>
           </div>
+        </div>
+
+        <div class="flex items-center gap-2 px-4 py-2 border-b border-slate-100 bg-white shrink-0">
+          <span class="text-[10px] font-semibold text-slate-400 tracking-wide shrink-0">内置示例</span>
+          <button v-for="b in BUILTIN" :key="b.key" @click="loadSample(b.key)"
+                  class="px-2.5 py-1 rounded-md border border-slate-200 hover:border-indigo-300 hover:text-indigo-600 bg-white text-[11px] font-medium text-slate-600 transition-colors">
+            <i class="fa-solid mr-1" :class="b.icon"></i>{{ b.label }}
+          </button>
         </div>
 
         <div class="flex-1 overflow-auto p-3">

@@ -50,10 +50,13 @@ body {
 
 /* ---------- 表格：更易扫读、可交互 ---------- */
 .step-panel table { border-spacing:0; }
-.step-panel thead th {
+/* :not(.sticky)：这一条不在 @layer 里，会盖过 Tailwind 分层的 .sticky（分层规则打不过未分层），
+   行号列要横向滚动时钉在左边，所以把它排除出去。 */
+.step-panel thead th:not(.sticky) {
   position:relative; font-weight:600; color:#475569;
   background:#f8fafc; white-space:nowrap;
 }
+.step-panel thead th.sticky { font-weight:600; color:#475569; }
 .step-panel thead th:first-child { border-top-left-radius:8px; }
 .step-panel thead th:last-child  { border-top-right-radius:8px; }
 .step-panel tbody td { border-color:var(--line-soft); }

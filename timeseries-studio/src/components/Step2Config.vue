@@ -3,7 +3,7 @@ import { ref, computed, reactive, watch, onActivated } from 'vue'
 import { ElMessageBox } from 'element-plus'
 import {
   state, ds, switchStep, toast, PAGE_SIZE, wsActionLog,
-  detectTimeFormat, convertTimeColumn, detectedFreqMinutes, pageColumnValues,
+  timeFormatDetect, setTimeColumn, convertTimeColumn, detectedFreqMinutes, pageColumnValues,
   refreshPage, refreshOverview, rowCount,
   resampleDataset, resamplePreview,
   loadExoCatalog, exoColumns,
@@ -12,7 +12,7 @@ import {
   renameColumn, deleteColumn, convertColumnUnit, splitCounts, setSplitRatio, applySplitColumn
 } from '../store'
 import {
-  convertSingleTime, convertWithCustomFormat, isMissing,
+  isMissing,
   UNIT_CONVERSIONS, RESAMPLE_RATE_MAP
 } from '../utils'
 import { checkBackend, API_BASE } from '../api'
@@ -43,9 +43,12 @@ const pageRows = computed(() => {
 })
 const pageFrom = computed(() => (page.value.total ? page.value.offset + 1 : 0))
 const pageTo = computed(() => page.value.offset + page.value.rows.length)
-const pageNo = computed(() => Math.floor(page.value.offset / page.value.limit) + 1)
-const pageCount = computed(() => Math.max(1, Math.ceil(page.value.total / page.value.limit)))
+// 页大小以界面这一份为准（下拉框绑的就是它）。整表页码也从这里推：
+// 末页那一页只回 17 行时，用"本页实际行数"当页大小会把页码和选中项一起算没。
 const PAGE_SIZES = [20, 50, 100, 200, 500]
+const pageSize = ref(page.value.limit || PAGE_SIZE)
+const pageNo = computed(() => Math.floor(page.value.offset / pageSize.value) + 1)
+const pageCount = computed(() => Math.max(1, Math.ceil(page.value.total / pageSize.value)))
 const paging = ref(false)
 const pageMissing = computed(() => {
   let n = 0
@@ -55,14 +58,17 @@ const pageMissing = computed(() => {
 
 async function goPage(offset, limit) {
   if (!hasWs.value || paging.value) return
-  const size = limit ?? page.value.limit
+  const size = limit ?? pageSize.value
   const maxOffset = Math.max(0, Math.floor((page.value.total - 1) / size) * size)
   const target = Math.min(Math.max(0, offset), maxOffset)
-  if (target === page.value.offset && size === page.value.limit) return
+  if (target === page.value.offset && size === pageSize.value) return
+  pageSize.value = size
   paging.value = true
   try { await refreshPage(target, size) } finally { paging.value = false }
 }
 function onPageSize(ev) { goPage(0, Number(ev.target.value)) }
+// 换数据集/撤销后端可能带回另一种页大小，下拉框跟着走（只认这五档，别的值不覆盖选中项）
+watch(() => page.value.limit, (v) => { if (PAGE_SIZES.includes(v)) pageSize.value = v })
 
 // 整表概览（采样间隔/未解析时间）与当前页都要向后端取，进入本步即刷新一次
 const numbersBusy = ref(false)
@@ -75,63 +81,97 @@ async function reloadServerNumbers() {
 }
 
 // ============ 时间列识别与转换 ============
+// 这一张卡里没有任何浏览器端时间算法：判定（能不能当时间列、什么源格式、命中率）和渲染
+// （转换前后各三个样本）都由后端对**整列**解析一次后回给这里。一页样本推不出整表结论，
+// 而猜错的代价是把一列中文文本或浮点读数洗成 1970 年的假时间，界面上还不留错字。
 const timeCol = ref(d.value.timeCol)
 // 换数据集要重置本地选择；同一数据集内的增删改（touch）不能重置，否则冲掉用户手选。
 watch([() => state.currentKey, () => d.value.timeCol], ([, v]) => { timeCol.value = v })
-const detected = ref(null)
+const detected = ref(null)          // 后端 time-detect 的整列回执
+const detectBusy = ref(false)
+const srcFmt = ref('')              // 自动识别认不出时手填的「源」格式
+const previewAfter = ref([])        // 后端按目标格式再渲染一次的样本
 const targetFmt = ref('YYYY-MM-DD HH:mm:ss')
 const customFmt = ref('DD/MM/YYYY HH:mm')
-const convertPreview = ref(null)
 const convertStatus = ref(null)
 const converting = ref(false)
+const assigning = ref(false)
 
-function sampleTimes() {
-  return pageColumnValues(timeCol.value).filter(v => !isMissing(v)).slice(0, 3).map(String)
-}
-function localConvert(raw) {
-  return targetFmt.value === 'custom'
-    ? convertWithCustomFormat(raw, customFmt.value)
-    : convertSingleTime(raw, targetFmt.value)
-}
+const DISPLAY_FALLBACK = ['YYYY-MM-DD HH:mm:ss', 'YYYY-MM-DD HH:mm', 'YYYY-MM-DD',
+  'YYYY/MM/DD HH:mm', 'YYYY/MM/DD', 'YYYY-MM-DDTHH:mm:ss', 'YYYY-MM-DD HH:mm:ss.SSS',
+  'YYYYMMDDHHmmss', 'YYYYMMDD', 'epoch_ms', 'epoch_s']
+// 下拉与提示都读后端 health 的白名单（后端加了格式，界面不用改代码就跟上）
+const displayFormats = computed(() => state.backend.limits?.displayFormats || DISPLAY_FALLBACK)
+const parseFormatCount = computed(() => (state.backend.limits?.parseFormats || []).length)
+const formatTokens = computed(() => state.backend.limits?.formatTokens || ['YYYY', 'MM', 'DD', 'HH', 'mm', 'ss', 'SSS'])
+const minHitRate = computed(() => (state.backend.limits?.minTimeHitRate ?? 0.6) * 100)
+const targetFmtFull = computed(() => (targetFmt.value === 'custom' ? customFmt.value : targetFmt.value))
+const isCurrentTimeCol = computed(() => !!timeCol.value && timeCol.value === d.value.timeCol)
 
-function runDetect(silent = false) {
-  const r = detectTimeFormat(timeCol.value)
-  if (!r) {
-    detected.value = null
-    convertPreview.value = null
-    if (!silent) toast('warning', `当前页窗口（第 ${pageFrom.value}–${pageTo.value} 行）没有可识别的时间样本，请翻页或换列`)
+async function runDetect(silent = false) {
+  detected.value = null
+  previewAfter.value = []
+  if (!hasWs.value || !backendReady.value || !timeCol.value) {
+    if (!silent && !timeCol.value) detected.value = { ok: false, col: '', reason: '还没有可用的时间列，请先在上方选一个文本列再识别' }
     return
   }
+  detectBusy.value = true
+  let r = null
+  try { r = await timeFormatDetect(timeCol.value, srcFmt.value.trim()) } finally { detectBusy.value = false }
+  if (!r) return
   detected.value = r
-  const before = sampleTimes()
-  convertPreview.value = {
-    // 浏览器端只是"预估"，真实渲染由后端完成；执行转换后会用后端返回值覆盖并比对
-    beforeFmt: r.format, afterFmt: targetFmt.value === 'custom' ? customFmt.value : targetFmt.value,
-    before, after: before.map(localConvert), estimated: true, drifted: false
-  }
   if (!silent) convertStatus.value = null
+  if (r.ok) await runTargetPreview()
+  else if (!silent) toast('warning', `「${r.col}」不能当时间列：${r.reason}`)
 }
 
-watch([timeCol, () => d.value.wsId, () => page.value.offset], () => runDetect(true), { immediate: true })
-watch(targetFmt, () => { if (detected.value) runDetect(true) })
+// 目标格式的预览同样让后端渲染一次：这里的 after 与转换后页面上看到的值必须同源
+async function runTargetPreview() {
+  const r = detected.value
+  if (!r?.ok || !r.isCurrent || !targetFmtFull.value) { previewAfter.value = []; return }
+  const p = await timeFormatDetect(r.col, targetFmtFull.value)
+  previewAfter.value = p?.ok ? p.samplesAfter : []
+}
+
+watch([timeCol, () => d.value.wsId], () => { srcFmt.value = ''; runDetect(true) }, { immediate: true })
+watch([targetFmt, customFmt], () => { runTargetPreview() })
+
+// 目标格式的起点是这一列此刻真正在用的显示格式：一进来就停在 YYYY-MM-DD HH:mm:ss 的话，
+// 点一次「执行转换」就把毫秒抹平了，而用户看到的是一次他没要求的改动。
+watch([() => d.value.timeFormat, timeCol], ([fmt, sel]) => {
+  if (!fmt || sel !== d.value.timeCol) return
+  if (displayFormats.value.includes(fmt)) { if (targetFmt.value !== 'custom') targetFmt.value = fmt }
+  else { targetFmt.value = 'custom'; customFmt.value = fmt }
+}, { immediate: true })
+
+async function runAssign() {
+  if (assigning.value || !detected.value?.ok) return
+  assigning.value = true
+  const r = await setTimeColumn(timeCol.value, srcFmt.value.trim())
+  assigning.value = false
+  if (!r) return
+  toast('success', `已把「${r.timeCol}」指定为时间列（整表 ${r.rowCount.toLocaleString()} 行）`)
+  await runDetect(true)
+}
 
 async function runConvert() {
   if (converting.value) return
+  if (!isCurrentTimeCol.value) { toast('warning', '先点「指定为时间列」把这一列转成时间，再换显示格式'); return }
   converting.value = true
-  const est = convertPreview.value?.after?.slice() || []
-  const before = convertPreview.value?.before?.slice() || sampleTimes()
-  const prevFmt = detected.value?.format || d.value.timeFormat
+  const est = previewAfter.value.slice()
+  const prevFmt = d.value.timeFormat
   const changed = await convertTimeColumn(timeCol.value, targetFmt.value, customFmt.value)
   converting.value = false
   if (changed === null) return
-  const after = sampleTimes()
+  const after = pageColumnValues(timeCol.value).filter(v => !isMissing(v)).slice(0, 3).map(String)
+  // 两条来路对拍：time-detect 的渲染 vs /rows 页窗口里的值，同一次后端计算该给同一个字符串
   const drifted = est.length > 0 && after.length > 0 && after.some((v, i) => est[i] !== v)
-  detected.value = detectTimeFormat(timeCol.value) || detected.value
-  convertPreview.value = { beforeFmt: prevFmt, afterFmt: targetFmt.value === 'custom' ? customFmt.value : targetFmt.value, before, after, estimated: false, drifted }
+  await runDetect(true)
   convertStatus.value = {
     ok: !drifted,
-    text: `后端已转换 ${totalRows.value.toLocaleString()} 行 × 时间列，${changed.toLocaleString()} 个值发生变化；` +
-      `浏览器只重取当前页 ${after.length.toLocaleString()} 个样本核对渲染结果`
+    text: drifted
+      ? `整表 ${totalRows.value.toLocaleString()} 行已按 ${targetFmtFull.value} 重渲染（${changed.toLocaleString()} 个值变化），但预演与页窗口取值不一致，已以页面为准`
+      : `整表 ${totalRows.value.toLocaleString()} 行按 ${prevFmt} → ${targetFmtFull.value} 重渲染，${changed.toLocaleString()} 个值变化；预演的 ${est.length} 个样本与页窗口取值逐字符一致`
   }
   toast('success', '时间格式转换完成（后端执行）')
 }
@@ -158,14 +198,18 @@ watch(wsVersion, () => refreshOverview())
 async function confirmResample() {
   const p = projection.value
   const msg = p
-    ? `后端按真实时间跨度预演：${p.currentRows.toLocaleString()} 行 → ${p.projectedRows.toLocaleString()} 行` +
-      `（${targetRate.value} 粒度，${p.filledBuckets.toLocaleString()} 个桶有数据、${p.emptyBuckets.toLocaleString()} 个桶为空` +
-      `${p.compression ? `，压缩比 ${p.compression.toFixed(2)}×` : ''}）。\n当前工作区数据会被替换（可用撤销回退）。确认继续？`
+    ? `${p.directionLabel || '重采样'}：${p.currentRows.toLocaleString()} 行 → ${p.projectedRows.toLocaleString()} 行` +
+      `（源 ${p.sourceMinutes} min → 目标 ${RESAMPLE_RATE_MAP[targetRate.value]} min，` +
+      `${p.filledBuckets.toLocaleString()} 个桶有观测、${p.emptyBuckets.toLocaleString()} 个桶没有观测` +
+      `${p.direction === 'down' && p.compression ? `，压缩比 ${p.compression.toFixed(2)}×` : ''}` +
+      `${p.direction === 'up' ? `，行数 ×${(p.projectedRows / p.currentRows).toFixed(2)}` : ''}）。\n` +
+      `${p.emptyNote ? `${p.emptyNote}\n` : ''}当前工作区数据会被替换（可用撤销回退）。确认继续？`
     : `将在后端按 ${targetRate.value} 粒度聚合整表（当前 ${totalRows.value.toLocaleString()} 行）。确认继续？`
   try { await ElMessageBox.confirm(msg, '重采样确认', { type: 'warning' }) } catch (e) { return }
   const r = await resampleDataset(targetRate.value, resampleMethod.value)
   if (!r) return
-  toast('success', `重采样完成（后端）：${r.oldCount.toLocaleString()} 行 → ${r.newCount.toLocaleString()} 行`)
+  toast('success', `${r.directionLabel || '重采样'}完成：${r.oldCount.toLocaleString()} 行 → ${r.newCount.toLocaleString()} 行` +
+    (r.fillNote ? ` · ${r.fillNote}` : ''))
 }
 
 // ============ 外生变量：只从文件导入，生成与对齐都在服务端 ============
@@ -508,15 +552,33 @@ const PIPE_CHIPS = [
       <div v-show="activeTab === 'time'" class="p-4 flex flex-col gap-3">
         <div class="flex items-center justify-between">
           <h2 class="text-xs font-bold text-slate-700 flex items-center">
-            <i class="fa-regular fa-clock mr-1.5 text-indigo-600"></i>时间列识别与转换引擎
+            <i class="fa-regular fa-clock mr-1.5 text-indigo-600"></i>时间列识别与转换
           </h2>
-          <div class="flex items-center gap-2">
-            <span class="text-[10px] text-slate-400">当前格式:</span>
-            <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
+          <div class="flex items-center gap-2 flex-wrap justify-end">
+            <span v-if="detected && detected.ok"
+                  class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-emerald-50 text-emerald-700 border border-emerald-200">
               <i class="fa-solid fa-check-circle text-[9px]"></i>
-              <span>{{ detected ? detected.format : '未识别' }}</span>
+              按 {{ detected.format }} 解析出 {{ detected.parsedCount.toLocaleString() }}/{{ detected.nonEmpty.toLocaleString() }} 个值（{{ detected.matchRate.toFixed(1) }}%）
             </span>
-            <span class="text-[10px] text-slate-400 font-mono">{{ detected ? `样本命中率 ${detected.matchRate.toFixed(0)}%` : '点击识别格式' }}</span>
+            <span v-else-if="detected"
+                  class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold bg-rose-50 text-rose-700 border border-rose-200">
+              <i class="fa-solid fa-ban text-[9px]"></i>整列解析不出时间
+            </span>
+            <span v-else class="text-[10px] text-slate-400 font-mono">{{ detectBusy ? '后端整列解析中…' : '点「识别格式」由后端按整列判定' }}</span>
+            <span class="text-[10px] text-slate-400 font-mono">当前显示：{{ d.timeFormat }}</span>
+          </div>
+        </div>
+
+        <!-- 没有时间列时照实说，并把"试过又退回"的列与真实原因念出来，不停留在一句"未识别" -->
+        <div v-if="!d.timeCol" class="text-[11px] px-3 py-2 rounded-lg border border-amber-200 bg-amber-50 text-amber-800 flex items-start gap-2">
+          <i class="fa-solid fa-circle-info mt-0.5 text-[10px]"></i>
+          <div>
+            本工作区没有可用的时间列，无法转换时间格式。
+            <template v-if="(d.timeRejected || []).length">
+              已试过并退回的列：
+              <span v-for="r in d.timeRejected" :key="r.key" class="font-mono mr-2">「{{ r.key }}」{{ r.reason }}</span>
+            </template>
+            <template v-else>选一个文本列点「识别格式」，认不出就在下面手填源格式再试。</template>
           </div>
         </div>
 
@@ -524,76 +586,98 @@ const PIPE_CHIPS = [
           <div>
             <label class="text-[11px] text-slate-500 block mb-1">时间列</label>
             <select v-model="timeCol" class="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:border-indigo-400 outline-none">
-              <option v-for="c in d.columns" :key="c.key" :value="c.key">{{ c.label }}<template v-if="c.label !== c.key"> ({{ c.key }})</template></option>
+              <option v-for="c in d.columns" :key="c.key" :value="c.key">{{ c.label }}<template v-if="c.label !== c.key"> ({{ c.key }})</template>· {{ c.type }}</option>
             </select>
           </div>
           <div>
-            <label class="text-[11px] text-slate-500 block mb-1">识别到的原始格式</label>
-            <div class="text-xs font-mono py-1.5 px-2 bg-emerald-50/70 border border-emerald-200 text-emerald-800 rounded truncate">
-              {{ detected ? detected.format : '— 等待识别' }}
+            <label class="text-[11px] text-slate-500 block mb-1">识别到的源格式<span class="text-[10px] text-slate-400 ml-1">{{ detected && detected.via === 'manual' ? '（手填）' : '（自动）' }}</span></label>
+            <div class="text-xs font-mono py-1.5 px-2 rounded border truncate"
+                 :class="detected && detected.ok ? 'bg-emerald-50/70 border-emerald-200 text-emerald-800' : 'bg-slate-50 border-slate-200 text-slate-500'">
+              {{ detected && detected.ok ? detected.format : '— 认不出，可在下面手填' }}
             </div>
           </div>
           <div>
-            <label class="text-[11px] text-slate-500 block mb-1">目标输出格式</label>
+            <label class="text-[11px] text-slate-500 block mb-1">目标显示格式</label>
             <select v-model="targetFmt" class="w-full text-xs border border-slate-200 rounded px-2 py-1.5 bg-white focus:border-indigo-400 outline-none">
-              <option value="YYYY-MM-DD HH:mm:ss">YYYY-MM-DD HH:mm:ss</option>
-              <option value="YYYY/MM/DD HH:mm">YYYY/MM/DD HH:mm</option>
-              <option value="YYYYMMDDHHmmss">YYYYMMDDHHmmss</option>
-              <option value="YYYY-MM-DD">YYYY-MM-DD (仅日期)</option>
-              <option value="epoch_ms">Unix 毫秒时间戳</option>
-              <option value="custom">自定义格式…</option>
+              <option v-for="f in displayFormats" :key="f" :value="f">{{ f }}</option>
+              <option value="custom">自定义模板…</option>
             </select>
           </div>
           <div class="flex items-end gap-1.5">
-            <button @click="runDetect()" class="flex-1 py-1.5 border border-indigo-300 hover:bg-indigo-50 text-indigo-600 rounded text-xs font-semibold transition-colors flex items-center justify-center gap-1">
-              <i class="fa-solid fa-magnifying-glass text-[10px]"></i>识别格式
+            <button @click="runDetect()" :disabled="detectBusy || !backendReady || !hasWs || !timeCol"
+                    class="flex-1 py-1.5 border border-indigo-300 hover:bg-indigo-50 disabled:opacity-40 text-indigo-600 rounded text-xs font-semibold transition-colors flex items-center justify-center gap-1">
+              <i class="fa-solid" :class="detectBusy ? 'fa-spinner fa-spin' : 'fa-magnifying-glass'"  ></i>识别格式
             </button>
-            <button @click="runConvert" :disabled="converting || !backendReady || !hasWs"
+            <button @click="runConvert" :disabled="converting || !backendReady || !hasWs || !isCurrentTimeCol"
                     class="flex-1 py-1.5 bg-indigo-600 hover:bg-indigo-700 disabled:opacity-50 text-white rounded text-xs font-semibold shadow-sm transition-colors flex items-center justify-center gap-1">
-              <i class="fa-solid fa-wand-magic-sparkles text-[10px]"></i>{{ converting ? '后端转换中…' : '执行转换' }}
+              <i class="fa-solid fa-wand-magic-sparkles text-[10px]"></i>{{ converting ? '转换中…' : '执行转换' }}
             </button>
           </div>
         </div>
 
-        <div v-if="targetFmt === 'custom'" class="grid grid-cols-2 gap-2">
+        <!-- 两个手填口子：源格式（认不出时怎么读进来）与目标模板（怎么显示出去） -->
+        <div class="grid grid-cols-2 gap-2">
           <div>
-            <label class="text-[11px] text-slate-500 block mb-1">自定义格式字符串</label>
-            <input v-model="customFmt" placeholder="如: DD/MM/YYYY HH:mm" class="w-full text-xs border border-slate-200 rounded px-2 py-1.5 font-mono bg-white focus:border-indigo-400 outline-none" />
+            <label class="text-[11px] text-slate-500 block mb-1">源格式（自动识别认不出时手填，只影响解析）</label>
+            <div class="flex items-center gap-1.5">
+              <input v-model="srcFmt" :placeholder="parseFormatCount ? `如 ${parseFormatCount} 种已知格式之一，或自定义模板` : '如 DD/MM/YYYY HH:mm'"
+                     class="flex-1 text-xs border border-slate-200 rounded px-2 py-1.5 font-mono bg-white focus:border-indigo-400 outline-none" />
+              <button @click="runAssign()" :disabled="assigning || !detected || !detected.ok || detected.isCurrent || !backendReady || !hasWs"
+                      class="shrink-0 py-1.5 px-2.5 rounded text-[11px] font-semibold border"
+                      :class="detected && detected.ok && !detected.isCurrent ? 'border-emerald-300 text-emerald-700 bg-emerald-50 hover:bg-emerald-100' : 'border-slate-200 text-slate-400 bg-slate-50'">
+                <i class="fa-solid fa-stopwatch text-[9px] mr-1"></i>{{ assigning ? '写入中…' : (detected && detected.isCurrent ? '已是时间列' : '指定为时间列') }}
+              </button>
+            </div>
+            <p class="text-[10px] text-slate-400 mt-1">
+              占位符 {{ formatTokens.join(' / ') }}（单字母 M/D/H/m = 不补零）；一列至少 {{ minHitRate.toFixed(0) }}% 的有值样本解析得动才算时间列。
+            </p>
           </div>
-          <div></div>
+          <div v-if="targetFmt === 'custom'">
+            <label class="text-[11px] text-slate-500 block mb-1">自定义显示模板</label>
+            <input v-model="customFmt" placeholder="如: DD/MM/YYYY HH:mm 或 YYYY年MM月DD日 HH:mm:ss.SSS"
+                   class="w-full text-xs border border-slate-200 rounded px-2 py-1.5 font-mono bg-white focus:border-indigo-400 outline-none" />
+            <p class="text-[10px] text-slate-400 mt-1">模板里的文字原样保留，只替换占位符；分隔符写成 <span class="font-mono">-</span>、<span class="font-mono">/</span>、<span class="font-mono">.</span> 都行。</p>
+          </div>
         </div>
 
-        <div v-if="convertPreview">
+        <div v-if="detected && detected.ok">
           <div class="grid grid-cols-2 gap-2">
             <div class="bg-slate-50 border border-slate-200 rounded-lg px-3 py-2">
               <div class="flex items-center justify-between mb-1">
-                <span class="text-[10px] font-semibold text-slate-500">转换前（当前页真实样本）</span>
-                <span class="text-[9px] font-mono px-1.5 py-0.5 rounded bg-slate-200 text-slate-500">{{ convertPreview.beforeFmt }}</span>
+                <span class="text-[10px] font-semibold text-slate-500">后端读到的样本（整列前 {{ (detected.samplesBefore || []).length }} 个）</span>
+                <span class="text-[9px] font-mono px-1.5 py-0.5 rounded bg-slate-200 text-slate-500">{{ detected.format }}</span>
               </div>
               <div class="text-xs font-mono text-slate-600 space-y-0.5 break-all">
-                <div v-for="(s, i) in convertPreview.before" :key="i">{{ s }}</div>
+                <div v-for="(s, i) in detected.samplesBefore" :key="i">{{ s }}</div>
               </div>
             </div>
             <div class="bg-indigo-50/50 border border-indigo-200 rounded-lg px-3 py-2">
               <div class="flex items-center justify-between mb-1">
                 <span class="text-[10px] font-semibold text-indigo-600">
-                  转换后（{{ convertPreview.estimated ? '浏览器预估' : '后端渲染' }}）
+                  {{ previewAfter.length ? '按目标格式渲染（后端）' : '当前显示（后端）' }}
                 </span>
-                <span class="text-[9px] font-mono px-1.5 py-0.5 rounded bg-indigo-200 text-indigo-700">{{ convertPreview.afterFmt }}</span>
+                <span class="text-[9px] font-mono px-1.5 py-0.5 rounded bg-indigo-200 text-indigo-700">
+                  {{ previewAfter.length ? targetFmtFull : detected.displayFormat }}
+                </span>
               </div>
               <div class="text-xs font-mono text-indigo-800 space-y-0.5 break-all">
-                <div v-for="(s, i) in convertPreview.after" :key="i">{{ s }}</div>
+                <div v-for="(s, i) in (previewAfter.length ? previewAfter : detected.samplesAfter)" :key="i">{{ s }}</div>
               </div>
             </div>
           </div>
-          <p v-if="convertPreview.estimated" class="text-[10px] text-slate-400 mt-1 flex items-center gap-1">
-            <i class="fa-solid fa-circle-info"></i>
-            「浏览器预估」只用于预览目标格式，执行转换后这里会换成后端真实渲染值并自动比对。
-          </p>
-          <p v-else-if="convertPreview.drifted" class="text-[10px] text-amber-600 mt-1 flex items-center gap-1">
+          <p v-if="detected.unparsed" class="text-[10px] text-amber-600 mt-1 flex items-center gap-1">
             <i class="fa-solid fa-triangle-exclamation"></i>
-            本地格式预估与后端渲染不一致，已以后端返回值为展示基准。
+            整列 {{ detected.nonEmpty.toLocaleString() }} 个有值样本里有 {{ detected.unparsed.toLocaleString() }} 个按 {{ detected.format }} 解析不动，这些行会变成缺失值。
           </p>
+        </div>
+        <div v-else-if="detected" class="text-[11px] px-3 py-2 rounded-lg border border-rose-200 bg-rose-50 text-rose-800 flex items-start gap-2">
+          <i class="fa-solid fa-ban mt-0.5 text-[10px]"></i>
+          <div>
+            「{{ detected.col }}」不能当时间列：{{ detected.reason }}
+            <template v-if="detected.samplesBefore && detected.samplesBefore.length">
+              <div class="font-mono text-[10px] text-rose-600 mt-0.5">读到的原值：{{ detected.samplesBefore.join('　') }}</div>
+            </template>
+          </div>
         </div>
 
         <div v-if="convertStatus" class="flex items-center gap-2 text-[11px] px-3 py-1.5 rounded-lg border"
@@ -643,13 +727,21 @@ const PIPE_CHIPS = [
           <span class="text-slate-500 shrink-0">后端预演:</span>
           <span v-if="projBusy" class="font-mono text-slate-400"><i class="fa-solid fa-spinner fa-spin mr-1"></i>正在按真实时间跨度预演…</span>
           <span v-else-if="projection" class="font-mono font-bold text-indigo-600 text-right">
+            <span class="px-1.5 py-0.5 rounded mr-1 text-[10px]"
+                  :class="projection.direction === 'up' ? 'bg-amber-100 text-amber-700'
+                        : (projection.direction === 'down' ? 'bg-emerald-100 text-emerald-700' : 'bg-slate-200 text-slate-600')">{{ projection.directionLabel }}</span>
             {{ projection.currentRows.toLocaleString() }} 条 → {{ projection.projectedRows.toLocaleString() }} 条
             <span class="text-[10px] font-normal text-slate-400">
-              （{{ projection.filledBuckets.toLocaleString() }} 桶有值 / {{ projection.emptyBuckets.toLocaleString() }} 桶为空{{ projection.compression ? ` · 压缩 ${projection.compression.toFixed(2)}×` : '' }}）
+              （源 {{ projection.sourceMinutes }} min → 目标 {{ RESAMPLE_RATE_MAP[targetRate] }} min ·
+              {{ projection.filledBuckets.toLocaleString() }} 桶有观测 / {{ projection.emptyBuckets.toLocaleString() }} 桶无观测{{ projection.direction === 'down' && projection.compression ? ` · 压缩 ${projection.compression.toFixed(2)}×` : '' }}{{ projection.direction === 'up' ? ` · 行数 ×${(projection.projectedRows / projection.currentRows).toFixed(2)}` : '' }}）
             </span>
           </span>
           <span v-else class="font-mono text-slate-400">{{ backendReady ? '载入数据集后由后端预演' : `需后端在线（${API_BASE}）` }}</span>
         </div>
+        <!-- 升/降采样的语义差别必须写在按钮旁边：合成出来的桶不是新测到的数据 -->
+        <p v-if="projection" class="mt-1.5 text-[10px]" :class="projection.direction === 'up' ? 'text-amber-600' : 'text-slate-400'">
+          <i class="fa-solid fa-circle-info mr-1"></i>{{ projection.emptyNote || '有观测的桶按所选方法聚合，桶数由后端按真实时间跨度数出' }}
+        </p>
         <div class="mt-2 flex items-center justify-between gap-2">
           <span v-if="!backendReady" class="text-[10px] text-rose-500">
             <button @click="checkBackend()" class="underline hover:no-underline font-semibold">重新探测后端</button> 后才能执行加工
@@ -911,27 +1003,30 @@ const PIPE_CHIPS = [
           </span>
         </div>
         <div class="flex items-center gap-2 text-[11px] text-slate-500">
-          <select :value="page.limit" @change="onPageSize" class="text-[11px] border border-slate-200 rounded px-1.5 py-0.5 bg-white">
+          <select :value="pageSize" @change="onPageSize" class="text-[11px] border border-slate-200 rounded px-1.5 py-0.5 bg-white">
             <option v-for="n in PAGE_SIZES" :key="n" :value="n">{{ n }} 行/页</option>
           </select>
           <button @click="goPage(0)" :disabled="pageNo <= 1 || paging || !hasWs"
                   class="px-2 py-0.5 border border-slate-200 rounded hover:border-indigo-300 hover:text-indigo-600 disabled:opacity-40">首页</button>
-          <button @click="goPage(page.offset - page.limit)" :disabled="pageNo <= 1 || paging || !hasWs"
+          <button @click="goPage(page.offset - pageSize)" :disabled="pageNo <= 1 || paging || !hasWs"
                   class="px-2 py-0.5 border border-slate-200 rounded hover:border-indigo-300 hover:text-indigo-600 disabled:opacity-40">上一页</button>
           <span class="font-mono">{{ pageNo }} / {{ pageCount }}</span>
-          <button @click="goPage(page.offset + page.limit)" :disabled="pageTo >= page.total || paging || !hasWs"
+          <button @click="goPage(page.offset + pageSize)" :disabled="pageTo >= page.total || paging || !hasWs"
                   class="px-2 py-0.5 border border-slate-200 rounded hover:border-indigo-300 hover:text-indigo-600 disabled:opacity-40">下一页</button>
-          <button @click="goPage((pageCount - 1) * page.limit)" :disabled="pageTo >= page.total || paging || !hasWs"
+          <button @click="goPage((pageCount - 1) * pageSize)" :disabled="pageTo >= page.total || paging || !hasWs"
                   class="px-2 py-0.5 border border-slate-200 rounded hover:border-indigo-300 hover:text-indigo-600 disabled:opacity-40">末页</button>
           <span v-if="paging" class="text-indigo-500"><i class="fa-solid fa-spinner fa-spin"></i></span>
         </div>
       </div>
-      <div class="overflow-auto">
-        <table class="w-full text-left text-xs border-collapse">
+      <div class="overflow-x-auto overflow-y-auto">
+        <!-- 列多时不按容器宽度硬塞：表格按内容排开（w-max），整张表可以左右滑动，
+             列头纵向仍是吸顶的，最左边的行号列横向滚动时也留在原位。 -->
+        <table class="min-w-full w-max text-left text-xs border-collapse">
           <thead class="sticky top-0 bg-slate-100 text-slate-600 font-semibold border-b border-slate-200 z-10">
             <tr>
-              <th class="px-2 py-2 border-r border-slate-200 text-right text-[10px] font-mono text-slate-400 w-14">#</th>
-              <th v-for="(c, idx) in d.columns" :key="c.key" class="group relative px-3 py-2 border-r border-slate-200 last:border-r-0 select-none">
+              <th class="px-2 py-2 border-r border-slate-200 text-right text-[10px] font-mono text-slate-400 w-14 min-w-[56px] sticky left-0 z-20 bg-slate-100">#</th>
+              <th v-for="(c, idx) in d.columns" :key="c.key"
+                  class="group relative px-3 py-2 border-r border-slate-200 last:border-r-0 select-none min-w-[150px] whitespace-nowrap">
                 <div v-if="editingIdx === idx" class="flex items-center gap-1">
                   <input v-model="editingValue" @keyup.enter="commitRename(idx)" @keyup.esc="editingIdx = -1"
                          class="flex-1 text-xs font-semibold px-1 py-0.5 border border-indigo-400 rounded bg-white outline-none ring-2 ring-indigo-200 font-sans" v-focus />
@@ -943,7 +1038,7 @@ const PIPE_CHIPS = [
                   </button>
                 </div>
                 <div v-else class="flex items-center justify-between gap-1">
-                  <span class="cursor-text hover:text-indigo-600 truncate max-w-[120px]" @dblclick="startRename(idx)">{{ c.label }}</span>
+                  <span class="cursor-text hover:text-indigo-600" @dblclick="startRename(idx)">{{ c.label }}</span>
                   <div class="flex items-center gap-1 shrink-0">
                     <span v-if="c.unit" class="text-[9px] font-mono px-1 rounded bg-indigo-100 text-indigo-600 font-semibold" title="当前单位">{{ c.unit }}</span>
                     <span class="text-[10px] font-mono font-normal uppercase px-1 rounded bg-slate-200 text-slate-500">{{ c.type }}</span>
@@ -997,9 +1092,9 @@ const PIPE_CHIPS = [
               </td>
             </tr>
             <tr v-for="(row, ri) in pageRows" :key="page.offset + ri" class="hover:bg-indigo-50/40">
-              <td class="px-2 py-1.5 text-right text-[10px] text-slate-400 border-r border-slate-100 font-mono">{{ (page.offset + ri + 1).toLocaleString() }}</td>
+              <td class="px-2 py-1.5 text-right text-[10px] text-slate-400 border-r border-slate-100 font-mono sticky left-0 bg-white">{{ (page.offset + ri + 1).toLocaleString() }}</td>
               <td v-for="c in d.columns" :key="c.key"
-                  class="px-3 py-1.5 border-r border-slate-100 last:border-r-0 truncate max-w-[180px]"
+                  class="px-3 py-1.5 border-r border-slate-100 last:border-r-0 truncate min-w-[150px] max-w-[260px]"
                   :class="isMissing(row[c.key]) ? 'bg-rose-50 text-rose-500 font-bold' : ''">
                 <template v-if="isMissing(row[c.key])"><i class="fa-solid fa-ban mr-1"></i>缺失</template>
                 <template v-else>{{ row[c.key] }}</template>

@@ -24,7 +24,7 @@ from ..schemas import (
     FeatureLagRequest, FeatureTimeRequest,
     HolidaysRequest, ImputeRequest, MaskDeleteRequest, MaskGenerateRequest,
     PresetRequest, RenameColumnRequest, ResampleRequest,
-    RestoreRequest, SaveAsRequest, SplitApplyRequest, TimeFormatRequest, DeleteColumnRequest,
+    RestoreRequest, SaveAsRequest, SetTimeColRequest, SplitApplyRequest, TimeFormatRequest, DeleteColumnRequest,
 )
 from ..services import dataset_store, exporter, explore, features
 from ..services import workspace as ws_store
@@ -117,6 +117,49 @@ def create_from_dataset(payload: DatasetWorkspaceRequest,
     return {"meta": meta, "page": ws.rows(offset, limit)}
 
 
+@router.post("/merge")
+async def create_merged_workspace(
+        files: list[UploadFile] = File(..., description="两份以上的 CSV/Excel/Parquet/Feather"),
+        persist: bool = Query(True, description="每份原始文件是否落盘到数据集目录"),
+        offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
+    """多文件按行合并 + 按时间排序：拼表在后端 pandas 里做，浏览器只拿回执和页窗口。
+
+    `persist` 默认打开：合并帧没有"原始整表"可退回，服务端重启后只能靠数据集目录里的这
+    几份文件依次重新解析再拼一遍，所以文件名必须真实落在目录里才能重建。
+    """
+    if len(files) < 2:
+        raise HTTPException(status_code=400, detail="合并至少需要两份文件；单份请走 POST /api/ws")
+    if len(files) > ws_store.MAX_MERGE_FILES:
+        raise HTTPException(status_code=400,
+                            detail=f"一次最多合并 {ws_store.MAX_MERGE_FILES} 份文件，本次收到 {len(files)} 份，请分批导入")
+    payloads: list[tuple[str, bytes]] = []
+    total = 0
+    for f in files:
+        name = f.filename or "data.csv"
+        content = await f.read()
+        if not content:
+            raise HTTPException(status_code=400, detail=f"上传文件 {name} 为空")
+        total += len(content)
+        if total > MAX_UPLOAD_BYTES:
+            raise HTTPException(status_code=413,
+                                detail=f"合并文件累计 {total / (1024 * 1024):.1f}MB，超过 "
+                                       f"{MAX_UPLOAD_MB}MB 上限（与单次导入同一口径）")
+        if persist:
+            # 先只做校名：第 3 份文件名非法时，不能把前 2 份已经写进目录
+            try:
+                dataset_store.safe_name(name)
+            except ValueError as exc:
+                raise HTTPException(status_code=400, detail=f"{name}：{exc}") from exc
+        payloads.append((name, content))
+    # 解析、合并、写盘都在服务里按这个顺序做：拼不成一张表的一批不会留下孤儿文件
+    ws, saved = _guard(ws_store.create_from_files,
+                       [(c, n) for n, c in payloads], None, persist)
+    meta = ws.meta_view()
+    if persist:
+        meta["source"] = {**meta["source"], "dir": str(dataset_store.dataset_dir())}
+    return {"meta": meta, "page": ws.rows(offset, limit), "persisted": saved, "merge": meta.get("merge")}
+
+
 @router.get("/{ws_id}")
 def get_meta(ws_id: str) -> dict:
     return _get(ws_id).meta_view()
@@ -141,6 +184,26 @@ def get_columns(ws_id: str, keys: str = Query(..., description="逗号分隔的�
 @router.get("/{ws_id}/overview")
 def get_overview(ws_id: str) -> dict:
     return _get(ws_id).overview()
+
+
+@router.get("/{ws_id}/time-detect")
+def get_time_detect(ws_id: str, col: str = Query(..., min_length=1, description="要试的列名"),
+                    format: str = Query("", description="手填的源格式（可选）：登记名、epoch_ms/epoch_s 或占位符模板"),
+                    customFormat: str = Query("", description="format=custom 时的模板")) -> dict:
+    """按整列真解析一次，回答"这一列能不能当时间列"：认不出也给真实原因与解析数。
+
+    判定不看列名像不像时间，只看有多少样本能按已知格式解析出来——所以中文文本列、
+    普通读数列都会被判"不能"，而不是被洗成 NaT 或 1970 年的假时间。
+    带 `format` 时按调用方指定的源格式解析（自动识别认不出时的出路），命中率照实回。
+    """
+    ws = _get(ws_id)
+    fmt = None
+    if (format or "").strip():
+        try:
+            fmt = ws_store.normalize_format(format, customFormat or None)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return _guard(ws_store.time_detect, ws, None, col, fmt)
 
 
 @router.get("/{ws_id}/quality")
@@ -169,8 +232,13 @@ def _numeric_only(ws: ws_store.Workspace, keys: list[str]) -> None:
 
 @router.get("/{ws_id}/series")
 def get_series(ws_id: str, cols: str = Query(..., description="逗号分隔的数值列名"),
-               points: int = Query(1200, ge=20, le=explore.MAX_POINTS)) -> dict:
-    """第四步的质量曲线：几条列共享一条抽稀时间轴，每列带原始行号、缺失标记与异常覆盖层。"""
+               points: int = Query(0, ge=0, le=explore.MAX_POINTS,
+                                  description="0（默认）= 全量，整表每一行都送回折线；> 0 = 按该上限抽稀")) -> dict:
+    """第四步的质量曲线：几条列共享一条时间轴，每列带原始行号、缺失标记与异常覆盖层。
+
+    默认全量（points=0）：折线一个点都不抽，行 × 列的格子数超过
+    `explore.FULL_RAW_MAX_VALUES` 时报 400 并说明怎么办，绝不偷偷抽点。
+    """
     ws = _get(ws_id)
     wanted = _split_cols(cols)
     if not wanted:
@@ -210,15 +278,17 @@ def get_hist(ws_id: str, col: str = Query(..., description="列名"),
 
 @router.get("/{ws_id}/series-multi")
 def get_series_multi(ws_id: str, cols: str = Query(..., description="逗号分隔的列名"),
-                     mode: str = Query("extremes", description="raw 全量 / extremes 极值抽稀 / mean 窗口均值"),
-                     points: int = Query(explore.DEFAULT_POINTS, ge=20, le=explore.MAX_POINTS),
+                     mode: str = Query(explore.DEFAULT_MODE,
+                                       description="raw 全量（每行都回，不抽点）/ extremes 极值 / mean 窗口均值 / lttb 三角面积降采样"),
+                     points: int = Query(explore.DEFAULT_POINTS, ge=20, le=explore.MAX_POINTS,
+                                         description="降采样档位的点数上限；raw 全量不受它约束"),
                      span: str = Query("all", description="all/year/month/week/day：按自然周期筛行"),
                      offset: int = Query(0, ge=-100000, le=100000,
                                          description="该档位内往前/往后第几个自然周期，0=第一期，越界贴到最近一端")) -> dict:
-    """多列叠加曲线：共享一条时间轴，每列一条抽稀后的序列，整表不出后端。
+    """多列叠加曲线：共享一条时间轴，每列一条降采样后的序列，整表不出后端。
 
     span 由服务端按真实时间列筛行（不是按行数估算），点数上限在窗口内重新分配，
-    所以「看一天」得到的是这一天自己的点，而不是整年抽稀后剩下的几颗。
+    所以「看一天」得到的是这一天自己的点，而不是整年降采样后剩下的几颗。
     """
     ws = _get(ws_id)
     wanted = _split_cols(cols)
@@ -358,6 +428,15 @@ def op_time_format(ws_id: str, payload: TimeFormatRequest,
                    offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
     result = _guard(ws.apply, {"kind": "set_time_format", "params": payload.model_dump()})
+    return _with_page(ws, result, offset, limit)
+
+
+@router.post("/{ws_id}/op/time-col")
+def op_time_col(ws_id: str, payload: SetTimeColRequest,
+                offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
+    """指定时间列：整列解析得过才改，改完这一列就是 datetime64（一条可撤销的命令）。"""
+    ws = _get(ws_id)
+    result = _guard(ws.apply, {"kind": "set_time_col", "params": payload.model_dump()})
     return _with_page(ws, result, offset, limit)
 
 

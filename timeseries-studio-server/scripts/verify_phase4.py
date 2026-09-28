@@ -34,6 +34,9 @@ REF = ROOT / "scripts" / "ref_phase4.mjs"
 REL_TOL = 1e-9
 BINS = 25
 POINTS = 3000
+# 四种降采样档位都要与 scripts/ref_phase4.mjs 里那份独立 JS 实现逐格对拍：
+# raw 现在是「窗口内每行都回」，lttb 是默认档（三角形面积选点）
+MODES = ("raw", "extremes", "mean", "lttb")
 
 FAILURES: list[str] = []
 
@@ -221,12 +224,12 @@ def section_parity():
               f"{full['colCount']} 列 / 数值列 {len(cols)}")
         for points in (POINTS, 500):
             t0 = time.perf_counter()
-            ref = node_ref(ROOT / "dataset" / filename, series_cols, ["raw", "extremes", "mean"], points)
+            ref = node_ref(ROOT / "dataset" / filename, series_cols, MODES, points)
             ms_node = (time.perf_counter() - t0) * 1000
             t0 = time.perf_counter()
             got_stats = api("GET", f"/api/ws/{ws}/stats?cols={urllib.parse.quote(','.join(series_cols))}")
             got_series = {m: api("GET", f"/api/ws/{ws}/series-multi?cols={urllib.parse.quote(','.join(series_cols))}"
-                                      f"&mode={m}&points={points}") for m in ("raw", "extremes", "mean")}
+                                      f"&mode={m}&points={points}") for m in MODES}
             ms_srv = (time.perf_counter() - t0) * 1000
 
             d = Diff(f"points={points} 统计矩阵（{len(cols)} 列 × 10 量）")
@@ -254,7 +257,7 @@ def section_parity():
                     dh.num(f, h[f], gh[f])
                 dh.report()
 
-            for mode in ("raw", "extremes", "mean"):
+            for mode in MODES:
                 r = next(s for s in ref["series"] if s["mode"] == mode)
                 g = got_series[mode]
                 ds = Diff(f"points={points} 叠加曲线 mode={mode}（{len(series_cols)} 列 × {g['points']} 点）")
@@ -303,8 +306,9 @@ def section_invariants():
     sc = cols[:6]
     q = urllib.parse.quote(",".join(sc))
     raw = api("GET", f"/api/ws/{ws}/series-multi?cols={q}&mode=raw&points=3000")
-    check(f"raw 模式：{n} 行抽到 {raw['points']} 点，且如实标记已抽稀",
-          raw["decimated"] is True and raw["points"] <= raw["maxPoints"] and len(raw["x"]) == raw["points"])
+    check(f"raw（全量）模式：{n} 行一行不抽，给满 {raw['points']} 点",
+          raw["decimated"] is False and raw["points"] == n and raw["maxPoints"] is None
+          and len(raw["x"]) == raw["points"], f"{raw['points']} 点 / {n} 行")
     ext = api("GET", f"/api/ws/{ws}/series-multi?cols={q}&mode=extremes&points=3000")
     stats_map = {r["key"]: r for r in stats["rows"]}
     lost = []
@@ -314,7 +318,7 @@ def section_invariants():
         if want["n"] and (min(vals) > want["min"] + 1e-9 or max(vals) < want["max"] - 1e-9):
             lost.append(s["col"])
     check("extremes 模式没有抽掉任何一列的最大/最小值（图就是用来看尖峰的）", not lost, lost[:4])
-    check("extremes 抽稀后的点数仍受上限约束", ext["points"] <= ext["maxPoints"], ext["points"])
+    check("extremes 降采样后的点数仍受上限约束", ext["points"] <= ext["maxPoints"], ext["points"])
     mean = api("GET", f"/api/ws/{ws}/series-multi?cols={q}&mode=mean&points=3000")
     check(f"mean 模式按 4 行一桶：{n} 行 → {mean['points']} 点 = ⌈{n}/4⌉",
           mean["windowStep"] == 4 and mean["points"] == math.ceil(n / 4), mean["points"])
@@ -324,15 +328,20 @@ def section_invariants():
         assert all(len(s["y"]) == len(mode["x"]) for s in mode["series"])
     check("每条曲线的 y 与共享 x 等长（前端画曲线的前提）", True)
     small = api("GET", f"/api/ws/{ws}/series-multi?cols={q}&mode=raw&points=6000")
-    check("points 给到上限时 raw 逐行不抽稀（11000 行 > 6000 点仍要抽）",
-          small["decimated"] is True and small["maxPoints"] == 6000, f"{small['points']} 点")
+    check("点数上限管不住全量档：points 给到 6000 仍送回整表 11000 行（旧行为在这里抽到 6000 点，是骗人）",
+          small["decimated"] is False and small["maxPoints"] is None and small["points"] == n,
+          f"{small['points']} 点")
+    lttb = api("GET", f"/api/ws/{ws}/series-multi?cols={q}&mode=lttb&points=6000")
+    check("同一张表同一 points，lttb 档老老实实受上限约束（6000 点）",
+          lttb["decimated"] is True and lttb["maxPoints"] == 6000 and lttb["points"] == 6000,
+          f"{lttb['points']} 点")
     close_workspace(ws)
 
-    print("\n== 短表：raw 模式行数不超过点数时逐行原样给出（放大不丢行）==")
+    print("\n== 短表：raw 全量档行数不超过上限时逐行原样给出（放大不丢行）==")
     ws2 = open_dataset("na3.csv")
     cols2 = float_cols(api("GET", f"/api/ws/{ws2}"))
     one = api("GET", f"/api/ws/{ws2}/series-multi?cols={urllib.parse.quote(cols2[0])}&mode=raw&points=3000")
-    check("240 行表 raw 模式 240 点、未抽稀", one["points"] == 240 and one["decimated"] is False,
+    check("240 行表 raw 全量档给 240 点、未降采样", one["points"] == 240 and one["decimated"] is False,
           f"{one['points']} 点")
     check("短表 mean 模式步长退化为 1（行数 ≤ 500 时窗口均值无意义）",
           api("GET", f"/api/ws/{ws2}/series-multi?cols={urllib.parse.quote(cols2[0])}&mode=mean&points=3000"
@@ -558,7 +567,7 @@ def section_errors():
         ("hist 桶数小于 2", f"/api/ws/{ws}/hist?col=temperature&bins=1", 422),
         ("series-multi cols 为空", f"/api/ws/{ws}/series-multi?cols=", 400),
         ("series-multi 列不存在", f"/api/ws/{ws}/series-multi?cols={urllib.parse.quote('没有这列')}", 400),
-        ("series-multi 未知抽稀方式", f"/api/ws/{ws}/series-multi?cols=temperature&mode=lttb", 400),
+        ("series-multi 未知降采样方式", f"/api/ws/{ws}/series-multi?cols=temperature&mode=nope", 400),
         ("series-multi 点数超上限", f"/api/ws/{ws}/series-multi?cols=temperature&points=99999", 422),
         ("series-multi 点数低于下限", f"/api/ws/{ws}/series-multi?cols=temperature&points=2", 422),
         ("first-complete cols 为空", f"/api/ws/{ws}/first-complete?cols=", 400),

@@ -38,6 +38,8 @@ MAX_WORKSPACES = 8
 MAX_CELLS = 5_000_000          # 单个工作区单元格上限（11000×40 是 44 万，留足余量）
 MAX_PAGE = 500                 # 单次行窗口上限
 DEFAULT_PAGE = 50
+# 一次合并导入最多带几份文件：行数与格数另有 MAX_CELLS 兜底，这条只挡住"一次拖进上百个分片"
+MAX_MERGE_FILES = 12
 # 撤销重放的帧缓存（见 Workspace._remember）：一颗帧的 dtype 字节数超过这个数就不留档，
 # 退回"从载入帧整段重放"的老行为；连同下面的版本条数上限，缓存不会变成第二份内存压力。
 SNAP_MAX_BYTES = 64 * 1024 * 1024
@@ -51,25 +53,37 @@ _ACCESS: dict[str, int] = {}
 _ACCESS_TICK = 0
 
 # 与前端 utils.js 的 TIME_FORMAT_PATTERNS 一一对应（顺序也必须一致：格式投票取首个胜出者）
+# 带毫秒的三条排在各自的"秒级"版本之前：同一批样本只会命中一条（秒级模式要求 $ 收尾），
+# 顺序只为并列胜出时的取舍稳定。
+# 月/日/时分秒都放宽成 1~2 位（`2024/6/1 8:30` 这种不补零的写法很常见）：投票只判"形状"，
+# 它报出来的分隔符就是数据里真写的那个。紧凑格式（无分隔符的 8/14/10/13 位数字）不放宽，
+# 放宽后 6 位纯数字也会被认成 YYYYMMDD，那是凭形状编时间。
 TIME_FORMAT_PATTERNS: list[tuple[str, re.Pattern, int]] = [
-    ("YYYY-MM-DD HH:mm:ss", re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}$"), 98),
-    ("YYYY/MM/DD HH:mm", re.compile(r"^\d{4}/\d{2}/\d{2} \d{2}:\d{2}$"), 95),
-    ("YYYY-MM-DDTHH:mm:ss", re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}"), 96),
-    ("YYYY-MM-DD HH:mm", re.compile(r"^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$"), 92),
-    ("YYYY-MM-DD", re.compile(r"^\d{4}-\d{2}-\d{2}$"), 90),
-    ("YYYY/MM/DD", re.compile(r"^\d{4}/\d{2}/\d{2}$"), 88),
+    ("YYYY-MM-DD HH:mm:ss.SSS", re.compile(r"^\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}\.\d{1,3}$"), 98),
+    ("YYYY-MM-DD HH:mm:ss", re.compile(r"^\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}$"), 98),
+    ("YYYY/MM/DD HH:mm:ss.SSS", re.compile(r"^\d{4}/\d{1,2}/\d{1,2} \d{1,2}:\d{1,2}:\d{1,2}\.\d{1,3}$"), 95),
+    ("YYYY/MM/DD HH:mm", re.compile(r"^\d{4}/\d{1,2}/\d{1,2} \d{1,2}:\d{1,2}$"), 95),
+    ("YYYY-MM-DDTHH:mm:ss.SSS", re.compile(r"^\d{4}-\d{1,2}-\d{1,2}T\d{1,2}:\d{1,2}:\d{1,2}\.\d{1,3}"), 96),
+    ("YYYY-MM-DDTHH:mm:ss", re.compile(r"^\d{4}-\d{1,2}-\d{1,2}T\d{1,2}:\d{1,2}:\d{1,2}"), 96),
+    ("YYYY-MM-DD HH:mm", re.compile(r"^\d{4}-\d{1,2}-\d{1,2} \d{1,2}:\d{1,2}$"), 92),
+    ("YYYY-MM-DD", re.compile(r"^\d{4}-\d{1,2}-\d{1,2}$"), 90),
+    ("YYYY/MM/DD", re.compile(r"^\d{4}/\d{1,2}/\d{1,2}$"), 88),
     ("epoch_ms", re.compile(r"^\d{13}$"), 99),
     ("epoch_s", re.compile(r"^\d{10}$"), 97),
     ("YYYYMMDDHHmmss", re.compile(r"^\d{14}$"), 94),
     ("YYYYMMDD", re.compile(r"^\d{4}\d{2}\d{2}$"), 85),
-    ("MM/DD/YYYY", re.compile(r"^\d{2}/\d{2}/\d{4}"), 80),
-    ("DD-MM-YYYY", re.compile(r"^\d{2}-\d{2}-\d{4}"), 78),
+    ("MM/DD/YYYY", re.compile(r"^\d{1,2}/\d{1,2}/\d{4}"), 80),
+    ("DD-MM-YYYY", re.compile(r"^\d{1,2}-\d{1,2}-\d{4}"), 78),
 ]
 
 # 解析用的 pandas format（只用于读入源字符串，pandas 自己的分词器，不受 Windows CRT 影响）
+# 顺序就是严格解析的尝试顺序：越靠前的越"标准"，并列时取排在前面的。
 _PARSE_FORMAT = {
+    "YYYY-MM-DD HH:mm:ss.SSS": "%Y-%m-%d %H:%M:%S.%f",
     "YYYY-MM-DD HH:mm:ss": "%Y-%m-%d %H:%M:%S",
+    "YYYY/MM/DD HH:mm:ss.SSS": "%Y/%m/%d %H:%M:%S.%f",
     "YYYY/MM/DD HH:mm": "%Y/%m/%d %H:%M",
+    "YYYY-MM-DDTHH:mm:ss.SSS": "%Y-%m-%dT%H:%M:%S.%f",
     "YYYY-MM-DDTHH:mm:ss": "%Y-%m-%dT%H:%M:%S",
     "YYYY-MM-DD HH:mm": "%Y-%m-%d %H:%M",
     "YYYY-MM-DD": "%Y-%m-%d",
@@ -81,21 +95,36 @@ _PARSE_FORMAT = {
 }
 
 # 可切换的显示格式：与前端 convertSingleTime 的 switch 分支一致，
-# 每项都是 YYYY/MM/DD/HH/mm/ss 占位符模板（渲染时自己做替换，不用 strftime）。
+# 每项都是 YYYY/MM/DD/HH/mm/ss(/SSS) 占位符模板（渲染时自己做替换，不用 strftime）。
 DISPLAY_FORMATS = (
     "YYYY-MM-DD HH:mm:ss", "YYYY-MM-DD HH:mm", "YYYY-MM-DD",
     "YYYY/MM/DD HH:mm", "YYYY/MM/DD", "YYYY-MM-DDTHH:mm:ss",
+    "YYYY-MM-DD HH:mm:ss.SSS",
     "YYYYMMDDHHmmss", "YYYYMMDD", "epoch_ms", "epoch_s",
 )
 _TOKEN_FORMATS = tuple(f for f in DISPLAY_FORMATS if not f.startswith("epoch_"))
 # 投票能识别、但不在可切换列表里的源格式：入库解析照旧，显示一律退回 ISO
 _LOCALE_FORMATS = ("MM/DD/YYYY", "DD-MM-YYYY")   # 只用于解析，不作为显示格式
 
+# 模板里的占位符就是这一套（顺序很重要：多位在前，单位在后，"MM" 永远优先于 "M"）。
+# 单位版是不补零的写法（2024/6/1 8:30），项目内外两边都常见，所以两套都吃；
+# 单字母 's' 刻意不做占位符，否则 "秒"/"seconds" 这类字面量会被吃掉。
+_FORMAT_TOKENS = ("YYYY", "SSS", "MM", "DD", "HH", "mm", "ss", "M", "D", "H", "m")
+# 自定义模板 → pandas format：本项目这套占位符翻成 strptime；单字母与双字母都落同一个
+# %x（pandas 的 %m/%d/%H/%M 本来就容得下 1~2 位），显示侧才区分补零与否。
+_STRPTIME_TOKENS = (("SSS", "%f"), ("YYYY", "%Y"), ("MM", "%m"), ("M", "%m"),
+                    ("DD", "%d"), ("D", "%d"), ("HH", "%H"), ("H", "%H"),
+                    ("mm", "%M"), ("m", "%M"), ("ss", "%S"))
+
 # 本机时区偏移：JS 的 new Date('2024-06-01 00:00:00') 按本地时区解释，
 # pandas 的 naive Timestamp 不带时区，换算 epoch 时必须自己补这一段偏移。
 _LOCAL_OFFSET = (datetime.now().astimezone().utcoffset() or timedelta(0)).total_seconds()
 
-_TIME_NAME_HINTS = ("timestamp", "time", "date", "datetime", "日期", "时间", "ts")
+_TIME_NAME_HINTS = ("timestamp", "time", "date", "datetime", "日期", "时间", "时刻", "ts")
+# 一列要被判成时间列，至少这么多比例的有值样本能按某个已知格式解析出来。
+# 列名只是"值得一试"的线索，从来不是证据：叫「时间」的中文文本列、叫 time 的浮点读数
+# 都过不了这道闸门，宁可回一句"没有时间列"，也不能把整列洗成 NaT 或 1970 年的假时间。
+MIN_TIME_HIT_RATE = 0.6
 
 RESAMPLE_RATES = {"1min": 1, "5min": 5, "15min": 15, "30min": 30, "60min": 60, "120min": 120, "1440min": 1440}
 RESAMPLE_METHODS = ("mean", "sum", "first", "interpolate")
@@ -155,7 +184,8 @@ def _log_jsonable(v):
 
 # 命令种类 → 界面上的短名。撤销/重做按钮要说"撤销「重采样」"，靠 summary 太长且带数字。
 OP_KIND_LABELS = {
-    "set_time_format": "时间格式转换", "rename_column": "重命名列", "delete_column": "删除列",
+    "set_time_format": "时间格式转换", "set_time_col": "指定时间列",
+    "rename_column": "重命名列", "delete_column": "删除列",
     "convert_unit": "单位换算", "derived_column": "列运算生成",
     "resample": "重采样", "impute": "缺失值填补", "anomaly-repair": "异常修复",
     "mask-generate": "生成掩码列", "mask-delete": "删除掩码列",
@@ -198,7 +228,11 @@ def _op_brief(op: dict) -> dict:
 
 
 def vote_time_format(samples: list[str]) -> dict | None:
-    """对原始字符串样本做格式投票，等价于前端 detectTimeFormatOfSamples。"""
+    """对原始字符串样本做格式投票，等价于前端 detectTimeFormatOfSamples。
+
+    一条模式都没命中就返回 None：过去这里会退回一个"看起来最标准"的 ISO 格式，
+    于是中文列、纯数字列也带着 0% 命中率被当成识别成功，界面上那颗绿色徽章纯属白送。
+    """
     strs = [s for s in (str(x).strip() for x in samples) if s]
     if not strs:
         return None
@@ -207,10 +241,12 @@ def vote_time_format(samples: list[str]) -> dict | None:
         for fmt, pat, _ in TIME_FORMAT_PATTERNS:
             if pat.match(s):
                 votes[fmt] += 1
-    best_format, best_count = "YYYY-MM-DD HH:mm:ss", 0
+    best_format, best_count = "", 0
     for fmt, count in votes.items():
         if count > best_count:
             best_format, best_count = fmt, count
+    if not best_count:
+        return None
     confidence = next((c for f, _, c in TIME_FORMAT_PATTERNS if f == best_format), 80)
     return {
         "format": best_format,
@@ -223,49 +259,118 @@ def vote_time_format(samples: list[str]) -> dict | None:
     }
 
 
+# 用户手写的模板很常见是 JS/moment 那套大小写（yyyy-MM-dd HH:mm:ss.SSS），和项目内的
+# 占位符只差三个词的写法。这里一次性归一，免得"格式识别不出来"变成"你得会写我们的方言"。
+_FORMAT_ALIASES = (("yyyy", "YYYY"), ("dd", "DD"), ("hh", "HH"))
+
+
+def canonicalize_format(tpl: str) -> str:
+    out = tpl.strip()
+    for src, dst in _FORMAT_ALIASES:
+        out = out.replace(src, dst)
+    return out
+
+
+def _iter_template(tpl: str):
+    """从左到右切模板：对得上占位符的吃占位符，其余字符原样当字面量。
+
+    不用 str.replace 逐词替换：那种写法在引入单位占位符后会自我踩踏
+    （"MM"→"%m" 之后，"%m" 里那个 m 又被"m"→"%M" 吃掉，格式串直接废掉）。
+    """
+    i = 0
+    while i < len(tpl):
+        for tok in _FORMAT_TOKENS:
+            if tpl.startswith(tok, i):
+                yield True, tok
+                i += len(tok)
+                break
+        else:
+            yield False, tpl[i]
+            i += 1
+
+
+_STRPTIME_MAP = dict(_STRPTIME_TOKENS)
+_TOKEN_RE = re.compile(r"YYYY|SSS|MM|DD|HH|mm|ss|M|D|H")
+
+
+def _format_pattern(fmt: str) -> str | None:
+    """源解析用的严格格式串：登记过的直接给，含占位符的自定义模板逐词翻译给 pandas。"""
+    if fmt in _PARSE_FORMAT:
+        return _PARSE_FORMAT[fmt]
+    if fmt in _TIME_UNITS:
+        return None
+    if not _TOKEN_RE.search(fmt):
+        return None
+    return "".join(_STRPTIME_MAP[val] if is_tok else ("%%" if val == "%" else val)
+                   for is_tok, val in _iter_template(fmt))
+
+
 def normalize_format(fmt: str, custom: str | None = None) -> str:
-    """校验可切换的显示格式；custom 必须是含占位符的模板。"""
-    if fmt == "custom":
-        c = (custom or "").strip()
-        if not c or not re.search(r"YYYY|MM|DD|HH|mm|ss", c):
-            raise ValueError("自定义格式需至少包含 YYYY/MM/DD/HH/mm/ss 之一")
+    """校验可切换的显示格式；custom 必须是含占位符的模板。
+
+    三条来路都归一到同一个东西：登记过的格式名直接用；`custom` 用模板；直接把模板写在
+    `format` 上也认（只要它含占位符）——前端两个入口（源格式手填 / 目标格式自定义）共用
+    这一份校验，规则只有一套。
+    """
+    c = canonicalize_format(custom or "") if (fmt or "").strip() == "custom" else ""
+    if (fmt or "").strip() == "custom":
+        if not c or not re.search(r"YYYY|MM|DD|HH|mm|ss|SSS", c):
+            raise ValueError("自定义格式需至少包含 YYYY/MM/DD/HH/mm/ss/SSS 之一")
+        if len(c) > 64:
+            raise ValueError(f"自定义格式过长（{len(c)} 字符，上限 64）")
         return c
-    if fmt not in DISPLAY_FORMATS:
-        raise ValueError(f"不支持的时间格式：{fmt}")
-    return fmt
+    name = canonicalize_format(fmt or "")
+    if name in DISPLAY_FORMATS:
+        return name
+    if re.search(r"YYYY|MM|DD|HH|mm|ss|SSS", name):
+        if len(name) > 64:
+            raise ValueError(f"时间格式过长（{len(name)} 字符，上限 64）")
+        return name
+    raise ValueError(f"不支持的时间格式：{fmt}（可选：{'、'.join(DISPLAY_FORMATS)}，或含占位符的自定义模板）")
 
 
 def reformat_iso(iso: str, fmt: str) -> str:
-    """iso 形如 'YYYY-MM-DD HH:MM:SS'，按显示占位符重排（与前端 convertSingleTime 同结果）。"""
-    parts = (iso[0:4], iso[5:7], iso[8:10], iso[11:13], iso[14:16], iso[17:19])
-    out = fmt
-    for token, value in zip(("YYYY", "MM", "DD", "HH", "mm", "ss"), parts):
-        out = out.replace(token, value)
-    return out
+    """iso 形如 'YYYY-MM-DD HH:MM:SS'（带毫秒时再跟 '.SSS'），按显示占位符重排。
+
+    双字母补零、单字母不补零，两边共用 `_iter_template` 那一个切分器：显示与解析
+    只会对同一份模板有两种读法，绝不会出现"解析认得、显示写回一半字面量"。
+    """
+    def num(part: str) -> str:
+        return str(int(part))
+    parts = {
+        "YYYY": iso[0:4], "MM": iso[5:7], "M": num(iso[5:7]), "DD": iso[8:10], "D": num(iso[8:10]),
+        "HH": iso[11:13], "H": num(iso[11:13]), "mm": iso[14:16], "m": num(iso[14:16]),
+        "ss": iso[17:19], "SSS": iso[20:23] if len(iso) > 19 else "000",
+    }
+    return "".join(parts[val] if is_tok else val for is_tok, val in _iter_template(fmt))
 
 
 _TIME_UNITS = {"epoch_ms": "ms", "epoch_s": "s"}
 
 
-def iso_strings(ts: pd.Series) -> list:
-    """datetime64 → 'YYYY-MM-DD HH:MM:SS'（缺失为 None）。
+def iso_strings(ts: pd.Series, with_ms: bool = False) -> list:
+    """datetime64 → 'YYYY-MM-DD HH:MM:SS'（with_ms 时再跟 '.SSS'；缺失为 None）。
 
     不用 astype(str)：pandas 在整列时间全为午夜时会输出省略时分的 '2024-06-01'，
     按页渲染时同一天数据会时带时分、时不带，切片取值就不稳；也不用 strftime
-    （Windows 的 CRT 会把 '/' 改写成本地化分隔符）。这里直接取六个整数分量拼串。
+    （Windows 的 CRT 会把 '/' 改写成本地化分隔符）。这里直接取整数分量拼串。
     """
-    def part(accessor, width):
-        values = pd.to_numeric(getattr(ts.dt, accessor), errors="coerce").fillna(0).astype("int64")
-        return values.astype(str).str.zfill(width)
+    def part(accessor, width, divisor=1):
+        values = pd.to_numeric(getattr(ts.dt, accessor), errors="coerce").fillna(0)
+        if divisor != 1:
+            values = values // divisor
+        return values.astype("int64").astype(str).str.zfill(width)
     joined = (part("year", 4) + "-" + part("month", 2) + "-" + part("day", 2) + " "
               + part("hour", 2) + ":" + part("minute", 2) + ":" + part("second", 2))
+    if with_ms:
+        joined = joined + "." + part("microsecond", 3, divisor=1000)
     return [None if is_na else v for is_na, v in zip(ts.isna().tolist(), joined.tolist())]
 
 
 def render_times(series: pd.Series, fmt: str) -> list:
     """把 datetime64 列按显示格式渲染（epoch 格式渲染成数字）。"""
     ts = pd.to_datetime(series, errors="coerce")
-    iso = iso_strings(ts)
+    iso = iso_strings(ts, with_ms="SSS" in fmt)
     if fmt in _TIME_UNITS:
         unit = _TIME_UNITS[fmt]
         shift = int(_LOCAL_OFFSET) * (1000 if unit == "ms" else 1)
@@ -274,8 +379,71 @@ def render_times(series: pd.Series, fmt: str) -> list:
     return [None if s is None else reformat_iso(s, fmt) for s in iso]
 
 
+def _strict_parse_strings(strs: pd.Series, fmt: str) -> pd.Series:
+    """只按登记过或自定义的严格格式解析；解析不动就是 NaT，绝不猜。"""
+    pattern = _format_pattern(fmt)
+    if pattern is None:
+        return pd.Series([pd.NaT] * len(strs), index=strs.index, dtype="datetime64[ns]")
+    return pd.to_datetime(strs, format=pattern, errors="coerce")
+
+
+def _candidate_formats(strs: pd.Series) -> list[str]:
+    """候选格式的尝试顺序：形状投票胜出的那个排第一，其余按登记表兜底。
+
+    为什么要投票先试：pandas 的 `format=` 只卡**位数**，字面分隔符是宽容的
+    （`%Y/%m/%d` 能把 `2024-6-1` 读进去），所以按登记表顺序试会先撞上斜杠版格式，
+    界面上连字符数据就被报成"源格式 YYYY/MM/DD HH:mm"。分隔符应当念数据里真写的那个。
+    """
+    vote = vote_time_format(strs.dropna().head(20).tolist()) or {}
+    first = vote.get("format")
+    keys = list(_PARSE_FORMAT)
+    if first in _PARSE_FORMAT:
+        keys.remove(first)
+        keys.insert(0, first)
+    return keys
+
+
+def best_strict_parse(values: pd.Series) -> tuple[pd.Series, str, float] | None:
+    """逐个候选格式严格解析这一列字符串，返回 (结果, 胜出格式, 命中率)。
+
+    这里刻意**没有** `dayfirst=True` 那类自由解析：pandas 的 dateutil 兜底会把
+    '2024-06-01 00:00:00.123' 读成 2024-01-06（月日对调），把 '12.5' 读成 2001-12-05，
+    错得安静——列照样变成时间列，界面上一个错字都没有。认不出就返回 None。
+    """
+    strs = values.astype("string").str.strip()
+    non_empty = int((strs.notna() & (strs != "")).sum())
+    if not non_empty:
+        return None
+    best: tuple[pd.Series, str, int] | None = None
+    for fmt in _candidate_formats(strs):
+        parsed = _strict_parse_strings(strs, fmt)
+        hits = int(parsed.notna().sum())
+        if hits and (best is None or hits > best[2]):
+            best = (parsed, fmt, hits)
+    return (best[0], best[1], best[2] / non_empty) if best else None
+
+
+def epoch_unit_of(values: pd.Series) -> str | None:
+    """数值列只在"每一位都像时间戳"时才认：10 位当秒、13 位当毫秒，别的都是普通数字。
+
+    没有这条闸门，一列叫 time 的浮点读数（12.5 / 13.2）会被当成 epoch 秒，
+    整列变成 1970-01-01 08:00:12 这种没人认得出的假时间。
+    """
+    nums = pd.to_numeric(values, errors="coerce").dropna()
+    if nums.empty:
+        return None
+    if not bool((nums == nums.round().astype("int64")).all()):
+        return None
+    med = float(nums.median())
+    if 1e11 <= med < 1e13:
+        return "ms"
+    if 1e8 <= med < 1e10:
+        return "s"
+    return None
+
+
 def parse_time_column(values: pd.Series, fmt: str) -> pd.Series:
-    """按投票出来的源格式把时间列解析成 datetime64。"""
+    """按指定源格式把时间列解析成 datetime64（严格模式，解析不动给 NaT）。"""
     if pd.api.types.is_datetime64_any_dtype(values):
         return values
     if pd.api.types.is_numeric_dtype(values):
@@ -283,25 +451,21 @@ def parse_time_column(values: pd.Series, fmt: str) -> pd.Series:
         unit = "ms" if fmt == "epoch_ms" else "s" if fmt == "epoch_s" else None
         if unit:
             return pd.to_datetime(arr, unit=unit, errors="coerce") + timedelta(seconds=_LOCAL_OFFSET)
-        # 10/13 位纯数字：按长度判断秒还是毫秒
-        sample = arr.dropna()
-        if len(sample):
-            unit = "ms" if float(sample.iloc[0]) > 1e11 else "s"
-            return pd.to_datetime(arr, unit=unit, errors="coerce") + timedelta(seconds=_LOCAL_OFFSET)
-        return pd.to_datetime(values, errors="coerce")
+        guessed = epoch_unit_of(values)
+        if guessed:
+            return pd.to_datetime(arr, unit=guessed, errors="coerce") + timedelta(seconds=_LOCAL_OFFSET)
+        return pd.Series([pd.NaT] * len(values), index=values.index, dtype="datetime64[ns]")
     strs = values.astype("string").str.strip()
     if fmt == "epoch_ms":
-        return pd.to_datetime(pd.to_numeric(strs, errors="coerce"), unit="ms", errors="coerce") + timedelta(seconds=_LOCAL_OFFSET)
+        return pd.to_datetime(pd.to_numeric(strs, errors="coerce"), unit="ms", errors="coerce") \
+            + timedelta(seconds=_LOCAL_OFFSET)
     if fmt == "epoch_s":
-        return pd.to_datetime(pd.to_numeric(strs, errors="coerce"), unit="s", errors="coerce") + timedelta(seconds=_LOCAL_OFFSET)
-    pattern = _PARSE_FORMAT.get(fmt)
-    parsed = (pd.to_datetime(strs, format=pattern, errors="coerce") if pattern
-              else pd.to_datetime(strs, errors="coerce"))
-    if parsed.isna().all():
-        fallback = pd.to_datetime(strs, errors="coerce", dayfirst=True)
-        if not fallback.isna().all():
-            return fallback
-    return parsed
+        return pd.to_datetime(pd.to_numeric(strs, errors="coerce"), unit="s", errors="coerce") \
+            + timedelta(seconds=_LOCAL_OFFSET)
+    if _format_pattern(fmt):
+        return _strict_parse_strings(strs, fmt)
+    best = best_strict_parse(values)
+    return best[0] if best else pd.Series([pd.NaT] * len(values), index=values.index, dtype="datetime64[ns]")
 
 
 def col_type_of(series: pd.Series) -> str:
@@ -404,35 +568,231 @@ def dataframe_from_bytes(content: bytes, filename: str) -> tuple[pd.DataFrame, d
             df[c] = df[c].map(_clean_cell)
 
     columns = build_meta_columns(df, None)
-    time_col = pick_time_col(columns, df)
-    detect = None
+    time_col, detect, parsed, rejected = pick_time_column(df, columns)
     if time_col is not None:
-        samples = [str(v) for v in df[time_col].dropna().head(20).tolist()]
-        detect = vote_time_format(samples)
-        parsed = parse_time_column(df[time_col], detect["format"] if detect else "YYYY-MM-DD HH:mm:ss")
+        # 只有真解析得动的列才会被改写：认不出就整列原样留着，绝不先把中文/数字洗成 NaT
         df[time_col] = pd.to_datetime(parsed, errors="coerce")
-        if df[time_col].notna().sum() == 0:
-            df[time_col] = pd.to_datetime(
-                pd.to_datetime(df[time_col].astype("string").str.strip(), errors="coerce", dayfirst=True),
-                errors="coerce")
         columns = build_meta_columns(df, time_col)
-    return df, {"format": fmt, "timeCol": time_col, "timeDetect": detect, "columns": columns}
+    return df, {"format": fmt, "timeCol": time_col, "timeDetect": detect,
+                "timeRejected": rejected, "columns": columns}
+
+
+def time_col_candidates(columns: list[dict], df: pd.DataFrame) -> list[str]:
+    """给出"值得一试"的时间列候选，按优先级排：已是 datetime 的列 > 列名带时间提示的非数值列
+    > 列名带时间提示的数值列（只有每一位都像 epoch 的才可能通过下一步闸门）。"""
+    hinted = [c["key"] for c in columns if any(h in c["key"].lower() for h in _TIME_NAME_HINTS)]
+    datetime_cols = [c["key"] for c in columns if pd.api.types.is_datetime64_any_dtype(df[c["key"]])]
+    ordered: list[str] = []
+    for key in datetime_cols + [k for k in hinted if k not in datetime_cols]:
+        if key not in ordered:
+            ordered.append(key)
+    return ordered
+
+
+def try_time_column(values: pd.Series, fmt: str | None = None
+                    ) -> tuple[pd.Series, dict] | None:
+    """把一列试着当时间列解析：认得出返回 (datetime64 列, 识别回执)，认不出返回 None。
+
+    判定只看一件事——**有多少比例的样本真能按某个严格格式解析出来**。列名像不像时间
+    只决定试的顺序，不决定结论，所以中文文本列、普通读数列都不会再被"改名成时间列"。
+
+    `fmt` 是用户在界面上手填的源格式（自动识别不出来时的出路）：只用这一个格式解析，
+    命中率照实计算，闸门不放宽——手填错格式就该报"这一列按 X 只解析出 N 个"，
+    而不是把一半行洗成 NaT 还自称成功。
+    """
+    total = int(values.shape[0])
+    non_empty = int(values.notna().sum())
+    if not non_empty:
+        return None
+    via = "dtype" if pd.api.types.is_datetime64_any_dtype(values) else "parse"
+    display = None
+    if fmt:
+        via = "manual"
+        if pd.api.types.is_datetime64_any_dtype(values):
+            # 已经是 datetime64：解析这一步没什么可做的，但用户指定的格式仍要当作显示格式
+            parsed, src = values, "YYYY-MM-DD HH:mm:ss"
+            display = fmt
+        elif fmt in _TIME_UNITS:
+            parsed, src = parse_time_column(values, fmt), fmt
+        else:
+            parsed, src = _strict_parse_strings(values.astype("string").str.strip(), fmt), fmt
+    elif pd.api.types.is_datetime64_any_dtype(values):
+        parsed, src = values, "YYYY-MM-DD HH:mm:ss"
+    elif pd.api.types.is_numeric_dtype(values):
+        unit = epoch_unit_of(values)
+        if not unit:
+            return None
+        src = "epoch_ms" if unit == "ms" else "epoch_s"
+        parsed = parse_time_column(values, src)
+    else:
+        best = best_strict_parse(values)
+        if not best:
+            return None
+        parsed, src = best[0], best[1]
+    hits = int(pd.to_datetime(parsed, errors="coerce").notna().sum())
+    hit_rate = hits / non_empty
+    if hit_rate < MIN_TIME_HIT_RATE:
+        return None
+    vote = vote_time_format([str(v) for v in values.dropna().head(20).tolist()]) or {}
+    return pd.to_datetime(parsed, errors="coerce"), {
+        "format": src,
+        # 源格式可能落在 MM/DD/YYYY 这类不可切换的分支上：解析按源格式，显示退回 ISO
+        "displayFormat": display or (src if src in _TOKEN_FORMATS or _format_pattern(src) else "YYYY-MM-DD HH:mm:ss"),
+        "confidence": vote.get("confidence") or (100 if fmt else 90),
+        # matchRate 一律按整列真实解析数给，界面那句"命中率"和导出行数才对得上同一件事
+        "matchRate": hit_rate * 100,
+        "matched": hits,
+        "sampled": non_empty,
+        "totalRows": total,
+        "unparsed": non_empty - hits,
+        "via": via,
+    }
+
+
+def pick_time_column(df: pd.DataFrame, columns: list[dict] | None = None
+                     ) -> tuple[str | None, dict | None, pd.Series | None, list[dict]]:
+    """挑时间列：按候选顺序逐个真解析一遍，第一个过闸门的胜出，全不过就是"没有时间列"。
+
+    返回里的 rejected 是**试过又退回**的列与原因，界面要照着念，不能只说"没找到"。
+    """
+    cols = columns if columns is not None else build_meta_columns(df, None)
+    rejected: list[dict] = []
+    for key in time_col_candidates(cols, df):
+        got = try_time_column(df[key])
+        if got:
+            return key, got[1], got[0], rejected
+        rejected.append({"key": key, "reason": _reject_reason(df[key])})
+    return None, None, None, rejected
+
+
+def _reject_reason(values: pd.Series, fmt: str | None = None) -> str:
+    """为什么这一列不能当时间列——只描述真实测到的数，不猜。"""
+    non_empty = int(values.notna().sum())
+    if not non_empty:
+        return "整列没有值"
+    if fmt and not pd.api.types.is_datetime64_any_dtype(values):
+        if fmt in _TIME_UNITS:
+            parsed = parse_time_column(values, fmt)
+        else:
+            parsed = _strict_parse_strings(values.astype("string").str.strip(), fmt)
+        hits = int(pd.to_datetime(parsed, errors="coerce").notna().sum())
+        return (f"按「{fmt}」只解析出 {hits}/{non_empty} 个值"
+                f"（低于要求的 {MIN_TIME_HIT_RATE * 100:.0f}%）——检查格式串里的分隔符与位数")
+    if pd.api.types.is_numeric_dtype(values):
+        return f"{non_empty} 个数值都不是 10/13 位时间戳（中位数 {float(pd.to_numeric(values, errors='coerce').median()):g}）"
+    best = best_strict_parse(values)
+    rate = 0.0 if not best else best[2] * 100
+    return f"{non_empty} 个样本里只有 {rate:.0f}% 能按任何已知时间格式解析"
 
 
 def pick_time_col(columns: list[dict], df: pd.DataFrame) -> str | None:
-    """先按列名提示，再按已解析出的 datetime 列；与 utils.pickTimeCol 的优先级一致。"""
-    for c in columns:
-        low = c["key"].lower()
-        if any(h in low for h in _TIME_NAME_HINTS) and c["type"] != "float":
-            return c["key"]
-    dt = [c["key"] for c in columns if pd.api.types.is_datetime64_any_dtype(df[c["key"]])]
-    if dt:
-        return dt[0]
-    for c in columns:
-        low = c["key"].lower()
-        if any(h in low for h in _TIME_NAME_HINTS):
-            return c["key"]
-    return None
+    """只要列名的调用方（侧表时间列）用这个：认不出就是 None，不再按列名硬给一个。"""
+    return pick_time_column(df, columns)[0]
+
+
+# ---------------------------------------------------------------- 多文件按行合并
+
+def _time_series(df: pd.DataFrame, col: str) -> pd.Series:
+    """排序与计数都用这一份 datetime 口径，避免同一列在两处判出不同的 NaT 数。"""
+    return pd.to_datetime(df[col], errors="coerce")
+
+
+def _backjumps(ts: pd.Series) -> int:
+    """相邻两行里"后一行的时间反而更早"的位置数（NaT 不参与比较）。"""
+    v = ts.dropna().to_numpy()
+    if v.size < 2:
+        return 0
+    return int((v[:-1] > v[1:]).sum())
+
+
+def merge_frames(parts: list[tuple[str, pd.DataFrame, dict]]) -> tuple[pd.DataFrame, dict]:
+    """把多份已解析的表按行拼成一张，并按时间列稳定排序。
+
+    三条口径必须写清楚，因为它们决定界面上的数字能不能对账：
+    - 列取**并集**：只在部分文件里出现的列，其余文件的这些格子成为真实缺失（不补值、不丢行）；
+    - 排序是**稳定**的：同一时刻的行保持原来的文件先后，合并前后的行数必然相等；
+    - 这里**不判重复时间戳**：去重是第②步的一条命令，本次只把重复计数如实写进回执。
+    """
+    if len(parts) < 2:
+        raise ValueError("合并至少需要两份文件（单份请直接走普通导入）")
+    if len(parts) > MAX_MERGE_FILES:
+        raise ValueError(f"一次最多合并 {MAX_MERGE_FILES} 份文件，本次收到 {len(parts)} 份，请分批导入")
+
+    named = [(str(name), df, meta) for name, df, meta in parts]
+    empty = [n for n, df, _ in named if int(df.shape[0]) == 0]
+    if empty:
+        raise ValueError(f"这些文件解析后没有数据行：{'、'.join(empty)}")
+
+    time_cols = [m.get("timeCol") for _, _, m in named]
+    real_cols = {t for t in time_cols if t}
+    if len(real_cols) > 1:
+        detail = "、".join(f"{n}→{t or '未识别'}" for n, t in zip([x[0] for x in named], time_cols))
+        raise ValueError(f"各文件识别到的时间列名不一致，无法按时间排序合并：{detail}")
+    if None in time_cols:
+        missing = "、".join(n for n, t in zip([x[0] for x in named], time_cols) if not t)
+        raise ValueError(
+            f"这些文件没识别到时间列，无法按时间排序合并：{missing}"
+            f"（其余文件的时间列为 {sorted(real_cols)[0]}；请在文件里把时间列名改成一致，或单独导入后自行处理）")
+    time_col = next(iter(real_cols)) if real_cols else None
+
+    dfs = [df for _, df, _ in named]
+    df = pd.concat(dfs, ignore_index=True, sort=False)
+    if time_col and not pd.api.types.is_datetime64_any_dtype(df[time_col]):
+        df[time_col] = _time_series(df, time_col)
+
+    file_cols = [set(str(c) for c in d.columns) for _, d, _ in named]
+    all_cols = [str(c) for c in df.columns]
+    union_only = [c for c in all_cols if not all(c in s for s in file_cols)]
+    # 因"列取并集"而必然为空的格子数：某文件没有这一列，它的每一行在这一列上就是缺失
+    gap_cells = sum(int((len(all_cols) - len(s)) * d.shape[0]) for s, (_, d, _) in zip(file_cols, named))
+
+    rows_moved = back_before = back_after = dup_times = time_na = 0
+    if time_col:
+        ts = df[time_col]
+        back_before = _backjumps(ts)
+        time_na = int(ts.isna().sum())
+        stamp = df.assign(_merge_pos=np.arange(len(df)))
+        stamp = stamp.sort_values(time_col, kind="stable", na_position="last")
+        pos = stamp["_merge_pos"].to_numpy()
+        rows_moved = int((pos != np.arange(len(pos))).sum())
+        df = stamp.drop(columns="_merge_pos").reset_index(drop=True)
+        back_after = _backjumps(df[time_col])
+        dup_times = int(df[time_col].duplicated().sum())
+
+    base = dict(named[0][2])
+    base["format"] = "merge"
+    base["timeCol"] = time_col
+    base["columns"] = build_meta_columns(df, time_col)
+    receipt = {
+        "fileCount": len(named),
+        "files": [
+            {"filename": n, "rows": int(d.shape[0]), "cols": int(d.shape[1]),
+             "timeFormat": (m.get("timeDetect") or {}).get("displayFormat")}
+            for n, d, m in named
+        ],
+        "totalRows": int(df.shape[0]),
+        "colCount": int(df.shape[1]),
+        "unionOnlyCols": union_only,
+        "gapCells": int(gap_cells),
+        "timeCol": time_col,
+        "sorted": bool(time_col),
+        "sortNote": (f"按「{time_col}」稳定升序（同一时刻保持原文件先后，空时间排在最后）"
+                     if time_col else "未排序：各文件都没识别到时间列"),
+        "rowsMoved": int(rows_moved),
+        "backjumpsBefore": back_before,
+        "backjumpsAfter": back_after,
+        "duplicateTimes": dup_times,
+        "emptyTimes": time_na,
+        "timeRange": {
+            "start": None, "end": None,
+        },
+    }
+    if time_col and df[time_col].notna().any():
+        span = pd.to_datetime(df[time_col], errors="coerce").dropna()
+        receipt["timeRange"] = {"start": span.min().isoformat(sep=" "),
+                               "end": span.max().isoformat(sep=" ")}
+    base["merge"] = receipt
+    return df, base
 
 
 # ---------------------------------------------------------------- 预设数据集（种子化，可重放）
@@ -661,6 +1021,9 @@ class Workspace:
             "freqLabel": m.get("freqLabel") or "未知",
             "timeFormat": m.get("timeFormat") or "YYYY-MM-DD HH:mm:ss",
             "timeDetect": m.get("timeDetect"),
+            # 载入时"名字像时间列却解析不动"的那些列与真实原因：界面没有识别到时间列时，
+            # 要能回答"为什么没有"，而不是只留一句"未识别"。
+            "timeRejected": m.get("timeRejected") or [],
             "derivedCols": m.get("derivedCols", []),
             "version": self.version,
             # valueEpoch = 到目前为止改动了既有数值的命令条数（新增列、只改配置的命令不推进它）。
@@ -683,6 +1046,10 @@ class Workspace:
                 for i, o in enumerate(self.applied_ops)
             ],
             "source": self.source,
+            # 合并导入的回执（几份文件、各自行数、并集列、排序前后的真实计数）。
+            # 它描述的是"这颗帧怎么来的"，不随后续命令变化，所以界面上要按导入回执念，
+            # 别拿它的 totalRows 当作当前行数（当前行数只看 rowCount）。
+            "merge": m.get("merge"),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at or self.created_at,
             "memoryBytes": int(self.df.memory_usage(deep=True).sum()),
@@ -691,9 +1058,15 @@ class Workspace:
 
     # ---- 行窗口 ----
     def rows(self, offset: int, limit: int) -> dict:
+        """一页窗口：`limit` 是**页大小**（调用方要多少），`returned` 才是这一页实际几行。
+
+        末页天然装不满：把 returned 回写成 limit，界面那个"20/50/100/200/500 行/页"的
+        下拉就会对不上任何一项（显示成未选中），翻页步长也会跟着变成末页那几行。
+        """
         n = int(self.df.shape[0])
         offset = max(0, min(int(offset or 0), n))
-        limit = max(1, min(int(limit or DEFAULT_PAGE), MAX_PAGE, max(1, n - offset)))
+        requested = max(1, min(int(limit or DEFAULT_PAGE), MAX_PAGE))
+        limit = requested
         chunk = self.df.iloc[offset:offset + limit]
         keys = [str(c) for c in chunk.columns]
         rendered: list[list] = []
@@ -704,7 +1077,7 @@ class Workspace:
                 rendered.append([_jsonable(v) for v in chunk[c].tolist()])
         rows = [[col[i] for col in rendered] for i in range(len(chunk))]
         return {"wsId": self.id, "version": self.version, "offset": offset,
-                "limit": limit, "total": n, "columns": keys, "rows": rows}
+                "limit": limit, "returned": len(rows), "total": n, "columns": keys, "rows": rows}
 
     def export_dataframe(self) -> pd.DataFrame:
         """导出用的帧：时间列按当前显示格式渲染成字符串，其余保持服务端 dtype。
@@ -1055,15 +1428,102 @@ def _require_col(ws: Workspace, work: pd.DataFrame, key: str) -> str:
 
 def _op_set_time_format(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     fmt = normalize_format(p.get("format") or "", p.get("customFormat"))
+    if not ws.time_col or ws.time_col not in work.columns:
+        raise ValueError("本工作区没有可用的时间列，无法转换时间格式："
+                         "先在「时间列」里指定一列能解析成时间的数据（点「识别格式」看结果）")
     old = ws.meta.get("timeFormat") or "YYYY-MM-DD HH:mm:ss"
-    changed = 0
-    if ws.time_col and ws.time_col in work.columns:
-        before = render_times(work[ws.time_col], old)
-        after = render_times(work[ws.time_col], fmt)
-        changed = sum(1 for a, b in zip(before, after) if a != b)
+    before = render_times(work[ws.time_col], old)
+    after = render_times(work[ws.time_col], fmt)
+    changed = sum(1 for a, b in zip(before, after) if a != b)
     ws.meta["timeFormat"] = fmt
     return {"summary": f"时间格式 {old} → {fmt}", "changed": changed, "format": fmt,
-            "rowCount": int(work.shape[0]), "_valueChange": False}
+            "timeCol": ws.time_col, "rowCount": int(work.shape[0]), "_valueChange": False}
+
+
+def time_detect(ws: Workspace, work: pd.DataFrame | None, key: str, fmt: str | None = None) -> dict:
+    """按整列真解析一次，回答"这一列能不能当时间列、按什么格式、多少个样本解析动了"。
+
+    浏览器只拿到几个样本回显，判定全部在这里发生：一页数据推不出整表结论。
+    `fmt`（已 normalize 过的模板或 epoch_*）给定时按用户指定的源格式解析，
+    这是自动识别认不出时的出路——命中率照样照实报。
+    """
+    frame = work if work is not None else ws.df
+    names = [str(c) for c in frame.columns]
+    if key not in names:
+        raise ValueError(f"列不存在：{key}（现有列：{'、'.join(names[:12])}）")
+    series = frame[key]
+    got = try_time_column(series, fmt)
+    total = int(series.shape[0])
+    non_empty = int(series.notna().sum())
+    if not got:
+        return {"col": key, "ok": False, "reason": _reject_reason(series, fmt),
+                "requestedFormat": fmt,
+                "totalRows": total, "nonEmpty": non_empty, "parsedCount": 0,
+                "matchRate": 0.0, "format": None, "displayFormat": None,
+                "samplesBefore": [str(v) for v in series.dropna().head(3).tolist()],
+                "samplesAfter": [], "isCurrent": key == ws.time_col}
+    parsed, detect = got
+    # dtype 分支给不出任何来源信息（只会回一句 ISO 占位）。这一列如果是当前时间列，
+    # 上传/指定时按真实源串测出的格式要留着，否则界面会同时念出
+    # 「按 YYYY-MM-DD HH:mm:ss 解析出 12/12」和「当前显示 YYYY-MM-DD HH:mm:ss.SSS」两句话。
+    prev = ws.meta.get("timeDetect") or {}
+    if (not fmt and detect.get("via") == "dtype" and key == ws.time_col
+            and prev.get("displayFormat")):
+        detect = {**detect, "format": prev.get("format") or detect["format"],
+                  "displayFormat": prev["displayFormat"],
+                  "confidence": prev.get("confidence", detect["confidence"])}
+    src_fmt = detect["format"]
+    samples = series.dropna().head(3)
+    before = [str(v) for v in samples.tolist()]
+    after = render_times(parsed.head(3), detect["displayFormat"])
+    return {"col": key, "ok": True, "reason": "", "requestedFormat": fmt,
+            "totalRows": total, "nonEmpty": non_empty,
+            "parsedCount": int(detect["matched"]), "matchRate": round(float(detect["matchRate"]), 2),
+            "unparsed": int(detect.get("unparsed") or 0),
+            "format": src_fmt, "displayFormat": detect["displayFormat"],
+            "confidence": detect["confidence"], "via": detect["via"],
+            "samplesBefore": before, "samplesAfter": [str(v) for v in after],
+            "isCurrent": key == ws.time_col}
+
+
+def _op_set_time_col(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
+    """把某一列指定为时间列：整列真解析得过才改，改完时间列就是 datetime64。
+
+    与"换显示格式"是两件事，所以是独立一条命令：撤销它要连列的 dtype 一起退回去，
+    而换格式只动 meta["timeFormat"]。
+    自动识别认不出时，调用方可以带 `format`/`customFormat` 指定源格式再试一次。
+    """
+    key = _require_col(ws, work, p.get("key") or "")
+    fmt = normalize_format(p.get("format") or "", p.get("customFormat")) if p.get("format") else None
+    got = try_time_column(work[key], fmt)
+    if not got:
+        raise ValueError(f"「{key}」不能当时间列：{_reject_reason(work[key], fmt)}")
+    parsed, detect = got
+    old_col = ws.time_col
+    prev = ws.meta.get("timeDetect") or {}
+    # 同一列再指定一次、且它已经是 datetime64（via=dtype）：这次解析给不出任何新的来源信息，
+    # 只会回一句 ISO。拿它覆盖 meta 就把上传时按真实源串测出的格式（例如带 .SSS）抹平了，
+    # 重启重放时尤其明显——重放的是已经改过 dtype 的帧，第二条 set_time_col 必然走 dtype 分支。
+    keep = key == old_col and detect.get("via") == "dtype" and bool(prev.get("format"))
+    if keep:
+        detect = prev
+    work[key] = pd.to_datetime(got[0], errors="coerce")
+    ws.meta["timeCol"] = key
+    ws.meta["timeDetect"] = detect
+    ws.meta["timeFormat"] = detect["displayFormat"]
+    ws.meta["sourceTimeFormat"] = detect["displayFormat"]
+    ws.meta["timeRejected"] = []
+    for c in ws.meta["columns"]:
+        c["isTime"] = c["key"] == key
+    ws.rebuild_meta_columns(work)
+    ws.refresh_freq(work)
+    return {"summary": f"时间列 {old_col or '（无）'} → {key}"
+                      f"（按 {detect['format']} 解析出 {detect['matched']}/{detect['sampled']} 个值）",
+            "timeCol": key, "prevTimeCol": old_col, "format": detect["format"],
+            "displayFormat": detect["displayFormat"], "matchRate": round(detect["matchRate"], 2),
+            "parsedCount": int(detect["matched"]), "unparsed": int(detect.get("unparsed") or 0),
+            "rowCount": int(work.shape[0]), "freqMinutes": ws.meta.get("freqMinutes"),
+            "_valueChange": True}
 
 
 def _op_rename_column(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
@@ -1286,7 +1746,19 @@ def _op_exo_file(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     }
 
 
-def _resample_frame(src: pd.DataFrame, time_col: str, minutes: int, method: str) -> tuple[pd.DataFrame, dict]:
+def _resample_frame(src: pd.DataFrame, time_col: str, minutes: int, method: str
+                    ) -> tuple[pd.DataFrame, dict]:
+    """按目标粒度分桶重排整表，并如实说明这一趟是降采样还是升采样、空桶怎么来。
+
+    方向必须分开算，因为两者根本不是一件事：
+    - 降采样（目标比原始间隔粗）：一个桶里有多行，按 mean/sum/first 聚合成一行；
+      没有数据的桶就留空——那段时间确实一个观测都没有，补出来就是造假。
+    - 升采样（目标粒度比原始间隔更细）：绝大多数桶里一行都没有，"聚合"无从谈起。
+      旧实现在这里照样按均值聚合，于是 720 行 60min 数据"重采样成 15min"变成 2877 行、
+      其中 2157 行整行全空，看着像数据翻了四倍、其实四分之三是洞。
+      现在明确成填充语义：mean/sum/first 都按"值延续"（前一个观测一直有效到下一个），
+      interpolate 走线性插值，两种都在回执里写清是"补"出来的、补了多少格。
+    """
     step = pd.Timedelta(minutes=minutes)
     step_ns = minutes * 60 * 1_000_000_000
     ts = pd.to_datetime(src[time_col], errors="coerce")
@@ -1294,8 +1766,12 @@ def _resample_frame(src: pd.DataFrame, time_col: str, minutes: int, method: str)
     frame = src.loc[keep].assign(_ts=ts[keep]).sort_values("_ts")
     if frame.empty:
         raise ValueError("时间列没有可解析的时间戳，无法重采样")
+    source_minutes = detect_freq_minutes(frame["_ts"])
+    direction = "same"
+    if source_minutes:
+        direction = "up" if minutes < source_minutes else ("down" if minutes > source_minutes else "same")
     t0, t_end = frame["_ts"].min(), frame["_ts"].max()
-    # 与前端一致：桶起点按 epoch 零点对齐（这样 15 分钟桶永远落在 :00/:15/:30/:45），空桶也补出来
+    # 桶起点按 epoch 零点对齐（naive 时间戳下等价于本地整点/整刻），空桶也补出来
     first_bucket = pd.Timestamp(int(t0.value // step_ns) * step_ns)
     last_bucket = pd.Timestamp(int(t_end.value // step_ns) * step_ns)
     bucket_count = int((last_bucket.value - first_bucket.value) // step_ns) + 1
@@ -1304,6 +1780,7 @@ def _resample_frame(src: pd.DataFrame, time_col: str, minutes: int, method: str)
     frame = frame.assign(_bucket=frame["_ts"].dt.floor(step))
     grouped = frame.groupby("_bucket", sort=True)
 
+    filled_by_fill = 0
     out: dict[str, pd.Series] = {time_col: pd.Series(buckets, index=idx, name=time_col)}
     for c in frame.columns:
         if c in ("_ts", "_bucket", time_col):
@@ -1314,27 +1791,52 @@ def _resample_frame(src: pd.DataFrame, time_col: str, minutes: int, method: str)
                 s = agg.sum(min_count=1)
             elif method == "first":
                 s = agg.first()
+            elif method == "interpolate" and direction == "up":
+                # 升采样时"插值"的落点在桶与桶之间：先取桶内首值，再线性插
+                s = agg.first()
             else:
                 s = agg.mean()
             s = s.reindex(idx).astype("float64")
-            if method == "interpolate":
+            if direction == "up":
+                gaps = int(s.isna().sum())
+                s = (s.interpolate(method="linear", limit_direction="both") if method == "interpolate"
+                     else s.ffill().bfill())
+                filled_by_fill = max(filled_by_fill, gaps)
+            elif method == "interpolate":
                 # 真正的线性插值：空桶用相邻桶值插出来（旧版浏览器实现把 interpolate 当成均值做了）
                 s = s.interpolate(method="linear", limit_direction="both")
             out[c] = s.round(2)
         else:
-            out[c] = agg.first().reindex(idx)
+            s = agg.first().reindex(idx)
+            if direction == "up":
+                filled_by_fill = max(filled_by_fill, int(s.isna().sum()))
+                s = s.ffill().bfill()
+            out[c] = s
     resampled = pd.DataFrame(out).reset_index(drop=True)
     covered = int(grouped.size().reindex(idx).notna().sum())
     stats = {
         "sourceRows": int(frame.shape[0]),
         "unparsedDropped": int((~keep).sum()),
         "targetMinutes": minutes,
+        "sourceMinutes": source_minutes,
+        "direction": direction,
         "method": method,
         "bucketCount": int(len(buckets)),
         "filledBuckets": covered,
         "emptyBuckets": int(len(buckets)) - covered,
+        "filledByFill": int(filled_by_fill),
+        "fillNote": _resample_fill_note(direction, method, filled_by_fill),
     }
     return resampled, stats
+
+
+def _resample_fill_note(direction: str, method: str, filled: int) -> str:
+    """把"多出来的行是怎么来的"讲明白：升采样只有两种诚实说法，都不该被写成"聚合"。"""
+    if direction != "up":
+        return "降采样：没有观测的桶留空，不补值" if direction == "down" else "目标粒度与原始间隔相同：逐桶聚合，行数只可能因空桶而变"
+    if method == "interpolate":
+        return f"升采样：{filled} 格由相邻桶线性插值得到"
+    return f"升采样：{filled} 格沿用上一个观测的值（值延续），不是新测到的数据"
 
 
 def _op_resample(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
@@ -1352,8 +1854,10 @@ def _op_resample(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     ws.refresh_freq(resampled)
     label = f"{minutes} min"
     ws.meta["freq"] = f"{label} ({1440 // minutes}点/天)"
+    direction_label = {"up": "升采样", "down": "降采样", "same": "同粒度重排"}[stats["direction"]]
     return {
-        "summary": f"重采样 {old_count}→{len(resampled)} 行 · {label} · {METHOD_LABELS[method]}",
+        "summary": f"{direction_label} {old_count}→{len(resampled)} 行 · {label} · {METHOD_LABELS[method]}",
+        "directionLabel": direction_label,
         "oldCount": old_count, "newCount": int(len(resampled)), "_frame": resampled, **stats,
     }
 
@@ -1833,6 +2337,7 @@ def _op_feature_cat(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
 
 _OPS = {
     "set_time_format": _op_set_time_format,
+    "set_time_col": _op_set_time_col,
     "rename_column": _op_rename_column,
     "delete_column": _op_delete_column,
     "convert_unit": _op_convert_unit,
@@ -1904,6 +2409,27 @@ def create_from_bytes(content: bytes, filename: str, display_name: str | None = 
     return _register(df, meta, {"kind": "upload", "filename": filename})
 
 
+def create_from_files(parts: list[tuple[bytes, str]], display_name: str | None = None,
+                      persist: bool = True) -> tuple[Workspace, list[str]]:
+    """多份上传文件按行合并 + 按时间排序成一颗帧，返回 (工作区, 各份的落盘文件名)。
+
+    source 记的是**全部落盘文件名**：合并帧没有"原始整表"可退回去，服务端重启后只能靠
+    数据集目录里的这几份文件依次再解析一遍，所以文件名丢了这颗帧就废了。
+    顺序刻意是"先解析合并、后写盘"：拼不成一张表的那一批（时间列名不一致等）不该在
+    数据集目录里留下孤儿文件——它们会出现在「最近打开的数据集」列表里。
+    """
+    parsed = []
+    for content, filename in parts:
+        df, meta = dataframe_from_bytes(content, filename)
+        parsed.append((filename, df, meta))
+    df, meta = merge_frames(parsed)
+    from . import dataset_store   # 与 dataset_read_bytes 同一口径的延迟导入，避免循环依赖
+    names = [str(f) for _, f in parts]
+    saved = [dataset_store.save_bytes(n, c) for c, n in parts] if persist else names
+    meta["name"] = display_name or f"{display_stem(names[0])} 等 {len(names)} 份合并"
+    return _register(df, meta, {"kind": "merge", "filenames": list(saved)}), saved
+
+
 def create_from_dataframe(df: pd.DataFrame, meta: dict, source: dict) -> Workspace:
     meta = dict(meta)
     if "name" not in meta:
@@ -1947,6 +2473,23 @@ def _rebuild_base(source: dict) -> tuple[pd.DataFrame, dict]:
         except ValueError as exc:
             raise ValueError(f"来源文件 {name} 不可读（上传时未落盘？）：{exc}") from exc
         return dataframe_from_bytes(content, real)
+    if kind == "merge":
+        names = source.get("filenames") or []
+        if len(names) < 2:
+            raise ValueError(f"合并工作区的来源记录不完整（应含两份以上文件名，实际 {len(names)} 份），无法重建")
+        parsed = []
+        for name in names:
+            try:
+                content, real = dataset_read_bytes(name)
+            except FileNotFoundError as exc:
+                raise ValueError(
+                    f"合并来源文件 {name} 已不在数据集目录里，无法重建该工作区"
+                    f"（合并帧只能靠这几份原始文件重拼）") from exc
+            except ValueError as exc:
+                raise ValueError(f"合并来源文件 {name} 不可读：{exc}") from exc
+            df, meta = dataframe_from_bytes(content, real)
+            parsed.append((real, df, meta))
+        return merge_frames(parsed)
     raise ValueError(f"未知的载入来源：{kind}")
 
 
@@ -2010,7 +2553,11 @@ def close(ws_id: str) -> bool:
 
 
 def resample_preview(ws: Workspace, minutes: int) -> dict:
-    """重采样前给出的预测行数（真实分桶计数，不是估算）。"""
+    """重采样前给出的预测行数（真实分桶计数，不是估算），并说清这一趟是升还是降。
+
+    升采样时"空桶"不是会丢的数据，而是**将要被填出来的格子**——预演里必须这么标，
+    否则确认框上写着"2157 个桶为空"，用户点完才发现表里多了四分之三的补值。
+    """
     if not ws.time_col or ws.time_col not in ws.df.columns:
         raise ValueError("没有可用的时间列")
     ts = pd.to_datetime(ws.df[ws.time_col], errors="coerce").dropna()
@@ -2021,8 +2568,18 @@ def resample_preview(ws: Workspace, minutes: int) -> dict:
     last = int(ts.max().value // step_ns) * step_ns
     projected = (last - first) // step_ns + 1
     covered = len(set(int(v.value // step_ns) for v in ts))
+    source_minutes = detect_freq_minutes(ts)
+    direction = "same"
+    if source_minutes:
+        direction = "up" if minutes < source_minutes else ("down" if minutes > source_minutes else "same")
+    empty = int(projected - covered)
     return {"targetMinutes": minutes, "projectedRows": int(projected), "currentRows": int(ws.df.shape[0]),
-            "filledBuckets": int(covered), "emptyBuckets": int(projected - covered),
+            "sourceMinutes": source_minutes, "direction": direction,
+            "directionLabel": {"up": "升采样", "down": "降采样", "same": "同粒度重排"}[direction],
+            "filledBuckets": int(covered), "emptyBuckets": empty,
+            # 降采样时只有真数出了空桶才提「留空」：一个都不空还说这句话，等于在描述一次不会发生的丢数据。
+            "emptyNote": ("这些空桶会被填上（值延续或线性插值），不是真实观测" if direction == "up"
+                          else ("这些桶在原始数据里就没有观测，重采样后留空" if empty else "")),
             "compression": (int(ws.df.shape[0]) / int(projected)) if projected else None}
 
 
