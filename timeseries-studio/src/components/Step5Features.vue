@@ -14,24 +14,20 @@ const d = computed(() => { void state.dataVersion; return { ...ds() } })
 // 四类特征全部在后端的整帧上算（期③）：浏览器只持有元数据与当前页窗口，不再常驻整表数据
 const limits = computed(() => state.backend.limits || {})
 const running = ref(false)
-// 一次只跑一个构建：连点两次会把同一批特征建第二遍（第二次只是「新增 0 列」，白跑一趟后端）
-// 两处分支都必须出声，否则界面上就是「点了没反应」：
-//   · 被闸门挡下来 → 说清为什么这一次没提交；
-//   · 构建没落成 → 说清表里没变（失败原因由 store 的 runOp 先弹一条，这里补结论）；
-//   返回值给调用方（commitHolidays 靠它决定要不要回填草稿），不再一律 undefined。
+// 一次只跑一个构建：连点两次会把同一批特征建第二遍（第二次只是「新增 0 列」，白跑一趟后端）。
+// 时间/分类这两个入口的按钮没有 disabled，被闸门挡下时必须出声，否则界面上就是「点了没反应」；
+// 构建没落成不用再说一遍——失败原因由 store 的 runOp 当场弹过，这里只回返回值
+// （调用方 commitHolidays 靠它决定要不要回填草稿）。
 async function runBuild(fn, onOk) {
   if (running.value) {
-    toast('info', '上一次特征构建还在执行：等它跑完再提交，避免同一批列建两遍')
+    toast('info', '上一次特征构建还在执行，这次没有提交')
     return false
   }
   running.value = true
   try {
     const r = await fn()
-    if (!r) {
-      toast('warning', '本次提交没有改动表里的任何列（原因见上一条提示）')
-      return false
-    }
-    onOk(r)
+    if (!r) return false
+    onOk?.(r)
     return true
   } finally {
     running.value = false
@@ -106,6 +102,12 @@ const timeOpts = reactive(Object.fromEntries(TIME_OPTS_ALL.map(k => [k, true])))
 
 function pickedKeys(map) { return Object.keys(map).filter(k => map[k]) }
 
+// 建成的列数写在卡片上的「本族已有几列」与特征登记表里，不再弹一条复述；
+// 只有「上一批里没再勾选的列被换出」这件事界面上看不出来（列直接消失了），必须当场说一声
+function noteSwapped(r) {
+  if (r?.removed) toast('info', `上一批未再勾选的 ${r.removed} 列已被换出`)
+}
+
 // 展示用的「本次会生成哪些列」，与 store 里的构建逻辑同一函数，数字可追溯
 const timePlan = computed(() => timePlanLabel(TIME_OPTS_ALL.filter(o => timeOpts[o])))
 const timeSinCosEnabled = computed(() => timePlan.value.cycDims.length > 0)
@@ -116,8 +118,7 @@ function runTimeFeatures() {
   const plan = timePlanLabel(chosen)
   if (plan.total === 0) { toast('warning', '当前勾选组合生成不出任何列'); return }
   runBuild(() => buildTimeFeatures(chosen), r => {
-    toast('success', `已写入 ${r.cols} 个时间特征列（其中正余弦 ${r.sinCos} 列，本次新增 ${r.created} 列）` +
-      (r.dropped ? `；${r.dropped} 个维度只留 sin/cos、未保留数值原列` : '') + r.removedNote)
+    noteSwapped(r)
   })
 }
 
@@ -173,8 +174,8 @@ function applyHolidayPreset(year) {
 }
 async function commitHolidays(source) {
   const days = [...new Set(holidayDraft.value)].sort()
-  const r = await runBuild(() => saveHolidays(days, source),
-    x => toast('success', `节假日表已更新为 ${x.count} 天（${x.source}）` + (x.days.length ? ` · ${x.days[0]} ~ ${x.days[x.days.length - 1]}` : ' · 不认任何节假日')))
+  // 天数与来源就写在标题那行，表空时下方另有常驻一句
+  const r = await runBuild(() => saveHolidays(days, source))
   if (r) syncHolidayDraft()
 }
 
@@ -233,7 +234,7 @@ const windowPlan = computed(() => lagFeaturePlan(targetColsOrDefault(), lagParam
 
 function runLagGroup(group) {
   const targetCols = targetColsOrDefault()
-  if (targetCols.length === 0) { toast('warning', '请先在左侧勾选至少一个操作字段'); return }
+  if (targetCols.length === 0) { toast('warning', '表里没有可用作目标的数值列'); return }
   const params = lagParams()
   if (group === 'lag') {
     if (params.lags.length === 0) { toast('warning', '请先填写滞后阶数（逗号分隔，如 1, 2, 4, 96）'); return }
@@ -247,10 +248,7 @@ function runLagGroup(group) {
       return
     }
   }
-  const head = group === 'lag' ? '滞后' : '滑动窗口'
-  runBuild(() => buildLagFeatures(targetCols, params, group), r => {
-    toast('success', `已写入 ${r.cols} 个${head}特征列（本次新增 ${r.created} 列）· 目标列: ${targetCols.join(', ')}${r.removedNote}`)
-  })
+  runBuild(() => buildLagFeatures(targetCols, params, group), noteSwapped)
 }
 
 // ---- Tab 3: 差分平稳化与频域 ----
@@ -276,17 +274,14 @@ const fftPlanOpen = ref(false)
 
 function runDiffGroup(group) {
   const targetCols = targetColsOrDefault()
-  if (targetCols.length === 0) { toast('warning', '请先在左侧勾选至少一个操作字段'); return }
+  if (targetCols.length === 0) { toast('warning', '表里没有可用作目标的数值列'); return }
   const p = diffParams()
   if (group === 'diff') {
     if (!p.d1 && !p.d2 && !p.seasonal) { toast('warning', '请至少勾选一项差分（一阶 / 二阶 / 季节性）'); return }
   } else {
     if (!p.fftDominant && !p.fftEntropy && !p.fftPowerRatio) { toast('warning', '请至少勾选一项频域特征'); return }
   }
-  const head = group === 'diff' ? '差分平稳化' : '频域'
-  runBuild(() => buildDiffFeatures(targetCols, p, group), r => {
-    toast('success', `已写入 ${r.cols} 个${head}特征列（本次新增 ${r.created} 列）· 目标列: ${targetCols.join(', ')}${r.removedNote}`)
-  })
+  runBuild(() => buildDiffFeatures(targetCols, p, group), noteSwapped)
 }
 
 // ---- Tab 4: 类别特征编码 ----
@@ -322,8 +317,8 @@ async function loadCatDist() {
   const r = await catColumnDistribution(keys, method)
   if (seq !== catDistSeq) return   // 只认最后一次请求的结果
   catDist.value = r
-    ? { ...r, loading: false, error: '' }
-    : { rows: [], totalNewCols: 0, loading: false, error: '后端未返回分布数据（原因见提示）' }
+    ? { ...r, loading: false, error: r.error || '' }
+    : { rows: [], totalNewCols: 0, loading: false, error: '后端没有返回这一批类别列的取值分布' }
 }
 watch(() => `${catPicked.value.join(',')}|${catMethod.value}|${d.value.meta?.version ?? -1}`, () => { loadCatDist() })
 
@@ -339,9 +334,7 @@ function distBar(row) {
 function runCatFeatures() {
   const keys = catPicked.value
   if (keys.length === 0) { toast('warning', '请先在左侧勾选至少一个类别列'); return }
-  runBuild(() => buildCatFeatures(keys, catMethod.value), r => {
-    toast('success', `已执行${CAT_METHOD_NAMES[catMethod.value]}，写入 ${r.cols} 列（本次新增 ${r.created} 列）· 列: ${keys.join(', ')}`)
-  })
+  runBuild(() => buildCatFeatures(keys, catMethod.value), noteSwapped)
 }
 
 // ---- 特征矩阵预览：读后端分页窗口，翻页即向 /rows 要下一段，浏览器不留整表 ----
@@ -389,7 +382,7 @@ async function jumpToComplete() {
   }
   previewStart.value = 0
   await refreshPage(r.index)
-  toast('success', `第 ${r.index + 1} 行起全部新增特征均有值`)
+  // 定位结果就写在预览表头那行「第 X–Y 行」里
 }
 
 const renameIdx = ref(-1)
@@ -407,7 +400,7 @@ function commitRename() {
   const v = renameVal.value.trim()
   renameIdx.value = -1
   if (!v || v === state.features[idx].label) return
-  runBuild(() => renameFeature(idx, v), () => toast('success', `特征列已重命名为 [${v}]`))
+  runBuild(() => renameFeature(idx, v))
 }
 function cancelRename() { renameIdx.value = -1 }
 
@@ -416,12 +409,11 @@ async function confirmDrop(idx) {
   const feat = state.features[idx]
   try {
     await ElMessageBox.confirm(
-      `确认撤销特征列「${feat.label}」？后端工作区的 ${rowCount().toLocaleString()} 行会一并去掉该字段，此操作会写入操作记录（可回放、可导出 Python）。`,
+      `撤销特征列「${feat.label}」？整表 ${rowCount().toLocaleString()} 行一并去掉该字段（可撤销）。`,
       '撤销特征列', { type: 'warning' })
   } catch (e) { return }
   renameIdx.value = -1
-  const label = feat.label
-  await runBuild(() => dropFeature(idx), () => toast('success', `特征列 [${label}] 已撤销`))
+  await runBuild(() => dropFeature(idx), () => {})
 }
 
 function enterStep() {
@@ -448,8 +440,8 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
          :class="state.backend.online ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-rose-50 border-rose-200 text-rose-700'">
       <i class="fa-solid mt-0.5" :class="running ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
       <div class="min-w-0">
-        <span v-if="running">构建中…</span>
-        <span v-else>后端不在线：本页的构建、重命名与撤销均为只读，浏览器不再算第二套</span>
+        <span v-if="running">后端整表构建中…</span>
+        <span v-else>后端不在线：本页的构建、重命名与撤销都只读</span>
       </div>
     </div>
     <!-- 特征配置区 -->
@@ -527,7 +519,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
               </div>
               <p class="text-[10px] text-slate-400 mt-1.5 leading-relaxed">
                 <template v-if="!timeSinCosEnabled">
-                  正余弦不是第 7 个日历维度，而是把上面某个周期维度<b class="text-slate-500">换一种编码</b>：映射到单位圆，避免「23 点与 0 点相差很远」的断裂。当前没有维度被编码，生成的是普通数值日历列。
+                  正余弦是把某个周期维度<b class="text-slate-500">换一种编码</b>，不是多出的维度。当前没有维度被编码，只生成普通数值日历列。
                 </template>
                 <template v-else>
                   将对 <b class="text-slate-600">{{ timePlan.cyc.join('、') }}</b> 各生成 sin 与 cos 两列（共
@@ -572,8 +564,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
 
               <div v-if="holOpen" class="mt-2 space-y-2">
                 <p class="text-[10px] text-slate-400 leading-relaxed">
-                  勾选「节假日编码」时，<span class="font-mono">feat_holiday</span> 就是「该行日期是否落在这份表里」。
-                  表配在工作区上（撤销/重做都会跟着走），改完点保存即写入一条命令；不保存就只是草稿，生成时用的仍是后端已生效的那份。
+                  勾选「节假日编码」时，<span class="font-mono">feat_holiday</span> 就是「该行日期是否落在这份表里」。这份表配在工作区上，撤销/重做都跟着它走。
                 </p>
                 <div v-if="hol.error" class="text-[10px] text-rose-600">
                   {{ hol.error }}
@@ -652,8 +643,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
                 <i class="fa-solid fa-clock-rotate-left text-sky-600 mr-2"></i>滞后与滑动窗口特征
               </h3>
               <p class="text-[10px] text-slate-400 mb-3 leading-relaxed">
-                左右两张卡片是两条互不相干的命令：各自的参数、各自的列名预览、各自的生成按钮。
-                点其中一张只提交它那一族，另一张已经生成的列原样留着（同一张卡片重新生成时，上一批里没再勾选的列会退场）。
+                左右两张卡片各自一条命令：点哪张就只提交那一族，另一族的列不动；同一张卡片重新生成时，上一批里没再勾选的列会被换出。
               </p>
               <div class="grid grid-cols-2 gap-4 items-stretch">
 
@@ -778,8 +768,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
                 </section>
               </div>
               <p class="text-[10px] text-slate-400 mt-3 leading-relaxed">
-                窗口类特征一律不含当前行（等价 pandas <span class="font-mono">.shift(1)</span>），防止用 t 时刻的值泄漏预测 t 时刻的标签；
-                Expanding 为历史累计均值，EWM 半衰期由 span 控制。两张卡片用的是左侧同一份「操作字段」勾选集。
+                窗口类特征一律不含当前行（等价 pandas <span class="font-mono">.shift(1)</span>），避免用 t 时刻的值泄漏 t 时刻的标签。Expanding 为历史累计均值，EWM 半衰期由 span 控制。
               </p>
             </div>
           </div>
@@ -816,8 +805,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
                 <i class="fa-solid fa-wave-square text-emerald-600 mr-2"></i>差分平稳化与频域特征
               </h3>
               <p class="text-[10px] text-slate-400 mb-3 leading-relaxed">
-                左右两张卡片是两条互不相干的命令：差分只做时域差商，频域只在滑动 DFT 窗口上取谱特征，
-                各自的生成按钮只提交自己那一族。
+                差分只做时域差商，频域只在滑动 DFT 窗口上取谱特征，两张卡片各提交自己那一族。
               </p>
               <div class="grid grid-cols-2 gap-4 items-stretch">
 
@@ -947,7 +935,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
                 </section>
               </div>
               <p class="text-[10px] text-slate-400 mt-3 leading-relaxed">
-                两张卡片用的是左侧同一份「操作字段」勾选集；差分与频域互不覆盖，撤销其中一族也不会动另一族的列。
+                两张卡片共用左侧那份「操作字段」勾选集；差分与频域互不覆盖，撤销一族不动另一族。
               </p>
             </div>
           </div>
@@ -986,7 +974,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
                       <option value="ordinal">序数编码 (Ordinal / Label)</option>
                       <option value="target">目标均值编码 (Target Encoding)</option>
                     </select>
-                    <p class="text-[10px] text-slate-400 mt-1.5">独热编码为每个类别生成独立 0/1 列；序数编码按出现顺序映射为整数；目标均值编码以主数值列为目标 (存在数据泄露风险，仅用于探索)</p>
+                    <p class="text-[10px] text-slate-400 mt-1.5">独热：每个取值一列 0/1；序数：按取值首次出现的顺序编号；目标均值：以主数值列为目标，有泄露风险，只用于探索</p>
                   </div>
                   <div>
                     <label class="text-[11px] text-slate-500 block mb-1.5">编码参数预览</label>
@@ -1005,7 +993,6 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
                 <div class="border border-slate-200 rounded-lg overflow-hidden">
                   <div class="bg-slate-50 px-3 py-1.5 border-b border-slate-200 flex items-center justify-between">
                     <span class="text-[11px] font-semibold text-slate-600">所选列类别值分布</span>
-                    <span class="text-[10px] text-slate-400">{{ catPicked.length === 0 ? '请选择类别列' : `${CAT_METHOD_NAMES[catMethod]} · 预计新增 ${catDist.totalNewCols} 列` }}</span>
                   </div>
                   <div class="max-h-[150px] overflow-auto">
                     <table class="w-full text-xs">

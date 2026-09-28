@@ -3,7 +3,7 @@ import { ref, reactive, computed, onMounted, onActivated, onBeforeUnmount, nextT
 import * as echarts from 'echarts'
 import { ElMessageBox } from 'element-plus'
 import {
-  state, ds, switchStep, toast, requireBackend, sourceSig,
+  state, ds, switchStep, requireBackend, sourceSig,
   loadQuality, qualityData, columnMissingStats, segmentsOf, segmentsTruncated,
   segAlgo, setSegAlgo, applySegmentImpute, applyAllSegmentsImpute, imputeAllAndDedupe,
   detectAnomalies, repairAnomalies, loadSeries,
@@ -27,7 +27,7 @@ const d = computed(() => { void state.dataVersion; return { ...ds() } })
 const stats = computed(() => { void state.dataVersion; return columnMissingStats() })
 const diagError = computed(() => {
   void state.dataVersion
-  if (!state.backend.online) return '后端未连接：本步的缺失扫描、填补、异常检测与掩码全部在后端执行，浏览器不再算第二套，页面转为只读。'
+  if (!state.backend.online) return '后端未连接：缺失扫描、填补、异常检测与掩码都在后端执行，本页只读。'
   if (!d.value.wsId) return '还没有载入数据集：请回第一步加载数据后再做质量诊断。'
   if (state.quality.error) return `诊断读取失败：${state.quality.error}`
   return ''
@@ -270,18 +270,17 @@ function segTotalRows() { return segList.value.reduce((s, g) => s + g.count, 0) 
 function colLabel(key) { return d.value.columns.find(c => c.key === key)?.label || key }
 
 async function doSegmentImpute(idx) {
-  const r = await applySegmentImpute(segCol.value, idx)
-  if (r) toast('success', r.summary)
+  // 补完这段就从缺失段列表里消失，整表计数随之下降；填补口径记在操作日志，不另弹
+  await applySegmentImpute(segCol.value, idx)
 }
 async function doAllSegments() {
-  const r = await applyAllSegmentsImpute(segCol.value)
-  if (r) toast('success', r.summary)
+  await applyAllSegmentsImpute(segCol.value)
 }
 
 const dupStrategy = ref('mean')
 const defaultAlgo = ref('linear')
 async function doImputeAll() {
-  // store 内的 imputeAllAndDedupe 已经把服务端 summary 作为 toast 发出来了
+  // 填掉的单元格数、去重条数都记在缺失计数表与操作日志里，这里不再弹一条复述
   await imputeAllAndDedupe(dupStrategy.value, defaultAlgo.value)
 }
 
@@ -354,7 +353,7 @@ async function doDetect() {
       : {}
     const r = await detectAnomalies(algo.value, exprInput.value.trim(), params)
     if (r) {
-      toast('success', `检测完成：${r.summary.totalAnomalies} 个异常点，涉及 ${r.summary.colsAffected}/${r.summary.numCols} 列`)
+      // 异常点数、异常率、受影响列数就摆在下方六张卡里，不再弹一条复述
       await ensureSeries()
       renderChart()
     }
@@ -365,16 +364,16 @@ async function doDetect() {
 
 async function doRepair() {
   const la = detection.value
-  if (!la) { toast('warning', '请先执行检测：修复按服务端留存的行索引执行'); return }
-  if (la.stale) { toast('warning', '检测之后数据又被改过（行位置已变），请重新检测后再修复'); return }
+  // 未检测、检测过期、以及「检测到 0 个异常」三种情况按钮本身就禁用，原因写在 title 与上方那条常驻红字里
+  if (!la || la.stale || !la.summary.totalAnomalies) return
   try {
     await ElMessageBox.confirm(
-      `将按 ${ANOMALY_REPAIRS[repair.value].split('：')[0]} 方案处理 ${la.summary.totalAnomalies} 个异常点，数据会被修改。确认继续？`,
+      `按 ${ANOMALY_REPAIRS[repair.value].split('：')[0]} 方案处理 ${la.summary.totalAnomalies} 个异常点，数据会被修改。确认？`,
       '执行修复', { type: 'warning' }
     )
   } catch (e) { return }
-  const r = await repairAnomalies(repair.value)
-  if (r) toast('success', `修复完成：处理 ${r.touched} 个数据点`)
+  // 处理掉的点数就是修复前卡片上的「异常点总数」，修完六张卡立刻按新检测结果重算
+  await repairAnomalies(repair.value)
 }
 
 const anomalyCards = computed(() => {
@@ -396,11 +395,11 @@ function fmtBound(v) { return v === null || v === undefined ? '—' : Number(v).
 const maskName = ref('mask_curtailment')
 async function doGenerateMask() {
   if (!requireBackend('生成掩码列')) return
-  if (!brushRange.value) { toast('warning', '请先在图表上拖拽框选要标记的时段'); return }
+  // 没有框选时按钮本身就是禁用的，旁边那句「未框选」常驻说明状态，不再弹一条同义的提示
+  if (!brushRange.value) return
   const name = maskName.value.trim() || 'mask_1'
-  const ones = await generateMask(name, brushRange.value)
-  if (ones === null) return
-  toast('success', `已生成布尔掩码列 [${name}]，区间内 ${ones} 行置 1`)
+  if (await generateMask(name, brushRange.value) === null) return
+  // 列名、区间与「标记 N 行」就写在下方列表那一行，不另弹
   const num = state.masks.length + 1
   maskName.value = `mask_segment_${num}`
   clearBrush()
@@ -412,11 +411,11 @@ const maskStats = computed(() => ({
 }))
 async function doDeleteMask(idx) {
   if (!requireBackend('删除掩码列')) return
-  if (await deleteMask(idx)) toast('success', '掩码列已从服务端工作区删除')
+  await deleteMask(idx)
 }
 async function doDeleteAllMasks() {
   if (!requireBackend('清空掩码列')) return
-  if (await deleteAllMasks()) toast('success', '掩码列已全部从服务端工作区删除')
+  await deleteAllMasks()
 }
 
 // ============ 生命周期 ============
@@ -615,8 +614,8 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
               </div>
               <div v-if="segTruncated" class="px-3 py-2 bg-rose-50 border-b border-rose-200 text-[10px] text-rose-700 leading-snug">
                 <i class="fa-solid fa-circle-exclamation mr-1"></i>
-                该列缺失段超过 {{ stats?.segmentCap }} 段的返回上限，以下是前 {{ segList.length }} 段：逐段填补只能覆盖这部分，
-                整列请用右侧「执行填补与去重」（服务端扫描全表，不受上限限制）
+                该列缺失段超过 {{ stats?.segmentCap }} 段的返回上限，这里只列前 {{ segList.length }} 段：逐段填补只覆盖这部分，
+                整列请用右侧「执行填补与去重」（不受该上限限制）
               </div>
               <div class="max-h-[220px] overflow-auto divide-y divide-amber-100">
                 <div v-if="segList.length === 0" class="text-center py-6 text-amber-400 text-xs">
@@ -657,7 +656,7 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
                 <select v-model="defaultAlgo" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-xs bg-white focus:border-amber-400 outline-none">
                   <option v-for="o in IMPUTE_ALGOS" :key="o.value" :value="o.value">{{ o.label }}</option>
                 </select>
-                <p class="text-[10px] text-slate-400 mt-1.5">服务端扫描全表时对所有缺失段使用该算法</p>
+                <p class="text-[10px] text-slate-400 mt-1.5">整表所有缺失段都用这一个算法</p>
               </div>
               <div>
                 <label class="text-[11px] text-slate-500 block mb-1.5">重复时间戳合并策略</label>
@@ -714,7 +713,8 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
                         class="flex-1 py-2 bg-rose-500 hover:bg-rose-600 disabled:opacity-60 text-white rounded-lg text-xs font-bold shadow-sm flex items-center justify-center gap-1.5">
                   <i class="fa-solid text-[10px]" :class="detecting ? 'fa-spinner fa-spin' : 'fa-magnifying-glass'"></i>{{ detecting ? '后端计算中…' : '执行检测' }}
                 </button>
-                <button @click="doRepair" :disabled="!detection || detection.stale"
+                <button @click="doRepair" :disabled="!detection || detection.stale || !detection.summary.totalAnomalies"
+                        :title="detection && !detection.stale && !detection.summary.totalAnomalies ? '本次检测一个异常点都没有，没有要修的东西' : ''"
                         class="flex-1 py-2 bg-slate-700 hover:bg-slate-800 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold shadow-sm flex items-center justify-center gap-1.5">
                   <i class="fa-solid fa-wand-magic-sparkles text-[10px]"></i>执行修复
                 </button>
@@ -863,15 +863,15 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
                   <template v-if="brushRange">{{ brushRange.start }} ~ {{ brushRange.end }} (索引 {{ brushRange.startIdx }}–{{ brushRange.endIdx }})</template>
                   <template v-else>未框选 — 请先在上方图表上拖拽选取时段</template>
                 </div>
-                <p class="text-[10px] text-slate-400 mt-1.5">图表画的是整表每一行（服务端全量回传，不抽点），框选边界吸附到的就是真实行号（行号即工作区当前帧的行位置）</p>
+                <p class="text-[10px] text-slate-400 mt-1.5">图表画的是整表每一行（服务端全量回传，不抽点），框选吸附到的就是真实行号</p>
               </div>
               <div>
                 <label class="text-[11px] text-slate-500 block mb-1.5">自定义掩码特征列名</label>
                 <input v-model="maskName" class="w-full border border-slate-200 rounded-lg px-3 py-2 text-xs font-mono bg-white focus:border-teal-400 outline-none" />
-                <p class="text-[10px] text-slate-400 mt-1.5">生成的 0/1 列将追加到数据集中，1 表示框选区间内</p>
+                <p class="text-[10px] text-slate-400 mt-1.5">生成 0/1 列追加到数据集，1 表示落在框选区间内</p>
               </div>
               <div class="flex items-end">
-                <button @click="doGenerateMask" class="w-full py-2.5 bg-teal-500 hover:bg-teal-600 text-white rounded-lg text-xs font-bold shadow-sm flex items-center justify-center gap-1.5">
+                <button @click="doGenerateMask" :disabled="!brushRange || !!state.busy" class="w-full py-2.5 bg-teal-500 hover:bg-teal-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded-lg text-xs font-bold shadow-sm flex items-center justify-center gap-1.5">
                   <i class="fa-solid fa-plus text-[10px]"></i>生成布尔掩码
                 </button>
               </div>
@@ -922,23 +922,9 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
           </div>
 
           <div class="shrink-0 w-44 pl-5 border-l border-slate-100 flex flex-col gap-3">
-            <div class="p-3 rounded-lg bg-teal-50 border border-teal-200">
-              <h4 class="text-[11px] font-bold text-teal-700 mb-1">使用说明</h4>
-              <p class="text-[10px] text-teal-600 leading-relaxed">
-                1. 点击上方图表「开启时段刷选标记」<br/>
-                2. 在图表上拖拽选取目标时段<br/>
-                3. 填写掩码列名并点击「生成」<br/>
-                4. 生成后可在下方列表中查看或删除
-              </p>
-            </div>
             <div class="p-3 rounded-lg bg-slate-50 border border-slate-200">
               <h4 class="text-[11px] font-bold text-slate-600 mb-1">掩码用途</h4>
-              <p class="text-[10px] text-slate-500 leading-relaxed">
-                掩码列 (0/1) 可用于：<br/>
-                • 标记限电/检修时段<br/>
-                • 特征工程中过滤特定区间<br/>
-                • 作为模型训练的辅助特征
-              </p>
+              <p class="text-[10px] text-slate-500 leading-relaxed">0/1 列：标出限电、检修这类区间，既能用来过滤行，也能直接当特征。</p>
             </div>
             <div v-if="state.masks.length > 0" class="p-3 rounded-lg bg-white border border-slate-200">
               <h4 class="text-[11px] font-bold text-slate-600 mb-1.5">掩码统计</h4>

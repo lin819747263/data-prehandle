@@ -88,7 +88,7 @@ const codeContent = computed(() => state.showCodeModal ? generatePythonCode() : 
 function copyCode() {
   navigator.clipboard?.writeText(codeContent.value)
     .then(() => toast('success', '代码已复制到剪贴板'))
-    .catch(() => toast('warning', '浏览器拒绝了剪贴板访问，请手动选择复制'))
+    .catch(() => toast('warning', '浏览器拒绝了剪贴板访问，请手动选中复制'))
 }
 
 // ---- 后端连接状态 ----
@@ -181,12 +181,10 @@ async function doExport(kind) {
   if (kind === 'py') { state.showCodeModal = true; state.showExportModal = false; return }
   if (!EXPORT_FORMATS[kind]) return
   if (exporting.value) return
-  if (!state.backend.online) {
-    toast('info', `导出需要后端在线（${API_BASE}）：宽表由服务端从工作区直出，浏览器端不再保留整表编码兜底`)
-    return
-  }
+  // 离线时四个格式入口要么 disabled 要么换成「后端未连接」那块占位，走不到这里
+  if (!state.backend.online) return
   if (!canEncode(kind)) {
-    toast('warning', `后端编不出 ${EXPORT_FORMATS[kind]}：${codecReason(kind)}，换一种格式或补上依赖（parquet/feather 需要 pyarrow，xlsx 需要 openpyxl）`)
+    toast('warning', `后端编不出 ${EXPORT_FORMATS[kind]}：${codecReason(kind)} · 换格式或补依赖（parquet/feather 要 pyarrow，xlsx 要 openpyxl）`)
     return
   }
   const d = ds()
@@ -195,7 +193,7 @@ async function doExport(kind) {
   try {
     const rows = rowCount()
     const r = await wsExport(d.wsId, kind)
-    toast('success', `后端已从工作区导出 ${(r.bytes / 1024).toFixed(1)} KB ${EXPORT_FORMATS[kind]}：${r.name}`)
+    toast('success', `导出完成：${r.name} · ${(r.bytes / 1024).toFixed(1)} KB（服务端直出）`)
     logAction(5, 'dataset', `导出 ${EXPORT_FORMATS[kind]} 宽表`,
       `${rows.toLocaleString()} 行 × ${exportCols.value} 列 · ${(r.bytes / 1024).toFixed(1)} KB · 后端工作区直出`,
       { type: 'export', format: kind, bytes: r.bytes, rows, cols: exportCols.value })
@@ -224,23 +222,16 @@ watch(saveFormats, m => {
 
 async function doSaveAsDataset() {
   if (saving.value) return
-  if (!state.backend.online) {
-    toast('info', `另存为数据集需要后端在线（${API_BASE}）：宽表由服务端直接写进数据集目录，浏览器不持有整表`)
-    return
-  }
+  if (!state.backend.online) return
   const d = ds()
   if (!d?.wsId) { toast('warning', '还没有载入数据集'); return }
-  if (!canEncode(saveFmt.value)) {
-    toast('warning', `后端编不出 ${EXPORT_FORMATS[saveFmt.value]}：${codecReason(saveFmt.value)}`)
-    return
-  }
+  if (!canEncode(saveFmt.value)) return
   saving.value = true
   try {
     const r = await wsSaveAs(d.wsId, saveFmt.value, saveName.value.trim())
     savedOk.value = `${r.filename} · ${r.sizeText} · ${r.rows.toLocaleString()} 行 × ${r.cols} 列` +
       (r.renamed ? `（${r.proposed} 已存在，另存为新名）` : '')
-    toast('success', `已存进数据集目录：${r.filename} · ${r.sizeText} · ${r.rows.toLocaleString()} 行 × ${r.cols} 列` +
-      (r.renamed ? `（${r.proposed} 已存在，另存为新名）` : '') + ' · 回第一步「最近打开的数据集」可直接点开')
+    // 不再另弹一条 toast：模态里那句 savedOk 就是同一批数字，而且它不会三秒就消失
     logAction(5, 'dataset', `另存为数据集（${EXPORT_FORMATS[saveFmt.value]}）`,
       `${r.filename} · ${r.rows.toLocaleString()} 行 × ${r.cols} 列 · ${r.sizeText}` +
       (r.renamed ? ` · 同名已存在，原名 ${r.proposed} 另存` : ''),
@@ -337,7 +328,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       <span v-if="state.session.found.drift" class="text-rose-600">
         （会话记的是第 {{ state.session.found.drift.sessionSays }} 版，服务端日志已走到第 {{ state.session.found.drift.serverSays }} 版 —— 以服务端为准）
       </span>
-      <span v-if="state.session.found.alive" class="text-amber-600">（撤销栈就是这段服务端日志，刷新与后端重启都还在；异常检测结果会随回退失效）</span>
+      <span v-if="state.session.found.alive" class="text-amber-600">（刷新与后端重启都还在；异常检测结果会随回退失效）</span>
     </span>
     <div class="ml-auto flex items-center gap-2 shrink-0">
       <button @click="runRestoreSession()" :disabled="histBusy"
@@ -426,9 +417,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <div v-for="g in groupedLog" :key="g.n" class="mb-3">
             <div class="flex items-center gap-1.5 mb-1.5 sticky top-0 bg-white/95 backdrop-blur py-1 z-10">
               <span class="inline-flex items-center gap-1 px-2 py-0.5 rounded-full text-[10px] font-bold text-white" :class="g.meta.color">
-                {{ g.meta.short.replace(/^[①②③④⑤]\s*/, '') }}
+                {{ g.meta.short }}
               </span>
-              <span class="text-[11px] font-bold text-slate-700">{{ g.meta.full }}</span>
               <span class="text-[10px] text-slate-400">· {{ g.items.length }} 条</span>
             </div>
             <div class="relative pl-3 border-l-2 border-dashed border-slate-200 ml-[7px]">
@@ -463,7 +453,8 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
       </div>
       <pre class="p-4 bg-slate-950 text-emerald-400 font-mono text-xs overflow-auto flex-1 leading-relaxed whitespace-pre">{{ codeContent }}</pre>
       <div class="p-3 bg-slate-100 border-t border-slate-200 flex justify-between">
-        <span class="text-[11px] text-slate-500 self-center">仅包含本次会话真实执行过的 {{ logCount }} 条操作（撤销掉的条目会跟着游标一起隐去，重做后回来）</span>
+        <span class="text-[11px] text-slate-500 self-center"
+              title="这份记录来自服务端命令日志的投影：撤销掉的条目会跟着游标一起隐去，重做后再回来">仅本次会话真实执行的 {{ logCount }} 条</span>
         <div class="flex gap-2">
           <button @click="copyCode()" class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs font-medium">复制代码</button>
           <button @click="state.showCodeModal = false" class="px-4 py-1.5 bg-slate-800 text-white rounded text-xs font-medium">关闭</button>
@@ -488,7 +479,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="w-9 h-9 rounded-lg bg-emerald-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-csv text-emerald-600"></i></span>
           <span class="flex-1 min-w-0">
             <span class="block text-xs font-bold text-slate-700">CSV 宽表 (.csv)</span>
-            <span class="block text-[11px] text-slate-400">含全部清洗结果、外生变量与衍生特征列（UTF-8 BOM，Excel 直接双击不乱码）</span>
+            <span class="block text-[11px] text-slate-400">含清洗结果与特征列 · UTF-8 BOM，Excel 双击不乱码</span>
           </span>
           <i class="fa-solid fa-chevron-right text-slate-300 text-xs"></i>
         </button>
@@ -541,7 +532,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           <span class="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-columns text-orange-500"></i></span>
           <span class="flex-1 min-w-0">
             <span class="block text-xs font-bold text-slate-600">Parquet / Feather</span>
-            <span class="block text-[11px] text-rose-500">后端未连接（{{ API_BASE }}）· 四种格式都要由服务端从工作区直出，浏览器端不再兜底编码</span>
+            <span class="block text-[11px] text-rose-500">后端未连接（{{ API_BASE }}）· 四种格式都由服务端直出</span>
           </span>
           <button @click="checkBackend()" class="text-[10px] px-2 py-1 rounded border border-slate-300 text-slate-500 hover:text-indigo-600 hover:border-indigo-300 shrink-0">重试</button>
         </div>
@@ -553,8 +544,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             <span>不下载，直接存进数据集目录</span>
           </div>
           <div class="mt-1 text-[11px] text-slate-400 leading-snug">
-            与上面的导出同一条编码路径（后端工作区宽表直出），字节只落到服务端磁盘；
-            存完回第一步「最近打开的数据集」就能把这份结果当新数据点开。同名不覆盖，后端另起一个带时间戳的文件名。
+            与上面的导出同一条编码路径，字节只落到服务端磁盘；同名不覆盖，后端另起带时间戳的文件名。
           </div>
           <div class="mt-2.5 flex items-center gap-2">
             <input v-model="saveName" type="text" spellcheck="false" :placeholder="`${dsName}_v${state.history.version || 0}（留空即用这个）`"
@@ -569,7 +559,9 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </div>
           <div v-if="savedOk" class="mt-2 flex items-start gap-1.5 text-[11px] text-emerald-700 leading-snug break-words">
             <i class="fa-solid fa-circle-check mt-0.5 shrink-0"></i>
-            <span class="min-w-0">已写进服务端数据集目录：{{ savedOk }} —— 第一步「最近打开的数据集」列表刷新后就是这一份</span>
+            <span class="min-w-0"
+                  title="另存时后端会按行号重编一次时间列，并把合并来源记进会话，重启后可照这份日志重放出同一张表；来源文件若已从数据集目录删除则无法重开。">
+              已写进服务端数据集目录：{{ savedOk }}</span>
           </div>
           <!-- 后端编不出的格式从下拉里收起，并把探测到的整段原因写在原地说清楚，而不是让人点了才吃 422 -->
           <div v-if="missingFormats.length" class="mt-2 space-y-1">
@@ -582,7 +574,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         </div>
       </div>
       <div class="px-5 py-3 bg-slate-50 border-t border-slate-200 text-[11px] text-slate-400">
-        导出内容为当前工作区真实数据状态，可与操作记录 JSON 一同归档复现。
+        导出的是当前工作区的数据，可与操作记录 JSON 一同归档复现。
       </div>
     </div>
   </div>

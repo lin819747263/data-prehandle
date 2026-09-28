@@ -111,15 +111,12 @@ const displayRows = computed(() => (stats.value ? stats.value.rowCount : rowCoun
 const displayCols = computed(() => (stats.value ? stats.value.colCount : floatCols.value.length))
 function fmt(v) { return v === null || v === undefined ? '—' : Number(v).toFixed(1) }
 
-// 每一块的失败都先记在自己账上；quiet=false（用户直接动作触发）时立刻弹一条，
-// quiet=true（prepare 一次性铺三块）时由 prepare 汇总成一条，避免同一屏叠三条 toast。
-function noteFailure(block, e, quiet) {
-  const msg = String(e?.message || e || '未知错误')
-  err[block] = msg
-  if (!quiet) toast('error', `${BLOCK_NAMES[block]}读取失败：${msg}`)
+// 每一块的失败记在自己账上：区块下方那条红字常驻，比一条三秒即消失的 toast 更适合放失败原因
+function noteFailure(block, e) {
+  err[block] = String(e?.message || e || '未知错误')
 }
 
-async function loadStats(quiet = false) {
+async function loadStats() {
   const keys = floatCols.value.map(c => c.key)
   if (!keys.length) { stats.value = null; err.stats = ''; return }
   fetching.stats = true
@@ -127,13 +124,13 @@ async function loadStats(quiet = false) {
     stats.value = await wsStats(d.value.wsId, keys)
     err.stats = ''
   } catch (e) {
-    noteFailure('stats', e, quiet)
+    noteFailure('stats', e)
   } finally {
     fetching.stats = false
   }
 }
 
-async function refreshSeries(quiet = false) {
+async function refreshSeries() {
   const keys = selectedList()
   if (!keys.length) { chart.value = null; err.series = ''; drawMain(); return }
   fetching.series = true
@@ -143,7 +140,7 @@ async function refreshSeries(quiet = false) {
     periodOffset.value = chart.value?.window?.offset ?? 0
     err.series = ''
   } catch (e) {
-    noteFailure('series', e, quiet)
+    noteFailure('series', e)
     return
   } finally {
     fetching.series = false
@@ -151,14 +148,14 @@ async function refreshSeries(quiet = false) {
   drawMain()
 }
 
-async function refreshHist(quiet = false) {
+async function refreshHist() {
   if (!distCol.value) { hist.value = null; err.hist = ''; drawDist(); return }
   fetching.hist = true
   try {
     hist.value = await wsHist(d.value.wsId, distCol.value, binsCount.value)
     err.hist = ''
   } catch (e) {
-    noteFailure('hist', e, quiet)
+    noteFailure('hist', e)
     return
   } finally {
     fetching.hist = false
@@ -167,21 +164,21 @@ async function refreshHist(quiet = false) {
 }
 
 async function prepare(force = false) {
-  if (!state.backend.online) { toast('warning', '后端不在线：第三步的整表计算无从执行，本页只读'); return }
-  if (!d.value.wsId) { toast('warning', '尚未载入数据集：请先在第一步接入数据'); return }
+  // 离线与未接入数据由页首那条 gate 常驻说明，这里直接不铺
+  if (!state.backend.online || !d.value.wsId) return
   // 按 (工作区, 版本号) 记这次铺没铺过：版本号只在执行加工命令时前进，翻页与改勾选都不动它
   const sig = `${d.value.wsId}|${d.value.meta?.version ?? -1}`
   if (!force && loadedSig === sig) return
-  await loadStats(true)
-  await refreshSeries(true)
-  await refreshHist(true)
+  await loadStats()
+  await refreshSeries()
+  await refreshHist()
   loadedSig = sig
   const bad = Object.keys(BLOCK_NAMES).filter(k => err[k])
   if (bad.length) {
-    // 整页缺块必须说出来：只标红不弹提示，用户会以为自己看到的表是全的
+    // 整页缺块必须说出来：只标红不弹提示，用户会以为自己看到的表是全的。
+    // 每块的具体错因由页首 gate 常驻列在这里就不再复述一遍
     toast(bad.length === 3 ? 'error' : 'warning',
-      `${bad.map(k => BLOCK_NAMES[k]).join('、')}没从后端取到${bad.length === 3 ? '，本页没有可用数字' : '，对应区块已标红'}：` +
-      bad.map(k => err[k]).join('　·　'))
+      `${bad.map(k => BLOCK_NAMES[k]).join('、')}没从后端取到${bad.length === 3 ? '，本页没有可用数字' : '，对应区块已标红'}`)
     return
   }
   // 取数成功不弹提示：本页的数字、曲线点数与直方图桶数就摆在区块里，
@@ -366,7 +363,7 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
       <div class="min-w-0">
         <div class="font-semibold">{{ gate.note || '正在计算…' }}</div>
         <div v-if="gate.status === 'error'" class="mt-0.5 leading-snug opacity-80">
-          缺的区块在页面上各自标红；其余两块数字仍然是后端刚算出来的真实值，可以直接看。
+          缺的区块各自标红；其余两块数字仍是后端刚算出来的真实值，可以直接看。
         </div>
       </div>
       <button v-if="gate.status === 'error' || gate.status === 'offline'" @click="prepare(true)"
@@ -376,7 +373,7 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
     <!-- 图上的数字仍是离线前那一次真实计算的结果，说清楚免得被当成实时值 -->
     <div v-if="gate.status === 'ready' && !state.backend.online"
          class="rounded-lg bg-amber-50 border border-amber-200 text-amber-700 px-3 py-1.5 text-[11px] shrink-0">
-      后端已离线：下方统计矩阵、曲线与直方图是离线前最后一次真实计算的结果，本页此时只读；重连后会自动重新计算。
+      后端已离线：下方数字是离线前最后一次真实计算的结果，本页只读；重连后自动重算。
     </div>
 
     <div class="bg-white p-3 rounded-xl border border-slate-200 shadow-sm flex flex-col gap-2.5 shrink-0">

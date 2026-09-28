@@ -65,11 +65,11 @@ function removeFile(idx) { state.pendingFiles.splice(idx, 1) }
 function clearFiles() { state.pendingFiles.splice(0, state.pendingFiles.length) }
 
 async function confirmLoad() {
-  if (state.pendingFiles.length === 0) { toast('warning', '请先选择或上传数据文件！'); return }
+  if (state.pendingFiles.length === 0) { toast('warning', '请先选择或上传数据文件'); return }
   if (!state.backend.online) await checkBackend()
   if (!state.backend.online) {
-    toast('error', `解析与加工已全部改由后端执行，${API_BASE} 不可达时无法载入数据`
-      + `：请在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000`)
+    toast('error', `后端不在线（${API_BASE}），无法解析与载入`
+      + `：在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000`)
     return
   }
   const files = state.pendingFiles.map(p => p.file)
@@ -78,11 +78,9 @@ async function confirmLoad() {
     const d = await loadFilesAsWorkspace(files)
     const r = d.meta.merge
     clearFiles()
-    toast('success', r
-      ? `后端已合并 ${r.fileCount} 份：${r.totalRows.toLocaleString()} 行 × ${r.colCount} 列，`
-        + `按「${r.timeCol}」升序（${r.rowsMoved.toLocaleString()} 行挪了位置，工作区 ${d.wsId}）`
-      : `已由后端解析 ${files[0].name}：${d.meta.rowCount.toLocaleString()} 行 × ${d.meta.colCount} 列`
-        + `（工作区 ${d.wsId}，浏览器只缓存前 ${d.page.rows.length} 行）`)
+    // 单份文件不弹：下一步的快照条就是那行数。合并要弹——「挪了多少行」这件事界面上看不见
+    if (r) toast('success', `已合并 ${r.fileCount} 份：${r.totalRows.toLocaleString()} 行 × ${r.colCount} 列，`
+      + `按「${r.timeCol}」升序（${r.rowsMoved.toLocaleString()} 行挪了位置）`)
     refreshRecent()
     switchStep(2)
   } catch (e) {
@@ -100,8 +98,7 @@ async function openRecent(item) {
   if (opening.value) return
   opening.value = item.filename
   try {
-    const d = await openDatasetFile(item.filename)
-    toast('success', `已打开 ${item.filename}：${d.meta.rowCount.toLocaleString()} 行 × ${d.meta.colCount} 列（工作区 ${d.wsId}）`)
+    await openDatasetFile(item.filename)
     switchStep(2)
   } catch (e) {
     toast('error', `打开失败：${e.message}`)

@@ -121,8 +121,8 @@ async function runDetect(silent = false) {
   if (!r) return
   detected.value = r
   if (!silent) convertStatus.value = null
+  // 认不出就在下方常驻红块里写原因和读到的原值，不再另弹一条三秒即消失的复述
   if (r.ok) await runTargetPreview()
-  else if (!silent) toast('warning', `「${r.col}」不能当时间列：${r.reason}`)
 }
 
 // 目标格式的预览同样让后端渲染一次：这里的 after 与转换后页面上看到的值必须同源
@@ -150,13 +150,12 @@ async function runAssign() {
   const r = await setTimeColumn(timeCol.value, srcFmt.value.trim())
   assigning.value = false
   if (!r) return
-  toast('success', `已把「${r.timeCol}」指定为时间列（整表 ${r.rowCount.toLocaleString()} 行）`)
+  // 按钮就地变成「已是时间列」，行数本来就写在快照条上
   await runDetect(true)
 }
 
 async function runConvert() {
-  if (converting.value) return
-  if (!isCurrentTimeCol.value) { toast('warning', '先点「指定为时间列」把这一列转成时间，再换显示格式'); return }
+  if (converting.value || !isCurrentTimeCol.value) return
   converting.value = true
   const est = previewAfter.value.slice()
   const prevFmt = d.value.timeFormat
@@ -173,7 +172,6 @@ async function runConvert() {
       ? `整表 ${totalRows.value.toLocaleString()} 行已按 ${targetFmtFull.value} 重渲染（${changed.toLocaleString()} 个值变化），但预演与页窗口取值不一致，已以页面为准`
       : `整表 ${totalRows.value.toLocaleString()} 行按 ${prevFmt} → ${targetFmtFull.value} 重渲染，${changed.toLocaleString()} 个值变化；预演的 ${est.length} 个样本与页窗口取值逐字符一致`
   }
-  toast('success', '时间格式转换完成（后端执行）')
 }
 
 // ============ 采样频率与重采样 ============
@@ -203,13 +201,11 @@ async function confirmResample() {
       `${p.filledBuckets.toLocaleString()} 个桶有观测、${p.emptyBuckets.toLocaleString()} 个桶没有观测` +
       `${p.direction === 'down' && p.compression ? `，压缩比 ${p.compression.toFixed(2)}×` : ''}` +
       `${p.direction === 'up' ? `，行数 ×${(p.projectedRows / p.currentRows).toFixed(2)}` : ''}）。\n` +
-      `${p.emptyNote ? `${p.emptyNote}\n` : ''}当前工作区数据会被替换（可用撤销回退）。确认继续？`
+      `${p.emptyNote ? `${p.emptyNote}\n` : ''}工作区数据会被替换（可撤销）。确认？`
     : `将在后端按 ${targetRate.value} 粒度聚合整表（当前 ${totalRows.value.toLocaleString()} 行）。确认继续？`
   try { await ElMessageBox.confirm(msg, '重采样确认', { type: 'warning' }) } catch (e) { return }
-  const r = await resampleDataset(targetRate.value, resampleMethod.value)
-  if (!r) return
-  toast('success', `${r.directionLabel || '重采样'}完成：${r.oldCount.toLocaleString()} 行 → ${r.newCount.toLocaleString()} 行` +
-    (r.fillNote ? ` · ${r.fillNote}` : ''))
+  await resampleDataset(targetRate.value, resampleMethod.value)
+  // 确认框里已经读过「旧行数 → 新行数」，做完新行数就写在快照条上
 }
 
 // ============ 外生变量：只从文件导入，生成与对齐都在服务端 ============
@@ -256,7 +252,7 @@ async function onExoFile(ev) {
     from: c.from, label: c.label, numeric: c.numeric, needsName: !!c.needsName, reason: c.reason || '',
     key: c.key || '', on: !c.needsName && c.numeric
   }))
-  if (!r.importable) toast('warning', `侧表 ${r.filename} 除时间列外没有可挂的数值列（${r.rows} 行已解析，未写入工作区）`)
+  if (!r.importable) toast('warning', `除时间列外没有可挂的数值列（${r.rows} 行已解析，未写入工作区）`)
 }
 
 // 时间列本身不该再作为变量列挂上去：换时间列时把新的那一列取消勾选
@@ -268,9 +264,7 @@ const sidePicked = computed(() => sideRows.value.filter(r => r.on && r.key.trim(
 const sideUnnamed = computed(() => sideRows.value.filter(r => r.on && !r.key.trim()))
 
 async function doAttachSide() {
-  if (!side.value) { toast('warning', '请先上传侧表并确认表头'); return }
   if (!sideTimeCol.value) { toast('warning', '请指定侧表中的时间列'); return }
-  if (!sidePicked.value.length) { toast('warning', '请至少勾选一列要挂到主表的变量'); return }
   if (sideUnnamed.value.length) { toast('warning', `列 ${sideUnnamed.value.map(r => r.from).join('、')} 还没有合法变量名`); return }
   if (exoBusy.value) return
   exoBusy.value = true
@@ -280,9 +274,9 @@ async function doAttachSide() {
     targets: sidePicked.value.map(t => ({ from: t.from, key: t.key.trim(), label: t.label }))
   })
   exoBusy.value = false
+  // 挂完这块面板就收起，「多少行真正取到值」只有这里说一次；文件名落在右侧已挂列表的第三行
   if (r) {
-    toast('success', `已挂上 ${r.count} 列：${r.summary}` +
-      (r.nonNumeric?.length ? `（非数值列 ${r.nonNumeric.length} 个已跳过）` : ''))
+    toast('success', `已挂上 ${r.count} 列：${r.stats?.matchedMainRows?.toLocaleString()}/${r.stats?.mainRows?.toLocaleString()} 行取到值`)
     side.value = null; sideRows.value = []
   }
 }
@@ -337,15 +331,13 @@ async function doApplyCalc() {
   if (!name) { toast('warning', '请填写新列名'); return }
   if (terms.length < 2) { toast('warning', '至少需要两个操作列'); return }
   if (await applyDerivedCol(name, terms.map(t => ({ ...t })))) {
-    toast('success', `后端已生成派生列 [${name}]`)
     newColName.value = ''
     calcPreview.value = null
   }
 }
 
 async function doDeleteDerivedCol(idx) {
-  const dc = state.derivedCols[idx]
-  if (await deleteDerivedCol(idx)) toast('success', `已删除派生列 [${dc?.key || ''}]`)
+  await deleteDerivedCol(idx)
 }
 async function doClearDerivedCols() {
   if (state.derivedCols.length === 0) return
@@ -370,18 +362,17 @@ async function commitRename(idx) {
   const v = editingValue.value.trim()
   editingIdx.value = -1
   if (!v) return
-  const old = d.value.columns[idx]?.label
-  if (await renameColumn(idx, v)) toast('success', `列名已改为 [${v}]（原 ${old}）`)
+  await renameColumn(idx, v)
 }
 
 async function askDeleteColumn(idx) {
   const col = d.value.columns[idx]
   try {
     await ElMessageBox.confirm(
-      `确认在后端工作区删除整列 "${col.label}"（${totalRows.value.toLocaleString()} 行）？可用顶部「撤销」回退。`,
+      `删除整列 "${col.label}"（${totalRows.value.toLocaleString()} 行）？顶部「撤销」可回退。`,
       '删除列', { type: 'warning' })
   } catch (e) { return }
-  if (await deleteColumn(idx)) toast('success', `列 [${col.label}] 已删除`)
+  await deleteColumn(idx)
 }
 
 function openUnitPanel(idx) {
@@ -410,9 +401,8 @@ const unitPreview = computed(() => {
 })
 async function commitUnit() {
   const idx = unitIdx.value
-  const ok = await convertColumnUnit(idx, Number(unitFactor.value), Number(unitOffset.value), unitLabel.value || '新单位')
+  await convertColumnUnit(idx, Number(unitFactor.value), Number(unitOffset.value), unitLabel.value || '新单位')
   unitIdx.value = -1
-  if (ok) toast('success', '单位换算已在后端整表应用')
 }
 
 // ============ 数据集切分 ============
@@ -441,9 +431,8 @@ const splitStale = computed(() => {
   return why.join('；')
 })
 async function doApplySplit() {
-  const r = await applySplitColumn(state.splitRatio)
-  // runOp 已把最新元数据与页窗口换回来，新列就在下方快照里，不必再要一次
-  if (r) toast('success', `划分列 [${r.label}] 已写入 ${r.rowCount.toLocaleString()} 行：train ${r.train.toLocaleString()} / val ${r.val.toLocaleString()} / test ${r.test.toLocaleString()}`)
+  // train/val/test 与整表行数就写在下方的常驻绿行里，撤销后那行会跟着变，不必再弹一条复述
+  await applySplitColumn(state.splitRatio)
 }
 
 // ============ Tab 布局：五个环节改为切换显示（与第五步同款） ============
@@ -774,7 +763,7 @@ const PIPE_CHIPS = [
 
             <!-- 侧表：先看后挂 -->
             <div class="flex flex-col gap-2">
-              <div @click="exoFileInput.click()"
+              <div @click="exoFileInput.click()" title="文件名与内容指纹写进命令日志，回放时按这份记录重新读一次该文件"
                    class="border-2 border-dashed border-slate-300 hover:border-teal-400 rounded-lg px-4 py-3 text-center transition-colors cursor-pointer">
                 <input ref="exoFileInput" type="file" accept=".csv,.xlsx,.xls" class="hidden" @change="onExoFile" />
                 <i class="fa-solid text-lg mb-1" :class="sideBusy ? 'fa-spinner fa-spin text-slate-400' : 'fa-cloud-arrow-up text-teal-500'"></i>
@@ -828,7 +817,7 @@ const PIPE_CHIPS = [
                   <i class="fa-solid text-[10px]" :class="exoBusy ? 'fa-spinner fa-spin' : 'fa-code-merge'"></i>{{ exoBusy ? '后端对齐挂列中…' : `按时间戳对齐并挂 ${sidePicked.length} 列` }}
                 </button>
                 <p class="text-[10px] text-slate-500 leading-snug">
-                  <i class="fa-solid fa-circle-info mr-1"></i>「精确时间戳」按秒对齐，未命中的主表行留空；「就近匹配」取容差内最近的一条，主表时间戳重复时以第一条为准。文件名与内容指纹会写进命令日志，回放时重新读那份文件。
+                  <i class="fa-solid fa-circle-info mr-1"></i>「精确时间戳」按秒对齐，未命中的主表行留空；「就近匹配」取容差内最近的一条，主表时间戳重复时以第一条为准。
                 </p>
               </div>
             </div>
@@ -959,8 +948,8 @@ const PIPE_CHIPS = [
         <p class="text-[10px] text-slate-400 mt-2 flex items-center gap-1">
           <i :class="splitLogged ? 'fa-solid fa-circle-check text-emerald-500' : 'fa-solid fa-circle-info text-slate-300'"></i>
           {{ splitLogged
-            ? `切分比例已写入操作记录（${state.splitRatio}%），会随流程回放与 Python 代码一起复现`
-            : `当前为默认 ${state.splitRatio}%，尚未写入操作记录；拖动滑杆并松手即记录一次，才会进入回放与导出` }}
+            ? `切分比例已记入操作记录（${state.splitRatio}%），回放与导出 Python 都会带上`
+            : `默认 ${state.splitRatio}%，尚未记入操作记录；拖动滑杆松手即记一次` }}
           · 三条行数按后端整表行数 {{ totalRows.toLocaleString() }} 计算
         </p>
 
@@ -971,11 +960,10 @@ const PIPE_CHIPS = [
               <i class="fa-solid fa-certificate text-indigo-500"></i>生成数据集划分列
             </h3>
             <p class="text-[10px] text-slate-400 mt-1 leading-relaxed">
-              新增 <span class="font-mono text-slate-500">dataset_split</span> 列，逐行写入
-              <span class="font-mono text-indigo-600">train</span> /
-              <span class="font-mono text-amber-600">val</span> /
-              <span class="font-mono text-emerald-600">test</span>：按当前行序前 {{ state.splitRatio }}% 记 train，余下对半分给 val 与 test，时序不打乱。
-              列会出现在下方快照与第五步特征登记表里，宽表导出与 Python 脚本复现的都是同一批标签。
+              新增 <span class="font-mono text-slate-500">dataset_split</span> 列，按当前行序前 {{ state.splitRatio }}% 记
+              <span class="font-mono text-indigo-600">train</span>，余下对半分给
+              <span class="font-mono text-amber-600">val</span> 与
+              <span class="font-mono text-emerald-600">test</span>，时序不打乱。宽表导出与 Python 脚本复现的是同一批标签。
             </p>
             <div v-if="splitApplied" class="mt-1.5 text-[10px] font-mono text-emerald-700">
               已生成：train {{ splitApplied.train.toLocaleString() }} / val {{ splitApplied.val.toLocaleString() }} / test {{ splitApplied.test.toLocaleString() }}

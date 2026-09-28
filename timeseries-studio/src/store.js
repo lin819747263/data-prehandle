@@ -116,8 +116,7 @@ export async function refreshPage(offset, limit) {
 // 后端不在线 = 只读。所有会改数据的入口都先过这道闸门，绝不静默降级成本地计算。
 export function requireBackend(action) {
   if (state.backend.online) return true
-  toast('warning', `${action}需后端在线执行（数据加工全部在后端，浏览器不再算第二套）` +
-    `：在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000`)
+  toast('warning', `${action}需后端在线：在 timeseries-studio-server 目录执行 uvicorn app.main:app --port 8000`)
   state.busy = ''
   return false
 }
@@ -173,7 +172,7 @@ export async function loadPresetData(key) {
     const d = await adoptWorkspace(key, resp, { name: resp.meta.name, format: 'preset' })
     logAction(1, 'dataset', '加载数据集',
       `${d.name} · ${d.meta.rowCount.toLocaleString()}行×${d.meta.colCount}列 · 后端工作区 ${d.wsId}`)
-    toast('success', `已加载内置示例：${d.name}（后端工作区 ${d.wsId}）`)
+    // 载入结果就写在页头与第二步快照条上，不再弹一条 3 秒即消失的复述
     return true
   } catch (e) {
     toast('error', `加载示例失败：${e.message}`)
@@ -780,12 +779,8 @@ export async function applySegmentImpute(colKey, segIdx) {
 
 export async function applyAllSegmentsImpute(colKey) {
   const segs = segmentsOf(colKey)
-  if (!segs.length) { toast('info', '该列当前没有缺失段'); return null }
-  if (segmentsTruncated(colKey)) {
-    toast('warning', `该列缺失段超过单次返回上限 ${qualityData()?.segmentCap || 300} 段，` +
-      `界面拿不到全部段号，逐段算法无法整列执行：请改用右侧「执行填补与去重」（由服务端扫描全表）`)
-    return null
-  }
+  // 段列表为空时这块卡片整块不渲染、被截断时按钮 disabled，这两道拦截在界面里都走不到，只做兜底
+  if (!segs.length || segmentsTruncated(colKey)) return null
   const targets = segTargets(colKey, segs, i => segAlgo(colKey, i))
   const used = [...new Set(targets.map(t => t.algo))].map(a => IMPUTE_LABELS[a] || a).join('、')
   return runImpute({ targets }, {
@@ -801,7 +796,7 @@ export async function imputeAllAndDedupe(dupStrategy, defaultAlgo = 'linear') {
   const hasMissing = q ? q.columns.some(c => c.imputable && c.missing > 0) : true
   const hasDup = q ? q.duplicateRows > 0 : true
   if (q && !hasMissing && !hasDup) {
-    toast('info', '当前没有可填补的缺失值，也没有重复时间戳：本次未执行任何修改')
+    toast('info', '没有可填补的缺失值，也没有重复时间戳：未做任何修改')
     return null
   }
   const params = { all: hasMissing, defaultAlgo, dedupe: hasDup ? (dupStrategy || 'mean') : null }
@@ -812,22 +807,24 @@ export async function imputeAllAndDedupe(dupStrategy, defaultAlgo = 'linear') {
     // floatCols 进审计参数：导出 Python 时不能靠"事后判断 dtype"猜当时填了哪些列
     params: { type: 'impute_all', all: hasMissing, defaultAlgo, dedupe: params.dedupe, floatCols }
   })
-  if (r) toast('success', r.summary)
+  // 填了几格/合并了几组：缺失计数表当场归零，同一句 summary 也已永久写进操作记录，不再弹
   return r
 }
 
 // ---- 异常检测与修复（检测只读、修复是加工命令；判定索引全部留在服务端）----
+// ---- 异常检测与修复（检测只读、修复是加工命令；判定索引全部留在服务端）----
+// 侧栏只留判定口径与「在后端算」这件事，实现来历不写在这里
 export const ANOMALY_ALGOS = {
-  '3sigma': '3-Sigma：假设数据服从正态分布，Z-Score 超过 3 倍标准差的点视为异常。适合检测远离均值的极端尖峰和深谷。后端 numpy 向量化实现（总体标准差 ÷n）。',
-  'iqr': '四分位距箱线法：以 Q1-1.5×IQR 和 Q3+1.5×IQR 为边界，超出范围的点视为异常。对偏态分布更加鲁棒。分位数取 sorted[int(n·q)]，与后端同一口径。',
-  'iforest': '孤立森林（近似版 · 后端 numpy）：以回看 33 个观测的窗口 MAD（均值绝对偏差）×4 近似隔离异常，无需假设分布。与 sklearn 完整版是两套算法，结果本就不同。',
-  'iforest_sklearn': '孤立森林（sklearn 完整版 · 后端）：服务端 scikit-learn IsolationForest 对每列真实拟合并打分，缺失点自动剔除，边界取正常点的 0.5%/99.5% 分位数供截断修复。',
-  'expr': '自定义表达式：使用数学表达式定义异常条件。变量 v 代表当前值，可用统计量 mean/std/median/q1/q3/min/max。表达式返回 true 即为异常。后端按 AST 白名单编译，逐列向量化求值。'
+  '3sigma': '3σ：偏离均值超过 3 倍标准差判为异常（总体标准差 ÷n）。后端 numpy 向量化。',
+  'iqr': 'IQR：落在 Q1−1.5×IQR 与 Q3+1.5×IQR 之外判为异常。分位数取 sorted[int(n·q)]，与后端同一口径。',
+  'iforest': '孤立森林（近似版 · 后端 numpy）：回看 33 个观测的窗口 MAD×4 判异常，不假设分布。与 sklearn 版是两套算法，结果本就不同。',
+  'iforest_sklearn': '孤立森林（sklearn 完整版 · 后端）：逐列真实拟合打分，缺失点自动剔除，边界取正常点的 0.5%/99.5% 分位。',
+  'expr': '自定义表达式：变量 v 为当前值，可用统计量 mean/std/median/q1/q3/min/max，返回 true 即异常。后端按 AST 白名单逐列向量化求值。'
 }
 export const ANOMALY_REPAIRS = {
-  'clip': '截断限制：将超出上下界的数据强制钳位到边界值，保留时间序列连续性，适合传感器饱和场景。',
-  'nan_impute': '缺失值重算：将异常点置为 NaN，再用时序线性插值重算，消除异常影响的同时保持趋势平滑。',
-  'mask_only': '掩码标记：仅生成布尔掩码列，不修改原始数据。适合需要保留原始观测的分析场景。'
+  'clip': '截断限制：超界点钳到上下界，行数与时间戳不变。',
+  'nan_impute': '缺失值重算：异常点置为 NaN 后按时序线性插值重算。',
+  'mask_only': '掩码标记：只生成布尔掩码列，原始数据不改。'
 }
 
 export async function detectAnomalies(algo, exprStr, params = {}) {
@@ -868,8 +865,8 @@ export async function refreshAnomaly() {
 
 export async function repairAnomalies(mode) {
   const la = state.lastAnomaly
-  if (!la) { toast('warning', '请先执行检测：修复要按检测时的行索引执行'); return null }
-  if (la.stale) { toast('warning', '检测之后数据又被改过（行位置已变），请重新检测后再修复'); return null }
+  // 第四步在未检测/已失效时把按钮禁掉并常驻说明原因，这里只是兜底：不再另弹一条重复的提示
+  if (!la || la.stale) return null
   const r = await runOp('anomaly-repair', { repair: mode }, {
     step: 4, icon: 'broom', title: '异常修复执行',
     detail: x => x.summary,
@@ -920,9 +917,8 @@ export async function loadSeries(keys, maxPoints = 0) {
     return resp
   } catch (e) {
     // 全量档撞上限（行 × 列 的格子数超过后端守卫）就是这条路：图会空，
-    // 原因必须留在 state 上给页面说明，不能只靠那一闪而过的 toast。
+    // 原因留在 state.series.error 上由图上那条红字常驻说明——3 秒即消失的 toast 不是它该去的地方。
     state.series = { key: '', data: null, error: e.message }
-    toast('error', `读取曲线失败：${e.message}`)
     return null
   }
 }
@@ -966,7 +962,8 @@ export async function deleteMask(idx) {
 
 export async function deleteAllMasks() {
   const keys = state.masks.map(m => m.key)
-  if (!keys.length) { toast('info', '当前没有掩码列'); return null }
+  // 没有掩码列时「清空」按钮本就不渲染
+  if (!keys.length) return null
   const r = await runOp('mask-delete', { keys }, {
     step: 4, icon: 'mask', title: '清空全部掩码',
     detail: x => x.summary, params: { type: 'mask_delete_all', keys }
@@ -1035,7 +1032,7 @@ export async function loadHolidays() {
     return r
   } catch (e) {
     state.holidays = { wsId: d0.wsId, version: -1, data: null, loading: false, error: e.message }
-    toast('error', `节假日表读取失败：${e.message}`)
+    // 原因由节假日卡自己常驻显示（带重试按钮），不再弹一条 3 秒即消失的复述
     return null
   }
 }
@@ -1342,8 +1339,8 @@ export async function catColumnDistribution(selectedKeys, method) {
     catDistCache.set(cacheKey, out)
     return out
   } catch (e) {
-    toast('error', `类别取值分布读取失败：${e.message}`)
-    return null
+    // 失败原因随结果带回，由编码卡常驻显示（这里再弹一条 toast 就是把同一句话讲两遍）
+    return { rows: [], totalNewCols: 0, rowCount: 0, error: e.message }
   }
 }
 
@@ -1417,7 +1414,9 @@ export async function renameFeature(idx, newLabel) {
 // 特征登记表由后端列注册表派生，撤销 = 让服务端删掉那一列（applyMeta 会把清单同步回来）
 export async function dropFeature(idx) {
   const feat = state.features[idx]
-  if (!feat.isNew) { toast('warning', '原始数据列请在第一步「列管理」中删除'); return false }
+  // 撤销特征只针对生成的列；原始列的删除入口在第二步「数据快照预览」的列头，
+  // 原话写的「第一步 · 列管理」那个地方并不存在
+  if (!feat.isNew) { toast('warning', '这是原始数据列，撤销只管生成的特征列'); return false }
   const r = await runOp('delete-column', { key: feat.key }, {
     step: 5, icon: 'delete', title: '撤销特征列',
     detail: () => `"${feat.label}" (${feat.key})`,
@@ -1431,7 +1430,7 @@ export async function dropFeature(idx) {
 // ============================================================
 export function exportActionLog() {
   const ops = wsActionLog()
-  if (ops.length === 0) { toast('warning', '当前数据集没有可导出的操作记录'); return false }
+  if (ops.length === 0) { toast('warning', '没有可导出的操作记录'); return false }
   const d = ds()
   const exportData = {
     version: '1.0',
@@ -1469,7 +1468,7 @@ export function importActionLog(text) {
     step: op.step, icon: op.icon, title: op.title, detail: op.detail,
     params: op.params, time: op.time || '', ts: 0, imported: true
   }))
-  toast('success', `已导入 ${data.operations.length} 条操作记录（${data.datasetName || data.datasetKey || '未知数据集'}），点击「回放执行」可复用此流程`)
+  toast('success', `已导入 ${data.operations.length} 条操作记录（${data.datasetName || data.datasetKey || '未知数据集'}）`)
   return true
 }
 
@@ -1695,13 +1694,11 @@ async function replaySingleOp(op) {
 let replayTimer = null
 
 export function replayActionLog() {
-  if (!state.importedLog || !state.importedLog.operations) {
-    toast('warning', '请先导入操作流程文件')
-    return
-  }
+  // 没有导入记录时「回放执行」按钮 disabled
+  if (!state.importedLog || !state.importedLog.operations) return
   const ops = state.importedLog.operations
   ElMessageBox.confirm(
-    `即将回放 ${ops.length} 条操作记录，当前数据将被修改。确认继续？`,
+    `将执行 ${ops.length} 条记录，当前数据会被改写。确认？`,
     '回放确认',
     { type: 'warning', confirmButtonText: '开始回放', cancelButtonText: '取消' }
   ).then(async () => {
@@ -2575,8 +2572,8 @@ async function restoreTo(version, verb) {
     const tr = resp.meta?.restoreTrace
     const cost = tr ? (tr.cacheHit ? ` · 帧缓存命中，重放 0 条命令` :
       ` · ${tr.replayedOps ? `从第 ${tr.fromVersion} 版起步` : '从载入帧起步'}，重放 ${tr.replayedOps} 条命令`) : ''
-    toast('success', `${verb}${label ? `：${label}` : ''} · 工作区 ${d.wsId} 现在在第 ${resp.meta.version} 版` +
-      `（${resp.meta.rowCount.toLocaleString()} 行 × ${resp.meta.colCount} 列）${cost}`)
+    // 工作区 id 与行×列就在页头那张数据集卡上，这里只说这次撤销做了什么、代价是几条命令
+    toast('success', `${verb}${label ? `：${label}` : ''} · 回到第 ${resp.meta.version} 版${cost}`)
     return true
   } catch (e) {
     toast('error', `${verb}失败：${e.message}`)
@@ -2779,16 +2776,13 @@ export async function restoreSession() {
   const m = doc.meta || {}
   if (restored.length) {
     const main = restored.find(r => r.w.key === state.currentKey) || restored[0]
-    toast('success', `已恢复服务端会话：${main.w.name} · 第 ${main.meta.version} 版 · ` +
-      `${main.meta.rowCount.toLocaleString()} 行 × ${main.meta.colCount} 列 · ${m.ops ?? 0} 条操作` +
-      (drift ? `（会话记的是第 ${drift.w.versionDrift.sessionSays} 版，服务端日志已走到第 ${drift.w.versionDrift.serverSays} 版，` +
-        `以服务端为准；撤销栈就是那段日志，照旧可用）` : '') +
-      (failed.length ? `；${failed.length} 个工作区已不在服务端` : '') +
-      `（会话与命令日志都在 ${doc.stateDir || '服务端状态目录'}）`)
+    // 行×列、状态目录这些页头数据集卡与 tooltip 上常驻，这里只讲恢复到了哪一版、代价是什么
+    toast('success', `已恢复会话：${main.w.name} · 第 ${main.meta.version} 版 · ${m.ops ?? 0} 条操作` +
+      (drift ? `（会话记的是第 ${drift.w.versionDrift.sessionSays} 版，服务端日志已走到第 ${drift.w.versionDrift.serverSays} 版，以服务端为准）` : '') +
+      (failed.length ? `；${failed.length} 个工作区已不在服务端` : ''))
   } else {
-    toast('warning', `已恢复会话配置（${m.ops ?? 0} 条操作 · ${m.name || '未知数据集'}），` +
-      `但服务端已经没有这些工作区的命令日志：${failed.map(f => `${f.wsId}（${f.reason || '已不存在'}）`).join('、') || '（无）'}，` +
-      `请回第一步重新载入数据后再继续`)
+    toast('warning', `只恢复了界面配置（${m.ops ?? 0} 条操作 · ${m.name || '未知数据集'}）：` +
+      `服务端已没有这些工作区的命令日志（${failed.map(f => `${f.wsId}：${f.reason || '已不存在'}`).join('；') || '无'}），请回第一步重新载入`)
   }
   pendingSession = null
   state.session.found = null
