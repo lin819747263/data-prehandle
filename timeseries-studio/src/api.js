@@ -5,7 +5,11 @@
 import { state } from './store'
 import { downloadBlob } from './utils'
 
-export const API_BASE = localStorage.getItem('tss.apiBase') || 'http://127.0.0.1:8000'
+// 桌面端（Electron）由主进程把实际后端地址注入 window.tssDesktop.apiBase；
+// localStorage 仍是手工改指向的口子，优先级最高，便于对着别的端口验证。
+const DESKTOP_BASE = typeof window !== 'undefined' && window.tssDesktop?.apiBase ? window.tssDesktop.apiBase : ''
+export const API_BASE = localStorage.getItem('tss.apiBase') || DESKTOP_BASE || 'http://127.0.0.1:8000'
+export const IS_DESKTOP = typeof window !== 'undefined' && !!window.tssDesktop?.desktop
 
 const TIMEOUT_MS = 20000
 // 整列取数 / 大表建区可能要几十秒，不能用 20 秒的统一超时一刀切

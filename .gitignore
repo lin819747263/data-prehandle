@@ -2,6 +2,8 @@
 node_modules/
 dist/
 build/
+# PyInstaller 产物：近百 MB 的单文件 exe，本机跑用，不入库
+release/
 *.pyc
 __pycache__/
 .venv/

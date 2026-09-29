@@ -3,10 +3,14 @@
   "private": true,
   "version": "1.0.0",
   "type": "module",
+  "main": "electron/main.js",
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "preview": "vite preview"
+    "preview": "vite preview",
+    "desktop": "electron .",
+    "desktop:dist": "npm run build && electron . --frontend=dist",
+    "build:backend": "cmd /c ..\\build-backend.bat"
   },
   "dependencies": {
     "@element-plus/icons-vue": "^2.3.1",
@@ -20,6 +24,7 @@
   "devDependencies": {
     "@tailwindcss/vite": "^4.1.0",
     "@vitejs/plugin-vue": "^5.2.1",
+    "electron": "^33.4.11",
     "tailwindcss": "^4.1.0",
     "vite": "^6.0.0"
   }

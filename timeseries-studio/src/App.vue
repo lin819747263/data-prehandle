@@ -7,7 +7,7 @@ import {
   replayActionLog, clearImportedLog, generatePythonCode, visibleActionLog,
   undo, redo, initSession, restoreSession, clearSession
 } from './store'
-import { checkBackend, wsExport, wsSaveAs, API_BASE } from './api'
+import { checkBackend, wsExport, wsSaveAs, API_BASE, IS_DESKTOP } from './api'
 import Step1Load from './components/Step1Load.vue'
 import Step2Config from './components/Step2Config.vue'
 import Step3Explore from './components/Step3Explore.vue'
@@ -95,7 +95,8 @@ function copyCode() {
 const backendTitle = computed(() => (state.backend.online
   ? `FastAPI 后端在线：${API_BASE} · 能力 ${state.backend.capabilities.join(' / ')} · 最近探测 ${state.backend.checkedAt}（点击重新探测）`
   : `后端未连接（${API_BASE}）：${state.backend.error || '未知原因'} · 整表计算、数据加工与四种格式的宽表导出都在服务端，工作台此时只读（点击重试）`)
-  + ` · 会话：${sessionLine.value}`)
+  + ` · 会话：${sessionLine.value}`
+  + (IS_DESKTOP ? '\n桌面端托管：后端优先跑打包版 exe（build-backend.bat 的产物），没有 exe 才回落到 python -m uvicorn app.main:app；应用退出时一并回收，外部已起的后端则复用、退出时不动它。' : ''))
 // 会话存在服务端（PUT /api/session），这里这一句必须说清它此刻到底在不在
 const sessionLine = computed(() => {
   if (!state.session.enabled) return `未启用（${state.session.error || '后端未连接'}）`
