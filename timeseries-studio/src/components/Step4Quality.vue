@@ -5,6 +5,7 @@ import { ElMessageBox } from 'element-plus'
 import {
   state, ds, switchStep, requireBackend, sourceSig,
   loadQuality, qualityData, columnMissingStats, segmentsOf, segmentsTruncated,
+  duplicateGroups, locateRows,
   segAlgo, setSegAlgo, applySegmentImpute, applyAllSegmentsImpute, imputeAllAndDedupe,
   detectAnomalies, repairAnomalies, loadSeries,
   ANOMALY_ALGOS, ANOMALY_REPAIRS, ANOMALY_NAMES,
@@ -25,6 +26,8 @@ const d = computed(() => { void state.dataVersion; return { ...ds() } })
 // 本步的每个数字都来自后端：诊断走 GET /quality，曲线走 GET /series，
 // 浏览器不再持有整表，所以 40 万格的表也能开这一页。
 const stats = computed(() => { void state.dataVersion; return columnMissingStats() })
+// 重复时刻的明细（后端按重复数量从多到少回前 cap 组）：光有「N 条 / M 组」看不出是哪几行
+const dupDetail = computed(() => { void state.dataVersion; return duplicateGroups() })
 const diagError = computed(() => {
   void state.dataVersion
   if (!state.backend.online) return '后端未连接：缺失扫描、填补、异常检测与掩码都在后端执行，本页只读。'
@@ -50,6 +53,20 @@ const colorFor = key => {
 
 const chartEl = ref(null)
 let chart = null
+// 缩放窗口自己记：组件不重建（见 renderChart 里的 replaceMerge），窗口就得在两次取数之间传下去，
+// 否则用户放大到某一段、勾一列过来就跳回全览。
+const zoom = reactive({ start: 0, end: 100 })
+let zoomBound = false
+function bindZoom() {
+  if (zoomBound || !chart) return
+  zoomBound = true
+  chart.on('dataZoom', () => {
+    const dz = chart.getOption()?.dataZoom?.[0]
+    if (!dz) return
+    zoom.start = typeof dz.start === 'number' ? dz.start : 0
+    zoom.end = typeof dz.end === 'number' ? dz.end : 100
+  })
+}
 const brushActive = ref(false)
 const brushRange = ref(null)
 const sd = ref(null)          // 当前勾选列的 /series 响应：{ x, idx, series:[{col,y,missingMarks,anomalies…}] }
@@ -131,10 +148,7 @@ const seriesChip = computed(() => {
 async function renderChart() {
   if (!chart) return
   const s = sd.value
-  if (!s || !s.x?.length || !s.series?.length) { chart.clear(); return }
-  const det = detection.value
-  const names = s.series.map(m => m.label || m.col)
-  const lines = s.series.map((m) => {
+  if (!s || !s.x?.length || !s.series?.length) { chart.clear(); return }  const lines = s.series.map((m) => {
     const color = colorFor(m.col)
     return {
       name: m.label || m.col,
@@ -161,11 +175,12 @@ async function renderChart() {
     z: 5
   }))
   chart.setOption({
-    title: {
-      text: `数据质量图示与异常探针 (${names.join('、')})` +
-        `${det ? ` · ${ANOMALY_NAMES[det.algo] || det.algo}` : ' · 尚未执行异常检测'}`,
-      left: 10, top: 5, textStyle: { fontSize: 12, color: '#334155' }
-    },
+    // 重影的根源在这两行：
+    // 1) 原来每次 setOption 都传 notMerge=true，等于把 dataZoom/brush 组件拆了重建，
+    //    旧的 slider 画布还没清干净就叠上新的，缩放时就看见两层刻度条和两条半透明影子；
+    // 2) 全量档是每行一个点，序列换了就从头补间一次动画，前一次的线还留在屏幕上。
+    // 改成只替换 series/legend、缩放窗口自己记住，组件不再重建，动画关掉。
+    animation: false,
     tooltip: {
       trigger: 'axis', axisPointer: { type: 'cross' },
       formatter(params) {
@@ -180,13 +195,14 @@ async function renderChart() {
     },
     toolbox: { feature: { brush: { type: ['lineX', 'clear'] } }, right: 20, top: 5 },
     brush: { toolbox: ['lineX', 'clear'], xAxisIndex: 0 },
-    legend: { top: 24, left: 10, textStyle: { fontSize: 10 }, itemWidth: 14, itemHeight: 8, type: 'scroll' },
-    grid: { top: 58, right: 25, bottom: 50, left: 55 },
-    dataZoom: [{ type: 'inside' }, { type: 'slider', bottom: 5, height: 20 }],
+    legend: { top: 6, left: 10, right: 60, textStyle: { fontSize: 10 }, itemWidth: 14, itemHeight: 8, type: 'scroll' },
+    grid: { top: 42, right: 25, bottom: 50, left: 55 },
+    dataZoom: [{ type: 'inside', start: zoom.start, end: zoom.end },
+               { type: 'slider', bottom: 5, height: 20, start: zoom.start, end: zoom.end }],
     xAxis: { type: 'category', data: s.x },
     yAxis: { type: 'value', splitLine: { lineStyle: { type: 'dashed' } } },
     series: [...lines, ...dots]
-  }, true)
+  }, { replaceMerge: ['series', 'legend'] })
   applyBrushCursor()
 }
 
@@ -423,6 +439,7 @@ function init() {
   if (chartEl.value && !chart) {
     chart = echarts.init(chartEl.value)
     chart.on('brushSelected', onBrushSelected)
+    bindZoom()
   }
   renderChart()
 }
@@ -433,6 +450,7 @@ onBeforeUnmount(() => {
   window.removeEventListener('resize', resize)
   chart && chart.dispose()
   chart = null
+  zoomBound = false
 })
 // 整页重算的开关不能是 state.dataVersion：翻一页、读一次整表统计都会碰它，
 // 那样每次只读访问都会把 /quality 与 /series 这两趟整表扫描重打一遍。
@@ -443,19 +461,12 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
 </script>
 
 <template>
-  <section class="step-panel h-full p-4 flex flex-col gap-3 overflow-y-auto">
+  <section class="step-panel h-full p-4 flex flex-col gap-3">
+    <!-- 与第三步同一条布局契约：根节点不滚，滚动交给里面这一层，页脚钉在页面底部。
+         取数状态也搬进页脚——原来那条横幅在滚动区顶部，取完就卸载，
+         下面的画布和工作台整块往上跳一次。 -->
+    <div class="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-0.5">
     <!-- 本步不再需要浏览器整表视图：诊断与曲线各取一次后端聚合结果 -->
-    <div v-if="diagError || state.quality.loading" class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
-         :class="diagError ? 'bg-rose-50 border-rose-200 text-rose-700' : 'bg-indigo-50 border-indigo-200 text-indigo-700'">
-      <i class="fa-solid mt-0.5" :class="diagError ? 'fa-triangle-exclamation' : 'fa-spinner fa-spin'"></i>
-      <div class="min-w-0">
-        <div class="font-semibold">{{ diagError ? '本步为只读：下方数字尚未从后端取到' : '正在从后端读取质量诊断…' }}</div>
-        <div class="mt-0.5 leading-snug opacity-80">{{ diagError || `${d.wsId} · 缺失扫描与全量曲线（每行一个点）由服务端计算` }}</div>
-      </div>
-      <button v-if="diagError" @click="state.backend.online ? refreshAll() : checkBackend().then(refreshAll)"
-              class="ml-auto shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
-    </div>
-
     <!-- 诊断画布 -->
     <div class="h-[48%] min-h-[340px] shrink-0 bg-white rounded-xl border border-slate-200 shadow-sm p-2 flex flex-col relative">
       <div class="flex justify-between items-center px-3 pt-1 gap-3">
@@ -474,21 +485,26 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
         </div>
       </div>
 
-      <!-- 绘图列多选（与第三步同款）：改勾选就是换一次后端取数，浏览器不持有整表 -->
-      <div class="flex items-center gap-1.5 px-3 pt-1.5 flex-wrap shrink-0">
-        <span class="text-[11px] font-bold text-slate-600 shrink-0">绘图列:</span>
-        <button @click="toggleAll(true)" class="text-[10px] text-indigo-600 hover:underline shrink-0">全选</button>
-        <span class="text-slate-300 shrink-0">|</span>
-        <button @click="toggleAll(false)" class="text-[10px] text-slate-500 hover:underline shrink-0">清空</button>
-        <span class="text-[10px] text-slate-400 font-mono shrink-0">已选 {{ selected.size }} 条</span>
-        <label v-for="(c, i) in floatCols" :key="c.key"
-               class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border cursor-pointer transition-all text-[10px] font-medium"
-               :class="selected.has(c.key) ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-200 hover:bg-indigo-50/50'">
-          <input type="checkbox" class="accent-indigo-500" :checked="selected.has(c.key)" @change="toggleCol(c.key)" />
-          <span class="w-2 h-2 rounded-full shrink-0" :style="{ background: colorOf(i) }"></span>
-          <span>{{ c.label || c.key }}</span>
-        </label>
-        <span v-if="!floatCols.length" class="text-[10px] text-slate-400">没有数值列可画</span>
+      <!-- 绘图列多选（与第三步同款）：改勾选就是换一次后端取数，浏览器不持有整表。
+           动作行钉住、只让标签区滚动，否则列一多这里就堆到七八行，把画布压没。 -->
+      <div class="px-3 pt-1.5 shrink-0">
+        <div class="flex items-center gap-1.5 text-[10px] text-slate-500">
+          <span class="text-[11px] font-bold text-slate-600 shrink-0">绘图列:</span>
+          <button @click="toggleAll(true)" class="text-indigo-600 hover:underline shrink-0">全选</button>
+          <span class="text-slate-300 shrink-0">|</span>
+          <button @click="toggleAll(false)" class="text-slate-500 hover:underline shrink-0">清空</button>
+          <span class="font-mono shrink-0">已选 {{ selected.size }} 条 / 共 {{ floatCols.length }} 列</span>
+        </div>
+        <div class="flex flex-wrap gap-1.5 mt-1 max-h-[104px] overflow-y-auto pr-1">
+          <label v-for="(c, i) in floatCols" :key="c.key"
+                 class="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md border cursor-pointer transition-all text-[10px] font-medium"
+                 :class="selected.has(c.key) ? 'bg-indigo-50 border-indigo-300 text-indigo-700' : 'bg-white border-slate-200 text-slate-600 hover:border-indigo-200 hover:bg-indigo-50/50'">
+            <input type="checkbox" class="accent-indigo-500" :checked="selected.has(c.key)" @change="toggleCol(c.key)" />
+            <span class="w-2 h-2 rounded-full shrink-0" :style="{ background: colorOf(i) }"></span>
+            <span>{{ c.label || c.key }}</span>
+          </label>
+          <span v-if="!floatCols.length" class="text-[10px] text-slate-400">没有数值列可画</span>
+        </div>
       </div>
 
       <div v-if="seriesError" class="px-3 pt-0.5 text-[10px] text-rose-600 shrink-0">
@@ -670,6 +686,46 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
                   {{ stats ? stats.duplicateCount.toLocaleString() + ' 条 / ' + stats.duplicateGroups.toLocaleString() + ' 组' : '待后端读取' }}
                 </p>
               </div>
+            </div>
+
+            <!-- 重复项明细：服务端整表扫描按解析后的时间戳分组，数量从多到少回前 cap 组。
+                 行号是那帧的绝对下标，点「定位」就交给第二步翻页捞出并标黄。 -->
+            <div v-if="dupDetail.list.length" class="border border-rose-200 rounded-lg overflow-hidden mt-4 bg-rose-50/30">
+              <div class="bg-rose-50 px-3 py-2 border-b border-rose-200 flex items-center gap-2">
+                <i class="fa-solid fa-clone text-rose-600 text-[11px]"></i>
+                <span class="text-[11px] font-bold text-rose-800 shrink-0">重复时刻明细</span>
+                <span class="text-[10px] text-rose-600">
+                  后端整表分组：{{ stats.duplicateGroups.toLocaleString() }} 组 / {{ stats.duplicateCount.toLocaleString() }} 条重复行，这里按重复数量列出前 {{ dupDetail.list.length }} 组
+                </span>
+              </div>
+              <div v-if="dupDetail.truncated" class="px-3 py-2 bg-rose-100/70 border-b border-rose-200 text-[10px] text-rose-700 leading-snug">
+                <i class="fa-solid fa-circle-exclamation mr-1"></i>
+                重复组数超过单次返回上限 {{ dupDetail.cap }} 组，这里只列重复最多的前 {{ dupDetail.list.length }} 组；
+                合并去重按整表执行，不受这份明细限制
+              </div>
+              <div class="max-h-[220px] overflow-auto divide-y divide-rose-100">
+                <div v-for="(g, gi) in dupDetail.list" :key="`${g.time}-${gi}`"
+                     class="px-3 py-2 flex items-center gap-3 hover:bg-rose-50 transition-colors">
+                  <span class="w-5 h-5 rounded-full bg-rose-200 text-rose-800 text-[10px] font-bold flex items-center justify-center shrink-0">{{ gi + 1 }}</span>
+                  <div class="flex-1 min-w-0">
+                    <div class="text-xs font-mono text-rose-900 font-medium truncate">
+                      {{ g.isNaT ? '（时间解析不出，NaT 互为重复）' : (g.time || '—') }}
+                    </div>
+                    <div class="text-[10px] text-rose-600 mt-0.5">
+                      重复 <strong>{{ g.count }}</strong> 次
+                      <span class="text-rose-400 mx-1">·</span>行号 {{ g.rows[0] + 1 }}–{{ g.rows[g.rows.length - 1] + 1 }}
+                      <span v-if="g.rowsTruncated" class="text-rose-400">（该组行号只回前 {{ g.rows.length }} 个）</span>
+                    </div>
+                  </div>
+                  <button @click="locateRows(g.rows, g.isNaT ? '' : g.time)"
+                          class="shrink-0 px-2.5 py-1 rounded border border-rose-300 text-rose-700 bg-white hover:bg-rose-100 text-[11px] font-semibold">
+                    <i class="fa-solid fa-location-crosshairs mr-1 text-[9px]"></i>定位这些行
+                  </button>
+                </div>
+              </div>
+            </div>
+            <div v-else-if="stats && stats.duplicateCount > 0" class="mt-4 text-[10px] text-rose-600">
+              <i class="fa-solid fa-circle-exclamation mr-1"></i>后端报有 {{ stats.duplicateCount.toLocaleString() }} 条重复行，但这份快照没带回明细：请重新执行一次缺失扫描
             </div>
           </div>
 
@@ -938,12 +994,25 @@ watch(selectionKey, () => { ensureSeries().then(renderChart) })
         </div>
       </div>
     </div>
+    </div>
 
-    <div class="flex justify-between items-center shrink-0">
-      <button @click="switchStep(3)" class="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium">
+    <div class="flex items-center justify-between gap-3 shrink-0">
+      <button @click="switchStep(3)" class="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium shrink-0">
         <i class="fa-solid fa-arrow-left mr-1"></i>返回数据探索
       </button>
-      <button @click="switchStep(5)" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow">
+      <!-- 状态位高度由按钮钉死：正在取数/取数失败都只占这一行，不再把上下卡片顶来顶去 -->
+      <div class="flex-1 min-w-0 h-8 flex items-center justify-end gap-2 text-[11px] overflow-hidden">
+        <template v-if="diagError || state.quality.loading">
+          <i class="fa-solid shrink-0" :class="diagError ? 'fa-triangle-exclamation' : 'fa-spinner fa-spin'"></i>
+          <span class="truncate" :class="diagError ? 'text-rose-700' : 'text-indigo-700'"
+                :title="diagError || `${d.wsId} · 缺失扫描与全量曲线（每行一个点）由服务端计算`">
+            {{ diagError || '正在从后端读取质量诊断…' }}
+          </span>
+          <button v-if="diagError" @click="state.backend.online ? refreshAll() : checkBackend().then(refreshAll)"
+                  class="shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
+        </template>
+      </div>
+      <button @click="switchStep(5)" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow shrink-0">
         下一步：时序特征工程 <i class="fa-solid fa-arrow-right ml-1"></i>
       </button>
     </div>

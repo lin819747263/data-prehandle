@@ -43,6 +43,11 @@ MAX_ENVELOPE_POINTS = 6000
 # 散点覆盖层一次最多回这么多点：整列都是异常时（比如表达式写错）不该把几 MB 索引推给浏览器
 MAX_ANOMALY_POINTS = 4000
 MAX_MISSING_MARKS = 80
+# 重复时刻的明细一次回给界面这么多组（按重复数量从多到少）：整表都是重复时组数会上万，
+# 列表放不下，超出部分在 duplicateDetailTruncated 里说明。每组最多带这么多行号，
+# 行号是绝对下标，第二步按它翻页定位。
+MAX_DUP_GROUPS = 200
+MAX_DUP_ROWS_PER_GROUP = 100
 
 
 # ---------------------------------------------------------------- 数值工具
@@ -518,11 +523,29 @@ def quality_snapshot(frame: pd.DataFrame, columns: list[dict], time_col: str | N
                              for a, b in runs[:MAX_SEGMENTS_PER_COLUMN]]
             truncated[key] = len(runs) > MAX_SEGMENTS_PER_COLUMN
     dup_rows = dup_groups = 0
+    dup_detail: list[dict] = []
+    dup_truncated = False
     if time_col and time_col in frame.columns:
         ts = pd.to_datetime(frame[time_col], errors="coerce")
         dup_rows = int(ts.duplicated().sum())
         # 与 merge_duplicates 的组数同一口径：NaT 之间也算一组，否则诊断页与执行结果会给出两个数字
         dup_groups = int((ts.value_counts(dropna=False) > 1).sum())
+        if dup_groups:
+            # 分组仍按解析后的时间戳（不是渲染出的字符串），行号是绝对下标：
+            # 第二步的快照表就是按绝对行号翻页的，界面点一组就能把那几行捞出来。
+            groups: dict = {}
+            for i, v in enumerate(ts.to_numpy()):
+                groups.setdefault(None if pd.isna(v) else v, []).append(i)
+            bad = [g for g in groups.values() if len(g) > 1]
+            bad.sort(key=lambda g: (-len(g), g[0]))
+            dup_truncated = len(bad) > MAX_DUP_GROUPS
+            dup_detail = [{
+                "time": _label(time_labels, g[0]),
+                "isNaT": pd.isna(ts.iat[g[0]]),
+                "count": len(g),
+                "rows": g[:MAX_DUP_ROWS_PER_GROUP],
+                "rowsTruncated": len(g) > MAX_DUP_ROWS_PER_GROUP,
+            } for g in bad[:MAX_DUP_GROUPS]]
     cells = n * len(columns)
     return {
         "rowCount": n, "colCount": len(columns), "timeCol": time_col,
@@ -531,6 +554,8 @@ def quality_snapshot(frame: pd.DataFrame, columns: list[dict], time_col: str | N
         "totalMissingCells": total_missing,
         "missingRate": (total_missing / cells * 100) if cells else 0.0,
         "duplicateRows": dup_rows, "duplicateGroups": dup_groups,
+        "duplicateDetail": dup_detail, "duplicateDetailTruncated": dup_truncated,
+        "duplicateGroupCap": MAX_DUP_GROUPS,
         "duplicateRate": (dup_rows / n * 100) if n else 0.0,
     }
 

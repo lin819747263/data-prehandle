@@ -132,9 +132,26 @@ RESAMPLE_METHODS = ("mean", "sum", "first", "interpolate")
 
 # ---------------------------------------------------------------- 工具函数
 
-def safe_key(label: str) -> str:
-    """与前端 renameColumn 同规则：小写、非 [a-z0-9_] 转下划线。"""
-    return re.sub(r"[^a-z0-9_]", "_", (label or "").lower())
+def _set_col_key(name: str, work: pd.DataFrame, what: str) -> str:
+    """新列/改名后的列键 = 用户写的那个名字，原样落进 DataFrame 的列头。
+
+    旧的 safe_key 规则先把名字转写成小写、非 [a-z0-9_] 换下划线：两个中文表头
+    （「有功功率」「出力利用率」）会双双压成 `____`/`___` 并互相覆盖，第二次就报
+    「列名 [____] 已存在」，界面上看到的名字和真实键还对不上。现在键与显示名同值，
+    撞名直接报错让用户换。
+    掩码列与外生变量列仍走 _MASK_KEY 的 ASCII 变量名契约——那是对外声明的变量名，
+    要进导出列头和公式，不在这条规则里。
+    """
+    key = str(name or "").strip()
+    if not key:
+        raise ValueError(f"{what}不能为空")
+    if len(key) > 128:
+        raise ValueError(f"{what}过长（{len(key)} 字符，上限 128）")
+    if any(ch in key for ch in ("\n", "\r", "\x00")):
+        raise ValueError(f"{what}不能包含换行或空字符")
+    if key in [str(c) for c in work.columns]:
+        raise ValueError(f"{what} [{key}] 已存在，请更换名称")
+    return key
 
 
 def _is_missing(v) -> bool:
@@ -1532,20 +1549,11 @@ def _op_rename_column(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     if not label:
         raise ValueError("新列名不能为空")
     # newKey 显式给定时按它改名（第五步的重命名会带上前端的冲突后缀 _lu7xxx），
-    # 与 key 相同表示只换显示名不动列键——原始列改名不该连带搬动整列数据。
+    # 没给定时键就跟显示名同一个字符串——改名不再转写，原始列只换显示名时把 newKey 传成 key 本身。
     explicit = p.get("newKey")
-    if explicit is None:
-        new_key = safe_key(label)
-    else:
-        new_key = str(explicit).strip()
-        if not new_key:
-            raise ValueError("新列键不能为空")
-        if len(new_key) > 128:
-            raise ValueError(f"新列键过长（{len(new_key)} 字符，上限 128）")
-        if any(ch in new_key for ch in ("\n", "\r", "\x00")):
-            raise ValueError("新列键不能包含换行或空字符")
-    if new_key != key and new_key in [str(c) for c in work.columns]:
-        raise ValueError(f"列名 {new_key} 已存在")
+    new_key = str(explicit if explicit is not None else label).strip()
+    if new_key != key:
+        new_key = _set_col_key(new_key, work, "新列名")
     if new_key != key:
         work.rename(columns={key: new_key}, inplace=True)
     for c in ws.meta["columns"]:
@@ -1606,11 +1614,7 @@ def _derived_formula(ws: Workspace, terms: list[dict]) -> str:
 
 
 def _op_derived_column(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
-    name = safe_key(p["name"])
-    if not name:
-        raise ValueError("新列名不合法")
-    if name in [str(c) for c in work.columns]:
-        raise ValueError(f"列名 [{name}] 已存在，请更换名称")
+    name = _set_col_key(p["name"], work, "新列名")
     terms = p["terms"]
     if len(terms) < 2:
         raise ValueError("列运算至少需要两个操作数")
@@ -1632,11 +1636,11 @@ def _op_derived_column(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     result = result.replace([np.inf, -np.inf], np.nan)
     work[name] = result.round(4)
     ws.rebuild_meta_columns(work)
-    next(c for c in ws.meta["columns"] if c["key"] == name)["label"] = p["name"]
+    next(c for c in ws.meta["columns"] if c["key"] == name)["label"] = name
     formula = _derived_formula(ws, terms)
-    ws.meta.setdefault("derivedCols", []).append({"key": name, "label": p["name"], "formula": formula})
+    ws.meta.setdefault("derivedCols", []).append({"key": name, "label": name, "formula": formula})
     valid = int(result.notna().sum())
-    return {"summary": f"列运算生成 {p['name']}：{formula}", "key": name, "formula": formula,
+    return {"summary": f"列运算生成 {name}：{formula}", "key": name, "formula": formula,
             "validRows": valid, "nullRows": int(result.shape[0]) - valid}
 
 

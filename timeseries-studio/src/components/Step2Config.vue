@@ -4,7 +4,7 @@ import { ElMessageBox } from 'element-plus'
 import {
   state, ds, switchStep, toast, PAGE_SIZE, wsActionLog,
   timeFormatDetect, setTimeColumn, convertTimeColumn, detectedFreqMinutes, pageColumnValues,
-  refreshPage, refreshOverview, rowCount,
+  refreshPage, refreshOverview, rowCount, clearLocate,
   resampleDataset, resamplePreview,
   loadExoCatalog, exoColumns,
   inspectSideTable, attachSideTable, removeExoColumn,
@@ -67,6 +67,22 @@ async function goPage(offset, limit) {
   try { await refreshPage(target, size) } finally { paging.value = false }
 }
 function onPageSize(ev) { goPage(0, Number(ev.target.value)) }
+// 第四步的「定位这些行」落在这里：行号是 /quality 那一帧的绝对 0-based 下标，
+// 先翻到含首行的那一页（上面留十行，看得见重复行的上下文），再把这几行整行标黄。
+const locate = computed(() => {
+  const l = state.locate
+  if (!l.wsId || l.wsId !== d.value.wsId || !l.rows.length) return null
+  return l
+})
+const locatedSet = computed(() => new Set(locate.value?.rows || []))
+async function applyLocate() {
+  const l = locate.value
+  if (!l) return
+  const first = Math.min(...l.rows)
+  const offset = Math.max(0, Math.floor(first / pageSize.value) * pageSize.value)
+  if (page.value.offset !== offset) await goPage(offset)
+}
+watch(() => state.locate, () => { applyLocate() })
 // 换数据集/撤销后端可能带回另一种页大小，下拉框跟着走（只认这五档，别的值不覆盖选中项）
 watch(() => page.value.limit, (v) => { if (PAGE_SIZES.includes(v)) pageSize.value = v })
 
@@ -108,28 +124,39 @@ const minHitRate = computed(() => (state.backend.limits?.minTimeHitRate ?? 0.6) 
 const targetFmtFull = computed(() => (targetFmt.value === 'custom' ? customFmt.value : targetFmt.value))
 const isCurrentTimeCol = computed(() => !!timeCol.value && timeCol.value === d.value.timeCol)
 
+// 识别回执必须对得上发起它的那份工作区：切换数据源时上一条请求往往还在飞，
+// 回来后拿旧列名去配新 wsId，后端就回 400「列不存在」，界面凭空弹一条识别失败。
+// seq 认「还有没有更新的一次识别在跑」，wsId 认「这份数据还在不在」，任一不满足就作废。
+let detectSeq = 0
+
 async function runDetect(silent = false) {
+  const seq = ++detectSeq
+  const wid = d.value.wsId
+  const col = timeCol.value
   detected.value = null
   previewAfter.value = []
-  if (!hasWs.value || !backendReady.value || !timeCol.value) {
-    if (!silent && !timeCol.value) detected.value = { ok: false, col: '', reason: '还没有可用的时间列，请先在上方选一个文本列再识别' }
+  if (!hasWs.value || !backendReady.value || !col) {
+    if (!silent && !col) detected.value = { ok: false, col: '', reason: '还没有可用的时间列，请先在上方选一个文本列再识别' }
     return
   }
   detectBusy.value = true
   let r = null
-  try { r = await timeFormatDetect(timeCol.value, srcFmt.value.trim()) } finally { detectBusy.value = false }
+  // 只由最新那一次识别收尾时的 busy 标志：旧的在飞请求不能把新请求的「识别中」擦掉
+  try { r = await timeFormatDetect(col, srcFmt.value.trim(), wid) } finally { if (seq === detectSeq) detectBusy.value = false }
+  if (seq !== detectSeq || wid !== d.value.wsId) return
   if (!r) return
   detected.value = r
   if (!silent) convertStatus.value = null
   // 认不出就在下方常驻红块里写原因和读到的原值，不再另弹一条三秒即消失的复述
-  if (r.ok) await runTargetPreview()
+  if (r.ok) await runTargetPreview(r, wid, seq)
 }
 
 // 目标格式的预览同样让后端渲染一次：这里的 after 与转换后页面上看到的值必须同源
-async function runTargetPreview() {
-  const r = detected.value
+async function runTargetPreview(seed = detected.value, wid = d.value.wsId, seq = detectSeq) {
+  const r = seed
   if (!r?.ok || !r.isCurrent || !targetFmtFull.value) { previewAfter.value = []; return }
-  const p = await timeFormatDetect(r.col, targetFmtFull.value)
+  const p = await timeFormatDetect(r.col, targetFmtFull.value, wid)
+  if (seq !== detectSeq || wid !== d.value.wsId) return
   previewAfter.value = p?.ok ? p.samplesAfter : []
 }
 
@@ -189,7 +216,7 @@ async function loadProjection() {
   finally { projBusy.value = false }
 }
 watch([() => d.value.wsId, targetRate, wsVersion], loadProjection, { immediate: true })
-onActivated(() => { reloadServerNumbers(); loadProjection() })
+onActivated(() => { reloadServerNumbers(); loadProjection(); applyLocate() })
 watch(() => d.value.wsId, () => reloadServerNumbers())
 watch(wsVersion, () => refreshOverview())
 
@@ -460,7 +487,8 @@ const PIPE_CHIPS = [
 </script>
 
 <template>
-  <section class="step-panel h-full p-4 flex flex-col gap-3 overflow-y-auto">
+  <section class="step-panel h-full p-4 flex flex-col gap-3">
+    <div class="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-0.5">
     <!-- 工作区状态条：界面上的每个整表数字都出自这里 -->
     <div class="bg-white border border-slate-200 rounded-xl px-4 py-2.5 shadow-sm flex items-center gap-3 flex-wrap text-[11px] shrink-0">
       <span class="font-bold text-slate-700 flex items-center gap-1.5">
@@ -1079,8 +1107,11 @@ const PIPE_CHIPS = [
                 {{ hasWs ? '后端未返回数据行（工作区可能已被回收，请回第一步重新载入）' : '尚未载入数据集' }}
               </td>
             </tr>
-            <tr v-for="(row, ri) in pageRows" :key="page.offset + ri" class="hover:bg-indigo-50/40">
-              <td class="px-2 py-1.5 text-right text-[10px] text-slate-400 border-r border-slate-100 font-mono sticky left-0 bg-white">{{ (page.offset + ri + 1).toLocaleString() }}</td>
+            <tr v-for="(row, ri) in pageRows" :key="page.offset + ri"
+                :class="locatedSet.has(page.offset + ri) ? 'bg-amber-100/80' : 'hover:bg-indigo-50/40'">
+              <td class="px-2 py-1.5 text-right text-[10px] border-r border-slate-100 font-mono sticky left-0"
+                  :class="locatedSet.has(page.offset + ri) ? 'bg-amber-100 text-amber-700 font-bold' : 'bg-white text-slate-400'">
+                <i v-if="locatedSet.has(page.offset + ri)" class="fa-solid fa-location-crosshairs mr-1 text-amber-600"></i>{{ (page.offset + ri + 1).toLocaleString() }}</td>
               <td v-for="c in d.columns" :key="c.key"
                   class="px-3 py-1.5 border-r border-slate-100 last:border-r-0 truncate min-w-[150px] max-w-[260px]"
                   :class="isMissing(row[c.key]) ? 'bg-rose-50 text-rose-500 font-bold' : ''">
@@ -1092,12 +1123,25 @@ const PIPE_CHIPS = [
         </table>
       </div>
     </div>
+    </div>
 
-    <div class="flex justify-between gap-3 pt-1">
-      <button @click="switchStep(1)" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium flex items-center">
+    <!-- 与第三步同款：页脚钉在页面底部，不跟着内容一起滚，列/行一多也不用翻到最下面找「下一步」 -->
+    <div class="flex items-center justify-between gap-3 pt-1 shrink-0">
+      <button @click="switchStep(1)" class="px-4 py-2 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium flex items-center shrink-0">
         <i class="fa-solid fa-arrow-left mr-1.5"></i>返回数据加载
       </button>
-      <button @click="switchStep(3)" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow flex items-center">
+      <!-- 第四步「定位这些行」带过来的那一组：说清定位了谁、共几行，并留一个取消入口。
+           高度钉死一行，出现与消失都不推动上面的卡片。 -->
+      <div class="flex-1 min-w-0 h-9 flex items-center justify-end gap-2 text-[11px] overflow-hidden">
+        <template v-if="locate">
+          <i class="fa-solid fa-location-crosshairs shrink-0 text-amber-600"></i>
+          <span class="truncate text-amber-700" :title="`行号 ${[...locatedSet].sort((a, b) => a - b).map(i => i + 1).join('、')}`">
+            已定位重复时刻 {{ locate.time || '（NaT）' }} 的 {{ locate.rows.length }} 行
+          </span>
+          <button @click="clearLocate()" class="shrink-0 px-2 py-0.5 rounded border border-amber-300 text-amber-700 hover:bg-amber-50">取消定位</button>
+        </template>
+      </div>
+      <button @click="switchStep(3)" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow flex items-center shrink-0">
         下一步：数据探索分析 <i class="fa-solid fa-arrow-right ml-1.5"></i>
       </button>
     </div>

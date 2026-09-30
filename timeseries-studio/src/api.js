@@ -86,8 +86,10 @@ async function wsJson(path, init) {
 const enc = encodeURIComponent
 
 // 建区成功的响应统一是 { meta, page, ... }
-export function wsCreatePreset(key, seed) {
-  return wsJson('/api/ws/preset', {
+// limit 要显式传：不传就是后端 DEFAULT_PAGE，第二步的表格会先画成服务端默认的行数
+export function wsCreatePreset(key, seed, limit) {
+  const q = limit ? `?limit=${enc(limit)}` : ''
+  return wsJson(`/api/ws/preset${q}`, {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(seed === null || seed === undefined ? { key } : { key, seed })
   })

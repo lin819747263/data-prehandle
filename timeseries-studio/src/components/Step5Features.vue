@@ -435,15 +435,10 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
 </script>
 
 <template>
-  <section class="step-panel h-full p-4 flex flex-col gap-3 overflow-y-auto">
-    <div v-if="!state.backend.online || running" class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
-         :class="state.backend.online ? 'bg-indigo-50 border-indigo-200 text-indigo-700' : 'bg-rose-50 border-rose-200 text-rose-700'">
-      <i class="fa-solid mt-0.5" :class="running ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
-      <div class="min-w-0">
-        <span v-if="running">后端整表构建中…</span>
-        <span v-else>后端不在线：本页的构建、重命名与撤销都只读</span>
-      </div>
-    </div>
+  <section class="step-panel h-full p-4 flex flex-col gap-3">
+    <!-- 与第三步同款布局契约：根节点不滚，滚动交给里面这一层，页脚钉在页面底部。
+         原来那条「构建中/后端离线」横幅放在滚动区顶部，一卸载就把整页往上抽一截。 -->
+    <div class="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-0.5">
     <!-- 特征配置区 -->
     <div class="shrink-0 bg-white rounded-xl border border-slate-200 shadow-sm overflow-hidden flex flex-col">
       <!-- Tab 栏 + 流水线状态 -->
@@ -1111,6 +1106,7 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
         </table>
       </div>
     </div>
+    </div>
 
     <!-- 本步的出口：这一页的产物就是那张宽表，所以收尾既给向前的动作（导出 / 存为数据集），
          也把真正的交付物念出来。行数、列数、各族特征数全部取自 meta 与后端列注册表的当前值。 -->
@@ -1127,12 +1123,20 @@ watch(() => `${d.value.wsId}|${d.value.meta?.version ?? -1}`, loadHolidayTable)
         </span>
         <span v-if="!featureTotal" class="text-amber-600">还没有生成任何特征列</span>
       </div>
+      <!-- 状态位常驻（h-8 钉死高度，里面有没有字都占一行）：整表构建中/后端离线都在这里念，
+           不再单独占一条横幅，页面上方就不会因为它出现和消失而跳动。 -->
+      <div class="flex-1 min-w-0 h-8 flex items-center justify-end gap-2 text-[11px] overflow-hidden">
+        <template v-if="running || !state.backend.online">
+          <i class="fa-solid shrink-0" :class="running ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
+          <span class="truncate" :class="running ? 'text-indigo-700' : 'text-rose-700'">{{ running ? '后端整表构建中…' : '后端不在线：本页的构建、重命名与撤销都只读' }}</span>
+        </template>
+      </div>
       <div class="flex items-center gap-2 shrink-0">
-        <button @click="switchStep(4)" class="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium">
+        <button @click="switchStep(4)" class="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium shrink-0">
           <i class="fa-solid fa-arrow-left mr-1"></i>返回质量清洗
         </button>
         <button @click="state.showExportModal = true" :disabled="!d.wsId"
-                class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold disabled:opacity-50">
+                class="px-4 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold disabled:opacity-50 shrink-0">
           导出结果 / 存为数据集<i class="fa-solid fa-arrow-right ml-1"></i>
         </button>
       </div>

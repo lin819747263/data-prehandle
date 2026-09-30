@@ -17,7 +17,7 @@ import {
 } from './utils'
 import * as ws from './api'
 
-export const PAGE_SIZE = 50
+export const PAGE_SIZE = 20
 
 function blankDataset(key, name) {
   return {
@@ -129,7 +129,9 @@ async function runOp(kind, params, note, { long = false } = {}) {
   try {
     // 与服务端 apply() 同一步：回退后又执行新命令，那段「等待重做」的记录从此不再成立
     pruneUndoneLog(d)
-    const r = await ws.wsOp(d.wsId, kind, params, null, { long })
+    // limit 必须显式带上：不带时 op 响应里的 page 用后端 DEFAULT_PAGE=50，
+    // 下面 applyPage 一把覆盖回来，用户选的 20 行/页每执行一条命令就被打回 50。
+    const r = await ws.wsOp(d.wsId, kind, params, d.page?.limit ?? PAGE_SIZE, { long })
     applyMeta(d, r.meta)
     applyPage(d, r.page)
     touch()
@@ -168,7 +170,7 @@ export async function loadPresetData(key) {
   if (!requireBackend('加载内置示例')) return false
   state.busy = '正在生成示例数据集…'
   try {
-    const resp = await ws.wsCreatePreset(key)
+    const resp = await ws.wsCreatePreset(key, undefined, PAGE_SIZE)
     const d = await adoptWorkspace(key, resp, { name: resp.meta.name, format: 'preset' })
     logAction(1, 'dataset', '加载数据集',
       `${d.name} · ${d.meta.rowCount.toLocaleString()}行×${d.meta.colCount}列 · 后端工作区 ${d.wsId}`)
@@ -260,6 +262,9 @@ export const state = reactive({
   holidays: { wsId: '', version: -1, data: null, loading: false, error: '' },
   // 图表与刷选用的质量曲线：GET /series（默认全量，含每点的行位置 idx，掩码区间靠它换算）
   series: { key: '', data: null, error: '' },
+  // 第四步「定位这些行」的交接单：绝对 0-based 行号 + 它属于哪份工作区。
+  // 只认发起时的那份 wsId——切换数据源后旧交接单必须作废，否则会把不相干的行标黄冒充结果。
+  locate: { wsId: '', rows: [], time: '' },
   lastAnomaly: null,    // 后端 detection_view()：{ algo, expr, results, summary, stale, anomalyIndices }
   splitRatio: 70,
   // 撤销/重做：整份投影自服务端 meta_view()（游标 + 命令日志），浏览器不存历史
@@ -453,11 +458,14 @@ export async function convertColumnUnit(idx, factor, offset, newUnit) {
 // ---- 时间列与时间格式：判定与渲染都在后端按整列真解析，浏览器只转述回执 ----
 // 这里没有"按当前页猜格式"的兜底了：一页 500 行推不出 11000 行的结论，
 // 猜错的代价是整列被洗成 NaT 或 1970 年的假时间，界面上一个错字都不留。
-export async function timeFormatDetect(colKey, srcFmt) {
+export async function timeFormatDetect(colKey, srcFmt, wsId) {
   const d = ds()
-  if (!d.wsId || !requireBackend('时间格式识别')) return null
+  // 问哪份工作区必须由调用方在发起时钉死：切换数据源时旧请求还在飞，
+  // d.wsId 已经换成新的，旧列名配新工作区就是后端那句 400「列不存在」。
+  const wid = wsId ?? d.wsId
+  if (!wid || wid !== d.wsId || !requireBackend('时间格式识别')) return null
   try {
-    return await ws.wsTimeDetect(d.wsId, colKey || d.timeCol, srcFmt || '')
+    return await ws.wsTimeDetect(wid, colKey || d.timeCol, srcFmt || '')
   } catch (e) {
     toast('error', `时间格式识别失败：${e.message}`)
     return null
@@ -743,6 +751,32 @@ export function segmentsOf(colKey) {
 // 超过 /quality 上限的列，浏览器根本拿不到全部缺失段，逐段选算法就是假的
 export function segmentsTruncated(colKey) {
   return !!qualityData()?.segmentsTruncated?.[colKey]
+}
+
+// 重复时刻的明细：后端按「重复数量从多到少」回前 duplicateGroupCap 组，每行一个组
+// { time, isNaT, count, rows[绝对 0-based 行号], rowsTruncated }。
+// 只有 qualityData() 签名对得上时才给得出——行号是那一帧的下标，帧换了就是废数据。
+export function duplicateGroups() {
+  const q = qualityData()
+  return {
+    list: q?.duplicateDetail || [],
+    truncated: !!q?.duplicateDetailTruncated,
+    cap: q?.duplicateGroupCap || 0
+  }
+}
+
+// 把「看哪几行」这个动作交给第二步：记下绝对行号与当时的工作区，切过去由第二步翻页捞出并标黄。
+// 计数只能说明重复了多少，看不到是哪几行就还是看不见。
+export function locateRows(rows, time) {
+  const d = ds()
+  if (!d?.wsId || !rows?.length) return false
+  state.locate = { wsId: d.wsId, rows: rows.slice(), time: time || '' }
+  switchStep(2)
+  return true
+}
+
+export function clearLocate() {
+  state.locate = { wsId: '', rows: [], time: '' }
 }
 
 export function segAlgo(colKey, idx) {
@@ -1394,13 +1428,13 @@ export async function firstCompleteRow(newKeys, scanRows = 5000) {
 export async function renameFeature(idx, newLabel) {
   const feat = state.features[idx]
   const oldKey = feat.key
-  // 原始列的键不能改（只换显示名）；特征列的键由标签推导，冲突时加时间戳后缀，
-  // 键由前端算好显式下发，服务端才不会按自己的 safe_key 规则另起一个名
+  // 原始列的键不能改（只换显示名）；特征列的键就是用户写的那个名字，撞名才加时间戳后缀。
+  // 键由前端算好显式下发，界面显示什么、导出宽表与撤销重放就是什么，中间不再转写一遍。
   let newKey = oldKey
   if (feat.isNew) {
-    const safeKey = newLabel.toLowerCase().replace(/[^a-z0-9_]/g, '_').replace(/_+/g, '_')
-    const conflict = state.features.some((f, i) => i !== idx && f.key === safeKey)
-    newKey = conflict ? safeKey + '_' + Date.now().toString(36) : safeKey
+    const wanted = String(newLabel || '').trim()
+    const conflict = state.features.some((f, i) => i !== idx && f.key === wanted)
+    newKey = conflict ? `${wanted}_${Date.now().toString(36)}` : wanted
   }
   // 改名会连带换掉导出宽表的列键，不进审计链就复现不出同一张表
   const r = await runOp('rename-column', { key: oldKey, label: newLabel, newKey }, {
@@ -1779,7 +1813,7 @@ export function generatePythonCode() {
   wsActionLog().slice().reverse().forEach(e => {
     const rp = e.params
     if (!rp || rp.type !== 'rename_column') return
-    const nk = rp.newKey || String(rp.newLabel || '').toLowerCase().replace(/[^a-z0-9_]/g, '_')
+    const nk = rp.newKey || String(rp.newLabel || '').trim()
     if (nk === loadTimeCol) loadTimeCol = rp.oldKey
   })
   let tc = loadTimeCol
@@ -2032,7 +2066,7 @@ export function generatePythonCode() {
   ops.forEach((entry, opNum) => {
     const p = entry.params
     if (p.type === 'rename_column' || p.type === 'feature_rename') {
-      const newKey = p.newKey || String(p.newLabel || '').toLowerCase().replace(/[^a-z0-9_]/g, '_')
+      const newKey = p.newKey || String(p.newLabel || '').trim()
       const key = `rename:${p.oldKey}->${newKey}`
       // 特征列若只改显示名（未换键），pandas 侧无事可做
       if (!done.has(key) && newKey && newKey !== p.oldKey) {

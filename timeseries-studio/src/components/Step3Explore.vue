@@ -163,12 +163,28 @@ async function refreshHist() {
   drawDist()
 }
 
+let inflight = null
+
 async function prepare(force = false) {
-  // 离线与未接入数据由页首那条 gate 常驻说明，这里直接不铺
+  // 离线与未接入数据由钉底页脚那条 gate 常驻说明，这里直接不铺
   if (!state.backend.online || !d.value.wsId) return
   // 按 (工作区, 版本号) 记这次铺没铺过：版本号只在执行加工命令时前进，翻页与改勾选都不动它
   const sig = `${d.value.wsId}|${d.value.meta?.version ?? -1}`
   if (!force && loadedSig === sig) return
+  // keep-alive 首次进入会把 onMounted 与 onActivated 连着各叫一次 prepare，
+  // 两条都抢在 loadedSig 落定前跑完自己的三个 await，于是整表 stats、曲线、直方图各被请求两遍
+  // （11,000×39 实测 series-multi 两次 345ms+803ms）。同一条签名上有在途请求就并进去，不重发。
+  if (inflight && inflight.sig === sig) return inflight.p
+  const p = runPrepare(sig)
+  inflight = { sig, p }
+  try {
+    return await p
+  } finally {
+    if (inflight && inflight.p === p) inflight = null
+  }
+}
+
+async function runPrepare(sig) {
   await loadStats()
   await refreshSeries()
   await refreshHist()
@@ -176,7 +192,7 @@ async function prepare(force = false) {
   const bad = Object.keys(BLOCK_NAMES).filter(k => err[k])
   if (bad.length) {
     // 整页缺块必须说出来：只标红不弹提示，用户会以为自己看到的表是全的。
-    // 每块的具体错因由页首 gate 常驻列在这里就不再复述一遍
+    // 每块的具体错因由钉底页脚那条 gate 常驻列在这里就不再复述一遍
     toast(bad.length === 3 ? 'error' : 'warning',
       `${bad.map(k => BLOCK_NAMES[k]).join('、')}没从后端取到${bad.length === 3 ? '，本页没有可用数字' : '，对应区块已标红'}`)
     return
@@ -355,21 +371,6 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
     <!-- 页脚单独留在滚动区外面：列一多，统计矩阵就把「下一步」顶到几百像素以下、甚至被卡片盖住，
          现在无论多少列，返回/下一步都钉在页面底部不动。 -->
     <div class="flex-1 min-h-0 flex flex-col gap-3 overflow-y-auto pr-0.5">
-    <div v-if="gate.status !== 'ready'" class="rounded-xl border px-3 py-2 text-[11px] flex items-start gap-2 shrink-0"
-         :class="gate.status === 'loading' ? 'bg-indigo-50 border-indigo-200 text-indigo-700'
-                 : gate.status === 'error' ? 'bg-rose-50 border-rose-200 text-rose-700'
-                 : 'bg-amber-50 border-amber-200 text-amber-700'">
-      <i class="fa-solid mt-0.5" :class="gate.status === 'loading' ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
-      <div class="min-w-0">
-        <div class="font-semibold">{{ gate.note || '正在计算…' }}</div>
-        <div v-if="gate.status === 'error'" class="mt-0.5 leading-snug opacity-80">
-          缺的区块各自标红；其余两块数字仍是后端刚算出来的真实值，可以直接看。
-        </div>
-      </div>
-      <button v-if="gate.status === 'error' || gate.status === 'offline'" @click="prepare(true)"
-              class="ml-auto shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
-    </div>
-
     <!-- 图上的数字仍是离线前那一次真实计算的结果，说清楚免得被当成实时值 -->
     <div v-if="gate.status === 'ready' && !state.backend.online"
          class="rounded-lg bg-amber-50 border border-amber-200 text-amber-700 px-3 py-1.5 text-[11px] shrink-0">
@@ -527,7 +528,7 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
                 <td class="px-2 py-1.5 text-right text-emerald-600">{{ fmt(s.q3) }}</td>
                 <td class="px-2 py-1.5 text-right text-slate-500">{{ fmt(s.max) }}</td>
                 <td class="px-2 py-1.5 text-right font-semibold"
-                    :class="s.missingRate === 0 ? 'text-emerald-600' : s.missingRate < 5 ? 'text-amber-600' : 'text-rose-600'">{{ s.missingRate.toFixed(1) }}%</td>
+                    :class="s.missingRate === 0 ? 'text-emerald-600' : s.missingRate < 5 ? 'text-amber-600' : 'text-rose-600'">{{ s.missingRate.toFixed(2) }}%</td>
                 <td class="px-2 py-1.5">
                   <div v-if="s.n > 0" class="w-full h-2 bg-slate-100 rounded-full overflow-hidden relative">
                     <div class="absolute h-full bg-indigo-400/60 rounded-full"
@@ -571,11 +572,25 @@ watch(() => state.backend.online, on => { if (on) prepare(true) })
 
     </div>
 
-    <div class="flex justify-between items-center shrink-0">
-      <button @click="switchStep(2)" class="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium">
+    <div class="flex items-center justify-between gap-3 shrink-0">
+      <button @click="switchStep(2)" class="px-4 py-1.5 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded-lg text-xs font-medium shrink-0">
         <i class="fa-solid fa-arrow-left mr-1"></i>返回数据接入
       </button>
-      <button @click="switchStep(4)" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow">
+      <!-- 计算状态写在钉底页脚里，不放滚动区顶部：那条横幅一卸载就把下面整块顶上去，
+           三块串行取数就跳三次。页脚高度由按钮钉死，状态在不在都只占一行。 -->
+      <div class="flex-1 min-w-0 h-8 flex items-center justify-end gap-2 text-[11px] overflow-hidden">
+        <template v-if="gate.status !== 'ready'">
+          <i class="fa-solid shrink-0" :class="gate.status === 'loading' ? 'fa-spinner fa-spin' : 'fa-triangle-exclamation'"></i>
+          <span class="truncate"
+                :class="gate.status === 'loading' ? 'text-indigo-700' : gate.status === 'error' ? 'text-rose-700' : 'text-amber-700'"
+                :title="gate.status === 'error' ? '缺的区块各自标红；其余区块的数字仍是后端刚算出来的真实值，可以直接看。' : gate.note">
+            {{ gate.note || '正在计算…' }}<template v-if="gate.status === 'error'"> · 缺的区块各自标红，其余仍是后端真实值</template>
+          </span>
+          <button v-if="gate.status === 'error' || gate.status === 'offline'" @click="prepare(true)"
+                  class="shrink-0 px-2 py-0.5 rounded border border-current opacity-70 hover:opacity-100">重试</button>
+        </template>
+      </div>
+      <button @click="switchStep(4)" class="px-5 py-2 bg-indigo-600 hover:bg-indigo-700 text-white rounded-lg text-xs font-semibold shadow shrink-0">
         下一步：数据质量清洗 <i class="fa-solid fa-arrow-right ml-1"></i>
       </button>
     </div>

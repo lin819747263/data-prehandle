@@ -132,7 +132,7 @@ def main() -> int:
     r1 = api("POST", f"/api/ws/{w2}/op/rename-column", {"key": "active_power", "label": "有功功率"})
     power_key = r1["newKey"]
     show("重命名", f"v{r1['meta']['version']} · {r1['summary']} · 新 key '{power_key}'")
-    check("中文列名按前端同规则折叠成 key", power_key == "____", power_key)
+    check("列名一路到底：key 就是写进去的那个名字，不再转写成 ____", power_key == "有功功率", power_key)
     r2 = api("POST", f"/api/ws/{w2}/op/convert-unit",
              {"key": "irradiance", "factor": 0.001, "offset": 0.0, "newUnit": "kW/m²"})
     show("单位换算", f"v{r2['meta']['version']} · {r2['summary']}")
