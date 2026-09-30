@@ -1,0 +1,39 @@
+# electron-builder 打包配置（npm run dist:win）
+# 结构：app.asar 里只放前端产物 dist/ 与桌面端主进程 electron/，
+# 打包版后端 exe 走 extraResources 放到 resources/ 根下，由 backend-manager 的 resourcesPath 候选命中。
+appId: com.timeseries.studio
+productName: TimeSeries Studio
+copyright: Copyright © 2026 TimeSeries Studio
+
+directories:
+  # 安装器与 win-unpacked 都落在 release/（根 .gitignore 已忽略，不进版本库）
+  output: release/desktop
+  buildResources: release/build-res
+
+# 前端依赖已被 vite 打进 dist，主进程只用 Node 内置模块 + electron，运行时不需要 node_modules
+files:
+  - dist/**/*
+  - electron/**/*
+  - package.json
+  - "!node_modules/**/*"
+
+extraResources:
+  - from: ../timeseries-studio-server/release/timeseries-backend.exe
+    to: timeseries-backend.exe
+
+asar: true
+
+win:
+  target:
+    - nsis
+    - dir
+  icon: electron/icon.ico
+  artifactName: TimeSeries-Studio-${version}-win.${ext}
+
+nsis:
+  # 装到当前用户目录（%LOCALAPPDATA%\Programs），不要 UAC 提权，也不假设机器上有管理员
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+  createDesktopShortcut: always
+  shortcutName: TimeSeries Studio

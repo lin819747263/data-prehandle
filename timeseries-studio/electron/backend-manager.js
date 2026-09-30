@@ -20,12 +20,13 @@ function candidatePythons(serverDir) {
   return [venv, ...(IS_WIN ? ['python', 'python3'] : ['python3', 'python'])]
 }
 
-/** 打包版后端的查找顺序：显式指定 → 后端项目 release/ → Electron 资源目录（打包发布时）。 */
+/** 打包版后端的查找顺序：显式指定 → Electron 资源目录（安装态）→ 后端项目 release/（开发态）。 */
 export function backendExeCandidates(serverDir) {
   const out = []
   if (process.env.TSS_BACKEND_EXE) out.push(path.resolve(process.env.TSS_BACKEND_EXE))
-  out.push(path.join(serverDir, 'release', EXE_NAME))
+  // 安装态必须优先 resources：exe 随应用走，不能被邻目录里别人的 release/ 抢走
   if (process.resourcesPath) out.push(path.join(process.resourcesPath, EXE_NAME))
+  if (serverDir) out.push(path.join(serverDir, 'release', EXE_NAME))
   return out
 }
 
@@ -81,8 +82,10 @@ export async function fetchHealth(baseUrl, timeoutMs = HEALTH_TIMEOUT_MS) {
 }
 
 export class BackendManager {
-  constructor({ serverDir, host = '127.0.0.1', port = 8000, onLog = () => {}, onExit = null }) {
+  constructor({ serverDir, dataRoot, host = '127.0.0.1', port = 8000, onLog = () => {}, onExit = null }) {
     this.serverDir = serverDir
+    // 数据目录与代码目录分开：安装态没有 ../timeseries-studio-server，dataset 要落在 userData 下
+    this.dataRoot = dataRoot || serverDir
     this.host = host
     this.port = port
     this.onLog = onLog
@@ -112,10 +115,16 @@ export class BackendManager {
     return candidates[0]
   }
 
+  /** 进程工作目录：安装态没有后端项目目录，退到数据目录（必须真实存在，否则 spawn 直接 ENOENT）。 */
+  spawnCwd() {
+    if (existsSync(this.serverDir)) return this.serverDir
+    return this.dataRoot
+  }
+
   /**
    * 挑运行时：TSS_BACKEND=python 强制走源码，否则有打包版 exe 就用它。
-   * exe 会把自己的 cwd 钉到它所在目录，所以这里显式把数据目录指回后端项目，
-   * 免得打包版和源码版各存一份 dataset。
+   * 两种运行时的命令行保持一致，数据目录统一由 dataRoot 决定
+   * （开发态 = 后端项目目录，安装态 = userData），保证 dataset 只有一份。
    */
   resolveRuntime() {
     if (process.env.TSS_BACKEND !== 'python') {
@@ -126,8 +135,8 @@ export class BackendManager {
           label: '打包版 exe',
           command: exe,
           args: ['--host', this.host, '--port', String(this.port),
-            '--dataset-dir', path.join(this.serverDir, 'dataset'),
-            '--state-dir', path.join(this.serverDir, '.tss-state')],
+            '--dataset-dir', path.join(this.dataRoot, 'dataset'),
+            '--state-dir', path.join(this.dataRoot, '.tss-state')],
           note: exe
         }
       }
@@ -137,7 +146,7 @@ export class BackendManager {
       throw new Error(`找不到 Python 解释器：${python}\n可用 TSS_PYTHON 指定解释器，或先跑 build-backend.bat 出打包版`)
     }
     if (!existsSync(path.join(this.serverDir, 'app', 'main.py'))) {
-      throw new Error(`后端目录不对：${this.serverDir} 下没有 app/main.py\n可用 TSS_SERVER_DIR 指定后端目录`)
+      throw new Error(`后端运行时缺失：既没有打包版 ${EXE_NAME}，${this.serverDir} 下也没有 app/main.py\n开发态可用 TSS_SERVER_DIR 指定后端目录，安装态请确认安装包内的 resources/${EXE_NAME} 完好`)
     }
     return {
       kind: 'python',
@@ -168,7 +177,8 @@ export class BackendManager {
 
     const rt = this.resolveRuntime()
     this.runtime = rt
-    this.onLog(`启动后端（${rt.label}）：${rt.command} ${rt.args.join(' ')}  (cwd=${this.serverDir})`)
+    const cwd = this.spawnCwd()
+    this.onLog(`启动后端（${rt.label}）：${rt.command} ${rt.args.join(' ')}  (cwd=${cwd})`)
     onStatus({
       phase: 'spawning',
       text: rt.kind === 'exe' ? '正在拉起打包版后端' : '正在拉起 Python 后端',
@@ -177,7 +187,7 @@ export class BackendManager {
     })
 
     this.child = spawn(rt.command, rt.args, {
-      cwd: this.serverDir,
+      cwd,
       env: { ...process.env, PYTHONUNBUFFERED: '1', PYTHONIOENCODING: 'utf-8' },
       windowsHide: true,
       stdio: ['ignore', 'pipe', 'pipe'],

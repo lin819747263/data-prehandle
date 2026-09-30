@@ -3,7 +3,7 @@
 // 退出次序：主窗关闭 → 回收自己 spawn 的后端与 vite 子进程 → app.quit()。
 // 复用的既有后端（别的终端里跑着的那个）不属于本进程，退出时不动它。
 import { app, BrowserWindow, ipcMain, shell, dialog } from 'electron'
-import { appendFileSync, existsSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync } from 'node:fs'
 import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { BackendManager, defaultServerDir } from './backend-manager.js'
@@ -17,12 +17,16 @@ const flag = (name) => (process.argv.find((a) => a.startsWith(`--${name}=`)) || 
 const config = (name, env, dflt) => flag(name) || process.env[env] || dflt
 
 const SERVER_DIR = path.resolve(config('server-dir', 'TSS_SERVER_DIR', defaultServerDir(APP_ROOT)))
+// 数据目录（dataset/ 与 .tss-state/）：开发态与源码后端共用项目目录，安装态落在当前用户的 userData 下
+const DATA_ROOT = path.resolve(config('data-root', 'TSS_DATA_ROOT', app.isPackaged ? app.getPath('userData') : SERVER_DIR))
 const BACKEND_HOST = config('host', 'TSS_HOST', '127.0.0.1')
 const BACKEND_PORT = Number(config('backend-port', 'TSS_PORT', '8000'))
 const BACKEND_URL = `http://${BACKEND_HOST}:${BACKEND_PORT}`
 // 前端必须以 http://127.0.0.1:<port> 暴露：后端 CORS 只放行本机 http 源，file:// 的 Origin 是 null
 const FRONTEND_MODE = config('frontend', 'TSS_FRONTEND', app.isPackaged ? 'dist' : 'vite')
 const LOG_FILE = path.join(app.getPath('userData'), 'desktop.log')
+// 任务栏/标题栏图标与安装包图标同源（electron/icon.ico，由 scripts/make-icon.mjs 从应用标识生成）
+const APP_ICON = path.join(HERE, 'icon.ico')
 
 let splash = null
 let mainWin = null
@@ -73,6 +77,7 @@ function createSplash() {
     center: true,
     show: false,
     backgroundColor: '#f1f5f9',
+    icon: APP_ICON,
     title: 'TimeSeries Studio',
     webPreferences: {
       preload: path.join(HERE, 'preload.cjs'),
@@ -96,6 +101,7 @@ function createMainWindow() {
     minHeight: 700,
     show: false,
     backgroundColor: '#f1f5f9',
+    icon: APP_ICON,
     title: 'TimeSeries Studio',
     webPreferences: {
       preload: path.join(HERE, 'preload.cjs'),
@@ -135,7 +141,8 @@ ipcMain.handle('tss:action', async (_e, { type }) => {
       ok: true, url: BACKEND_URL, mode: FRONTEND_MODE,
       owned: !!backend?.owned, pid: backend?.child?.pid ?? null,
       runtime: backend?.runtime?.kind || (backend?.owned ? 'unknown' : 'adopted'),
-      runtimePath: backend?.runtime?.note || null
+      runtimePath: backend?.runtime?.note || null,
+      dataRoot: DATA_ROOT
     }
   }
   return { ok: false, reason: `未知动作 ${type}` }
@@ -145,6 +152,7 @@ async function bootBackend() {
   if (!backend) {
     backend = new BackendManager({
       serverDir: SERVER_DIR,
+      dataRoot: DATA_ROOT,
       host: BACKEND_HOST,
       port: BACKEND_PORT,
       onLog: log,
@@ -205,7 +213,7 @@ async function finishBoot() {
 async function boot() {
   createSplash()
   sendToSplash({ phase: 'boot', text: `正在启动工作台前端（${FRONTEND_MODE}）` })
-  log(`桌面端启动：mode=${FRONTEND_MODE} server=${SERVER_DIR} backend=${BACKEND_URL}`)
+  log(`桌面端启动：mode=${FRONTEND_MODE} packaged=${app.isPackaged} server=${SERVER_DIR} data=${DATA_ROOT} backend=${BACKEND_URL}`)
 
   frontend = FRONTEND_MODE === 'dist'
     ? await startStaticFrontend({ distDir: path.join(APP_ROOT, 'dist'), onLog: log })
@@ -244,7 +252,9 @@ if (!gotLock) {
   })
 
   app.whenReady().then(() => {
-    if (!existsSync(SERVER_DIR)) log(`警告：后端目录不存在：${SERVER_DIR}（可用 TSS_SERVER_DIR 指定）`)
+    // 数据目录先建好：安装态它同时是后端子进程的工作目录，缺目录会让 spawn 直接 ENOENT
+    try { mkdirSync(DATA_ROOT, { recursive: true }) } catch (e) { log(`数据目录创建失败：${DATA_ROOT} (${e.message})`) }
+    if (!app.isPackaged && !existsSync(SERVER_DIR)) log(`警告：后端目录不存在：${SERVER_DIR}（可用 TSS_SERVER_DIR 指定）`)
     boot().catch(async (e) => {
       log(`启动失败：${e.stack || e.message}`)
       sendToSplash({ phase: 'error', message: String(e.message || e).slice(0, 4000) })
