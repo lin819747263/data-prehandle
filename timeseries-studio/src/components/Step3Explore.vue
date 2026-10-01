@@ -1,6 +1,6 @@
 <script setup>
 import { ref, computed, reactive, onMounted, onActivated, onBeforeUnmount, nextTick, watch } from 'vue'
-import * as echarts from 'echarts'
+import echarts from '../echarts-setup'
 import { state, ds, switchStep, rowCount, toast } from '../store'
 import { wsStats, wsHist, wsSeriesMulti } from '../api'
 

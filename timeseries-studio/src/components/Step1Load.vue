@@ -225,7 +225,7 @@ function relTime(mtime) {
             <p class="text-xs text-slate-500 font-medium">读取 dataset 目录需后端在线</p>
             <p class="text-[11px] text-slate-400 mt-1 mb-3 font-mono">{{ API_BASE }}</p>
             <button @click="checkBackend().then(refreshRecent)" class="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-[11px] font-semibold">
-              <i class="fa-solid fa-plug-circle-arrow-up mr-1"></i>重新探测
+              <i class="fa-solid fa-plug-circle-bolt mr-1"></i>重新探测
             </button>
           </div>
 

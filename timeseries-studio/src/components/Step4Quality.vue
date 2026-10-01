@@ -1,6 +1,6 @@
 <script setup>
 import { ref, reactive, computed, onMounted, onActivated, onBeforeUnmount, nextTick, watch } from 'vue'
-import * as echarts from 'echarts'
+import echarts from '../echarts-setup'
 import { ElMessageBox } from 'element-plus'
 import {
   state, ds, switchStep, requireBackend, sourceSig,
@@ -263,7 +263,7 @@ const cards = computed(() => {
   const overallRate = m.missingRate
   return [
     { icon: 'fa-table', bg: 'bg-slate-100', color: 'text-slate-600', label: '总行数', value: m.totalRows.toLocaleString() },
-    { icon: 'fa-cells', bg: 'bg-slate-100', color: 'text-slate-600', label: '总单元格', value: m.totalCells.toLocaleString() },
+    { icon: 'fa-table-cells', bg: 'bg-slate-100', color: 'text-slate-600', label: '总单元格', value: m.totalCells.toLocaleString() },
     { icon: 'fa-circle-question', bg: 'bg-rose-50', color: 'text-rose-600', label: '缺失单元格', value: m.totalMissing.toLocaleString() },
     { icon: 'fa-percent', bg: overallRate > 5 ? 'bg-rose-50' : 'bg-emerald-50', color: overallRate > 5 ? 'text-rose-600' : 'text-emerald-600', label: '整体缺失率', value: overallRate.toFixed(2) + '%' },
     { icon: 'fa-copy', bg: 'bg-amber-50', color: 'text-amber-600', label: '重复时间戳', value: m.duplicateCount.toLocaleString() + ' 条' }

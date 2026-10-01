@@ -504,7 +504,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
         <template v-if="state.backend.online">
           <button @click="doExport('parquet')" :disabled="exporting === 'parquet'"
                   class="w-full flex items-center gap-3 p-3 rounded-lg border border-slate-200 hover:border-orange-400 hover:bg-orange-50/40 disabled:opacity-60 text-left transition-all">
-            <span class="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-columns text-orange-600"></i></span>
+            <span class="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-table-columns text-orange-600"></i></span>
             <span class="flex-1 min-w-0">
               <span class="block text-xs font-bold text-slate-700">Parquet 列式归档 (.parquet)</span>
               <span class="block text-[11px] text-slate-400">snappy 压缩，含全部清洗结果与特征列</span>
@@ -530,7 +530,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
           </button>
         </template>
         <div v-else class="w-full flex items-center gap-3 p-3 rounded-lg border border-dashed border-slate-300 opacity-90">
-          <span class="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-file-columns text-orange-500"></i></span>
+          <span class="w-9 h-9 rounded-lg bg-orange-50 flex items-center justify-center shrink-0"><i class="fa-solid fa-table-columns text-orange-500"></i></span>
           <span class="flex-1 min-w-0">
             <span class="block text-xs font-bold text-slate-600">Parquet / Feather</span>
             <span class="block text-[11px] text-rose-500">后端未连接（{{ API_BASE }}）· 四种格式都由服务端直出</span>
@@ -555,7 +555,7 @@ onUnmounted(() => window.removeEventListener('keydown', onKeydown))
             </select>
             <button @click="doSaveAsDataset" :disabled="saving || !state.backend.online"
                     class="shrink-0 px-3 py-1.5 rounded-md bg-indigo-600 hover:bg-indigo-700 text-white text-[11px] font-semibold disabled:opacity-60">
-              <i class="fa-solid fa-arrow-down-to-bracket mr-1"></i>{{ saving ? '写入中…' : '存为数据集' }}
+              <i class="fa-solid fa-floppy-disk mr-1"></i>{{ saving ? '写入中…' : '存为数据集' }}
             </button>
           </div>
           <div v-if="savedOk" class="mt-2 flex items-start gap-1.5 text-[11px] text-emerald-700 leading-snug break-words">

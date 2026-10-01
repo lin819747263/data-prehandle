@@ -314,7 +314,7 @@ const attachedExo = computed(() => { void state.dataVersion; return exoColumns()
 // 那是要照实标出来的历史，不能因为入口没了就把它们显示成侧表
 const EXO_KIND_META = {
   preset: { icon: 'fa-cubes', label: '预设' },
-  formula: { icon: 'fa-function', label: '公式' },
+  formula: { icon: 'fa-square-root-variable', label: '公式' },
   file: { icon: 'fa-file-import', label: '侧表' }
 }
 

@@ -3,8 +3,6 @@
 // 整表级的统计、抽稀、重采样、清洗都在服务端算，这里不放算法
 // ============================================================
 
-export function pad(n) { return String(n).padStart(2, '0') }
-
 export function formatFileSize(bytes) {
   if (bytes < 1024) return bytes + ' B'
   if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB'
@@ -59,7 +57,7 @@ export function getFileIconMeta(filename) {
   const ext = fileExt(filename)
   if (ext === 'csv') return { icon: 'fa-file-csv', color: 'text-emerald-600', bg: 'bg-emerald-50' }
   if (ext === 'xlsx' || ext === 'xls') return { icon: 'fa-file-excel', color: 'text-green-600', bg: 'bg-green-50' }
-  if (ext === 'parquet') return { icon: 'fa-file-columns', color: 'text-orange-600', bg: 'bg-orange-50' }
+  if (ext === 'parquet') return { icon: 'fa-table-columns', color: 'text-orange-600', bg: 'bg-orange-50' }
   if (ext === 'feather') return { icon: 'fa-feather', color: 'text-sky-600', bg: 'bg-sky-50' }
   return { icon: 'fa-file', color: 'text-slate-600', bg: 'bg-slate-100' }
 }
