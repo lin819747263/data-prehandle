@@ -494,7 +494,16 @@ def apply_repair(frame: pd.DataFrame, detection: dict, mode: str,
 
 def quality_snapshot(frame: pd.DataFrame, columns: list[dict], time_col: str | None,
                      time_labels: list) -> dict:
-    """各列缺失统计 + 数值列的缺失时间段明细 + 重复时间戳计数（全部按当前帧算）。"""
+    """各列缺失统计 + 数值列的缺失时间段明细 + 重复时间戳计数（全部按当前帧算）。
+
+    这份响应里有两种缺失率，别把它们当同一个数（两处都随响应给出分母）：
+    - 每列的 `rate`：该列空格 ÷ 总行数，与第三步 stats_matrix 的 missingRate 同一分母；
+      数值列两边分子也一致（都是转成 float 之后的 NaN 个数），差别只在第四步还会扫到
+      第三步不让进的列——时间列按"解析不动就算缺"，类别列把空串也算缺。
+    - 顶层 `missingRate`：全部参与列的空格 ÷（行数 × 参与列数），是"整张表有多少格子是空的"。
+      第二步 overview 那个同名字段的分子只数原始数值列（类别列、时间列都不参与），
+      所以两个 missingRate 天生不相等，各自的分母与参与列都由本端点自己说明。
+    """
     n = int(frame.shape[0])
     col_stats_out = []
     segments: dict[str, list] = {}
@@ -553,6 +562,8 @@ def quality_snapshot(frame: pd.DataFrame, columns: list[dict], time_col: str | N
         "segmentCap": MAX_SEGMENTS_PER_COLUMN,
         "totalMissingCells": total_missing,
         "missingRate": (total_missing / cells * 100) if cells else 0.0,
+        # 分母随行携带：顶层这个率是"空格 ÷ 单元格总数"，与每列那个"空格 ÷ 总行数"不是一回事
+        "missingDenominator": cells,
         "duplicateRows": dup_rows, "duplicateGroups": dup_groups,
         "duplicateDetail": dup_detail, "duplicateDetailTruncated": dup_truncated,
         "duplicateGroupCap": MAX_DUP_GROUPS,

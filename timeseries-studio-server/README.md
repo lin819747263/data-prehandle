@@ -13,7 +13,7 @@
 | --- | --- |
 | 工作区：载入 / 分页取行 / 整列取数 / 总览统计 | 后端（`pyarrow` + `pandas`） |
 | 时间格式识别与渲染、单位换算、列运算、重命名/删列、重采样 | 后端，且可版本号重放 |
-| 统计矩阵、25 桶直方图、多列叠加曲线、首个完整行 | 后端，整表数完后只回笼统数字与抽稀后的点 |
+| 统计矩阵、25 桶直方图、多列叠加曲线（LTTB / 全量 / 极值 / 窗口均值四档）、首个完整行 | 后端，整表数完后只回笼统数字与降采样后的点 |
 | 缺失段诊断与填补、重复时间戳合并 | 后端（pandas + numpy，`services/quality.py`） |
 | 异常检测 3σ / IQR / 滑动窗口 MAD / 表达式 / 孤立森林 | 后端，`iforest_sklearn` 用 `scikit-learn.IsolationForest` |
 | 异常修复（截断 / 置空 / 生成掩码）与布尔掩码增删 | 后端，检测结果留在服务端，前端不回传行索引 |
@@ -43,10 +43,11 @@ python -m venv .venv
 
 **后端不在线时前端只读**：不再保留任何浏览器端的算法兜底实现，避免同一份数据出现两套结果。
 
-**迁移进度**：五期全部落地。第①~④步走服务端 —— 清洗与异常（②）、特征构建（③）、统计矩阵 / 直方图 /
-叠加曲线 / 导出（④）都在服务端的整帧上算，浏览器只拿到元数据与当前页窗口。
+**迁移进度**：五期全部落地。界面第①~⑤步的数据加工全部在服务端的整帧上做 —— 清洗与异常（期②）、
+特征构建（期③）、统计矩阵 / 直方图 / 叠加曲线 / 导出（期④），浏览器只拿到元数据与当前页窗口。
 `POST /api/ws/{id}/replace`（整表回传通道）**已删除**，浏览器再也无法用一份本地表覆盖服务端；
-`GET /columns` 保留但只服务"按时间戳对齐生成外生变量"这类必须要整列的操作，一次最多两三列。
+`GET /columns` 保留但**前端已经不用它**（外生变量改由服务端生成，见下文），留着它只为验收脚本要拿
+整列与独立实现逐位对拍。
 第⑤期把**撤销与会话**也搬到服务端：撤销/重做就是挪服务端游标（浏览器不再存 25 份深拷贝快照，
 `localStorage` 里那份整表会话已删），命令日志落盘、重启可重放，外生变量三条来源全部在服务端生成。
 至此浏览器侧不再保留任何一份"整表 + 快照"，也就没有第二套算法能算出不同的数。
@@ -67,14 +68,53 @@ python -m venv .venv
   钉进记录的私有 `replay` 字段：它不进 HTTP 响应、也不进 `meta.ops`，只在重放时回流给 handler。
   因此撤销掉"生成掩码"再重做，不需要重新检测也能得到逐格一致的结果
 - 检测索引是按某一颗帧算的，`restore` 之后一律作废（`anomaly=null`），界面据此把旧结果标成失效
+- **服务端现场取的值也要钉进日志**：命令记录里的 `params` 必须足以复现那一版。前端没给 seed 时 handler
+  自己挑一个、侧表没指定目标列时由表头推导出 `targets`，这些值若只活在响应里，重放就会得到另一列数据。
+  handler 用私有 `_pinParams` 把这类值回传，`apply()` 合并进 `record["params"]`（同样不进 HTTP 响应）。
+  `verify_phase5.py` 的 G 段是这条的负向对照：删掉那行合并，G2/G4 会立刻变红
+- **一次 HTTP 响应描述的是同一版数据**：每颗帧自带一把 `threading.RLock`（`Workspace.lock`），路由层的
+  `_ws_locked` 装饰器把整段请求（含读页窗口与 `meta`）套进这把锁 —— 早期一把进程级全局锁会让一颗帧跑
+  异常检测时另一颗帧翻页排队；不加锁则翻页会撞上正在执行的填补，拿到"帧已换、meta 还是旧的"那种两版
+  拼出来的数字。锁按 wsId 分：`verify_exit.py` 的 E2 用 `Barrier(2)` 证明两颗不同帧的重建是**同时**进行的
+- 重建同样是按 wsId 的锁 + 双检：并发挤中同一颗"只在磁盘上有日志"的帧时只重建一次（E1），
+  每个线程拿到的都是注册表里那一份（E3）；重建中途失败会把半成品从注册表摘掉，绝不留缺列的帧
+- **锁内必须交出"脱离帧的副本"**：FastAPI 是在端点函数返回**之后**才把 dict 序列化成 JSON 的，那时锁已经放了。
+  所以 `meta_view()` 返回的是 `deepcopy(self.meta)`（`source` 也单独 `dict()` 一份），`rows()` 现拼
+  array-of-arrays —— 若在锁内把活的 `meta` 引用交出去，另一个线程改帧时序列化就会读到半新半旧的列，
+  甚至撞上 `dict changed size during iteration`
 - 上限：同时 8 个工作区（LRU 淘汰）、单个工作区 500 万单元格、单次上传 64 MiB、单页 500 行
 - `GET /api/health` 的 `capabilities` / `limits` 就是这套契约，前端据此决定按钮是否可点
 
+### 错误码：三种失败必须长成三种样子
+
+`/api/ws/*` 的失败一律 4xx + 中文 `detail`，绝不返回半成品，也不把服务端内部异常洗成"没找到"：
+
+| 状态码 | 含义 | 例子 |
+| --- | --- | --- |
+| 400 | **请求写错了**，改调用方就好 | wsId 连形状都不合法（`is_workspace_id` 先拦，`no-such-ws` 不是"工作区不存在"）、列不存在、非数值列进统计接口、未知降采样档位 |
+| 404 | 这个 ID 合法但工作区确实没了 | 内存与磁盘日志都查不到（`_get` 回一句"既不在内存里、也没有命令日志…请回第一步重新载入数据"）；来源文件被删导致按日志重建时 `ValueError` 也算这一类 |
+| 422 | 请求合法但**这一版数据做不到** | handler 抛出的业务异常（`_guard` 的统一出口），Pydantic 的取值越界（`points` 超上限、`step > 5`） |
+
+`_brief()` 负责把异常文本压成一行：取首行、把 Windows/POSIX 路径替换成 `〈路径〉`、截到 200 字符。
+异常消息里常带绝对路径，直接透传给前端既难读又白送本机目录结构。
+
 ### 与前端口径的一致性
 
-- 列 key 规则、时间格式投票、采样频率（排序后正间隔的中位数）、派生列 4 位小数，均与
-  `../timeseries-studio/src/utils.js`、`store.js` 逐条对拍；中文列名会折叠成 `____`，
-  因为前端的 `safeKey` 就是这个规则（保留一致性而非"修正"它）
+- 列 key 规则：新列与改名后的列，**键就是用户写的那个名字**（`_set_col_key` 原样落进列头，只裁首尾空格、
+  拒绝空/超长/换行，撞名直接报「[x] 已存在，请更换名称」）。旧的 `safe_key` 转写规则（小写、非
+  `[a-z0-9_]` 换下划线）已删除 —— 两个中文表头会双双压成 `____`/`___` 互相覆盖，界面上的名字和真实键
+  也对不上。掩码列与外生变量列仍走 ASCII 变量名契约（`_MASK_KEY`），那是对外声明的变量名，要进导出
+  列头和公式，不在这条规则里
+- **时间列判定只有服务端一处**：按 `MIN_TIME_HIT_RATE`（命中率 ≥0.6）投票选出，前端只渲染后端回的那份
+  `meta.timeDetect`，不再自己数一遍（`store.js` 里不留第二套判定逻辑）。验收脚本 `verify_step2_time.py` 的
+  参照值是**纯 Python 手算**（str 切片 / 手算均值），不 import 服务层，避免自己和自己比
+- 采样频率（排序后正间隔的中位数，分钟、至少 1）也在服务端一次算完，前端那个 `detectSamplingMinutes`
+  已经删掉、只剩 `detectedFreqMinutes()` 读 `meta.freqMinutes`；派生列的 4 位小数同理。
+  **参照物变了，这一点要说清楚**：浏览器侧已经没有第二套算法可拍，所以这些口径现在对的是
+  「把迁移前那套浏览器实现**原样重写的独立 JS**」（`scripts/ref_phase4.mjs`，见期④）与
+  「界面导出的 Python 脚本单独跑出来的表」（见期②的跨语言自证），
+  而不是 `src/utils.js` 的活代码。`scripts/frontend_flow_node.mjs` 是另一回事——它复刻的是**请求序列**，
+  用来在没有浏览器时把界面会显示的数字打出来，不复计算法
 - 时间列内部一律存 `datetime64`，`timeFormat` 只管渲染。因此重复时间戳、频率识别不再依赖显示格式
   —— 这是相对旧浏览器实现的**行为修正**（旧代码比较的是渲染后的字符串）
 - `interpolate` 重采样为真正的线性插值。旧浏览器代码把它静默当成均值聚合 —— **行为修正**
@@ -88,8 +128,10 @@ python -m venv .venv
   再与 HTTP 返回逐格对拍（见下方"验证"）
 - 第四步（清洗与异常）的每个数字都在服务端算：缺失段由 `missing_runs` 扫描、4 位小数一律走
   `round4`（`Decimal` + `ROUND_HALF_UP`，与前端 `parseFloat(v.toFixed(4))` 同值）；3σ 用**总体**标准差（÷n）、
-  IQR 的分位数取 `sorted[int(n·q)]`、滑动 MAD 固定窗口 33 / min_periods 5 / k=4.0，三者与 `utils.js`
-  和独立 numpy 重算三方对拍（见下方"验证"）
+  IQR 的分位数取 `sorted[int(n·q)]`、滑动 MAD 固定窗口 33 / min_periods 5 / k=4.0。
+  这三种检测在 `src/utils.js` 里**已经没有活代码可拍**（浏览器不再自己判异常），所以证据换成两条独立的：
+  `verify_phase2.py` 里用 numpy/pandas **另行重算**（大表 3σ 点数、缺失格数），以及"界面导出的 Python 脚本
+  单独跑 `big40.csv`"与该工作区当前帧逐格比较（见下方"验证"）
 - 生成/删除掩码列只加列、不动既有数值（`_valueChange: False`）：它不该作废上一次的检测索引，
   也不该把曲线图的数值抖一下
 - 修复模式 `mask_only` 不改原值，`clip`/`nan_impute` 才改；`clip` 之后可能残留 ≤5e-5 的贴边差，
@@ -110,7 +152,19 @@ python -m venv .venv
 
 ## 接口
 
-- `GET /api/health` → `{ status, version, capabilities[], limits{workspaces,cellsPerWorkspace,maxPageRows,maxUploadBytes,featureColsPerOp,onehotLevels,featureWindow,uniqueValuesReported,holidayDays,holidayDates2024,seriesMaxPoints,histogramBins,sessionActionLog,sessionInlineArray,sessionBytes,sessionWorkspaces,workspaceLogBytes,exoColsPerOp,exoSideRows}, datasetDir, stateDir }`
+- `GET /api/health` → `{ status, version, capabilities[], exportCodecs{csv|xlsx|parquet|feather: null | 失败原因},
+  limits{…}, datasetDir, stateDir }`。`limits` 是**契约的单一来源**，前端该读它而不是各自抄一份数字，
+  现在的键（`app/main.py` 的 health 里逐个注释了用途）：
+  `workspaces`、`cellsPerWorkspace`、`maxPageRows`、`maxUploadBytes`、`mergeFiles`、`minTimeHitRate`、
+  `displayFormats`、`parseFormats`、`formatTokens`、`snapshotVersions`、`snapshotMaxBytes`、
+  `featureColsPerOp`、`onehotLevels`、`featureWindow`、`uniqueValuesReported`、
+  `seriesMaxPoints`、`seriesModes`、`seriesDefaultMode`、`seriesFullRawMaxValues`、`seriesSpans`、
+  `histogramBins`、`holidayDays`、`holidayDates2024`、`holidayPresetYears`、`maxHolidayDays`、
+  `sessionActionLog`、`sessionInlineArray`、`sessionBytes`、`sessionWorkspaces`、`workspaceLogBytes`、
+  `exoColsPerOp`、`exoSideRows`
+  - `capabilities` 里出现过、后来被删掉的通道（`replace`、`add-columns`、以及曾有的**孤儿** `POST /api/export`
+    ——它让浏览器把明细整份回传再编码，与「明细不出后端」这条主线冲突且前端从不调用，已连 `ExportRequest`
+    模型一起删除）不会以"留着备用"的名义回来：接口收敛由 `verify_phase4.py` 的 404 断言钉住
 - `GET /api/datasets` → `{ dir, count, items[{filename,name,ext,format,size,sizeText,modifiedAt,mtime}] }`，按修改时间倒序
 
 工作区：
@@ -141,10 +195,17 @@ python -m venv .venv
   与迁移前的浏览器实现逐格一致
 - `GET /api/ws/{id}/hist?col&bins` → 单列频次直方图，`bins` 缺省且上限都是 **25**（`limits.histogramBins`），
   返回桶边界、计数与均值/中位数所在桶
-- `GET /api/ws/{id}/series-multi?cols=a,b&mode=raw|extremes|mean&points` → 多列叠加曲线，共享一条时间轴。三种抽稀：
-  `raw`（等间隔跨步，首尾必留）、`extremes`（每列取极值包络点位，预算 `max(200, cap//列数)` 共享，
-  因此**不会抽掉任何一列的最大/最小值**）、`mean`（窗口均值，窗口 4 行，值保留 2 位小数）。
-  `points` 上限由 `limits.seriesMaxPoints = 6000` 声明，超出会被 clamp 而不是报错
+- `GET /api/ws/{id}/series-multi?cols=a,b&mode=lttb|raw|extremes|mean&points&span&offset` → 多列叠加曲线，
+  共享一条时间轴。**四档**（`limits.seriesModes` 就是这份表，`limits.seriesDefaultMode` 是默认档）：
+  `lttb`（默认，三角面积降采样，桶边界与叉积按 Steinarsson 定义实现，参照实现是 `scripts/lttb_ref.mjs`）、
+  `raw`（**全量**：窗口内每行都回，不抽点；行 × 列超过 `limits.seriesFullRawMaxValues = 600000` 格子就
+  报错而不是偷偷抽稀——抽了点，界面上写的「全量」就成了假话）、`extremes`（每列取桶内极值/缺失端点再取
+  并集，预算 `max(200, cap//列数)` 共享，因此**不会抽掉任何一列的最大/最小值**）、
+  `mean`（每 4 行窗口均值，窗口 > 500 行才生效，值保留 2 位小数）。
+  `points` 只约束降采样档（上限 `limits.seriesMaxPoints = 6000`，超出 clamp 不报错），`raw` 档不受它管
+- `span`（`all`/`year`/`month`/`week`/`day`，见 `limits.seriesSpans`）+ `offset` 由服务端**按真实时间列筛行**，
+  不是按行数估算：点数上限在窗口内重新分配，所以「看一天」拿到的是这一天自己的 3000 个点，
+  而不是整年 3000 个点里漏下的几颗；越界的 `offset` 贴到最近一端并如实回 `clamped`
 - `GET /api/ws/{id}/first-complete?cols&scan_rows` → 新增特征列行行有值的首个行号（长窗口特征开头必然为空，
   前端"首个完整行"按钮只拿一个行号，不再拉 5000 行回来自己扫）
 - `GET /api/ws/{id}/export?format=csv|xlsx|parquet|feather` → 宽表直出。时间列按 `timeFormat` 渲染后写出，
@@ -199,7 +260,9 @@ python -m venv .venv
 
 其他：
 
-- `POST /api/export`（JSON `{ format, columns[], rows[], filename }`）→ 附件字节流
+- 导出**只有** `GET /api/ws/{id}/export` 一条通道。曾有的 `POST /api/export`（JSON 传 `{columns, rows}` 让后端
+  编码附件）已删除：它是"明细出后端"的第二扇门，而前端从未调用过它，参数模型 `ExportRequest` 与
+  `exporter.build_export` 一并移除，`verify_phase4.py` 断言这条路径返回 404。
 
 ### 服务端历史与会话（第⑤期）
 
@@ -241,8 +304,9 @@ python -m venv .venv
   （`<stem>__<sha12><ext>`，同名不同内容各留一份），返回 `{ filename, sha, rows, sideTimeCol,
   columns[{from,key,label,numeric,time,needsName,reason}] }`。这条不产生任何命令日志
 - `POST /api/ws/{id}/op/exo-file { filename, sha, sideTimeCol, mode, toleranceMinutes?, targets? }` →
-  按时间戳对齐挂列。几十 MB 的侧表只上传一次；日志记文件名 + sha + 规格，重放时重新读那份文件，
-  内容被覆盖过就明确报错（`重放到版本 N 失败…内容已变化（命令里记录 sha …）`），不会静默换一列数据
+  按时间戳对齐挂列。几十 MB 的侧表只上传一次；日志记文件名 + sha + 规格，**没给 `targets` 时由表头推导出的
+  那一份也一并钉进日志**（同上一条的 `_pinParams`），重放时不再重新推导；文件内容被覆盖过就明确报错
+  （`重放到版本 N 失败…内容已变化（命令里记录 sha …）`），不会静默换一列数据
 - 对齐只有两种真实语义：`left` 精确匹配（未命中留空）、`nearest` 就近匹配（可选 `toleranceMinutes`）。
   界面上曾有第三项"内连接"，而浏览器旧实现里它与 `left` 一模一样（外生变量是往主表挂列，主表行数不由
   侧表决定），因此不提供这个假选项
@@ -265,20 +329,39 @@ python -m venv .venv
 
 # 期①验收：与 pd.read_csv 对拍数字 + 证明整表从未出现在响应里
 .venv/Scripts/python.exe scripts/verify_http.py
-# 期②验收：140 项，覆盖缺失段/填补/去重/五种检测/三种修复/掩码增删，以及游标式撤销与重做
+# 期②验收：169 项，覆盖缺失段/填补/去重/五种检测/三种修复/掩码增删，以及游标式撤销与重做
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_phase2.py
 # 期③验收：四个特征 Tab 的列集合/标签/取值顺序/上限拒绝/重复构建幂等 + 大表 big40 全程不吃整表
+#   ⚠ 这条现在是**红的**，而且是脚本自己陈旧、不是后端算错：na3 用例在 onehot→ordinal→target 连发之后
+#   再去 `rename-column weather_晴`，而独热列已被后两批换掉（"换掉上一批未再勾选的"是既定语义）。
+#   要改的是用例里那条操作的顺序或它所参照的浏览器流程，属于测试工程化那一轮，不该顺手改断言把它捂绿。
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_phase3.py
-# 期④验收：169 项。统计矩阵/直方图/三种抽稀曲线与「浏览器旧算法的 JS 重实现」逐格跨语言对拍，
-# 再加自洽不变量、与其他通道的交叉验证、首个完整行、四格式导出与二次载入、非数值列被 400 打回
+# 期④验收：183 项。统计矩阵/直方图/四种降采样曲线（raw 全量、extremes、mean、lttb）与
+# 「浏览器旧算法的 JS 重实现」逐格跨语言对拍，再加自洽不变量、与其他通道的交叉验证、首个完整行、
+# 四格式导出与二次载入、非数值列被 400 打回，以及已删通道（replace / add-columns / POST /api/export）的 404
 node --version >/dev/null 2>&1 || echo "期④需要 node 跑参考实现 scripts/ref_phase4.mjs"
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_phase4.py
 # 只跑某一节（parity|invariants|cross|first-complete|export|errors）
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_phase4.py --only=parity
-# 期⑤验收：50 项。自己起一个临时状态目录的后端，逐版回退比整表 CSV 指纹、
-# 审计链与服务端 ops[:游标] 跨语言三方对拍、会话存取与三条守卫、杀掉进程换端口重开再比指纹
+# 期⑤验收：57 项。自己起一个临时状态目录的后端，逐版回退比整表 CSV 指纹、
+# 审计链与服务端 ops[:游标] 跨语言三方对拍、会话存取与三条守卫、杀掉进程换端口重开再比指纹，
+# 外加 G 段：服务端现场取的参数（seed / 推导出的 targets）钉进日志后跨进程重放逐值一致 + 并发命令版本号不错位
 node --version >/dev/null 2>&1 || echo "期⑤需要 node 跑参考实现 scripts/ref_phase5.mjs"
 PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_phase5.py
+
+# —— 之后各轮修复的验收，脚本一律**自己起后端**（临时端口 + 临时 state/dataset 目录），
+#    不碰开发机上 8000 那台；只有下面两条要在 8000 已启动时才跑：
+#    verify_step2_time.py（时间列判定/自定义格式）与 verify_step3_downsample.py（LTTB 与全量档）。
+# 六项修复（92 项）：划分列 / 时间窗口 / 分组生成 / sin-cos 替换原列 / 节假日表可配置 + 逐版重建
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_six.py
+# 第一步多文件合并导入（37 项）：拼表与稳定升序在后端，坏输入 400，重启后按数据集目录重建
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_merge.py
+# 第⑥轮（64 项）：另存为数据集、撤销的帧缓存、失效粒度 + 并发重建（同一颗帧只重建一次、两颗帧并行）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_exit.py
+# 第二步③~⑦（84 项）：时间列按命中率判定、毫秒/自定义格式、末页页大小、重采样方向（需 8000）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_step2_time.py
+# 第三步降采样（47 项）：LTTB 与 scripts/lttb_ref.mjs 逐下标对拍、「全量」档一个点都不抽、超格子上限就报错（需 8000）
+PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_step3_downsample.py
 ```
 
 `verify_phase2.py` 里刻意包含"服务端数字 vs 独立 numpy/pandas 重算"的对拍（大表 3σ 点数、缺失格数），
@@ -296,10 +379,12 @@ PYTHONIOENCODING=utf-8 .venv/Scripts/python.exe scripts/verify_phase5.py
 （自己 `readFileSync` 解析 CSV，不用 pandas、不 import 服务端任何代码、也不走 HTTP），
 `scripts/verify_phase4.py` 再把它 printed 的 JSON 与真实接口的返回逐格比较 —— 覆盖 4 份数据
 （密布缺失的 `na3`、清洗后的 PV、中文带单位列名的 `machine`、11000×40 的 `big40`）× 2 个点数上限，
-统计矩阵、25 桶直方图与 raw/extremes/mean 三条抽稀曲线全部对拍。
+统计矩阵、25 桶直方图与 `raw`/`extremes`/`mean`/`lttb` **四条**降采样曲线全部对拍
+（`raw` 那一档参照实现按"每行都回"重算，与后端的「全量」语义同一件事；`lttb` 另有独立的
+定义级参照 `scripts/lttb_ref.mjs`，见 `verify_step3_downsample.py`）。
 比较规则与第五步同源：**浮点用相对容差 `1e-9`，计数/行号/桶边界精确相等** ——
 numpy 的成对求和与 JS 的顺序累加在 float 上必然有最后一位差别（实测最大相对偏差 3.7e-15），
-而"哪个点是极值""某一桶有几个值"不允许差一个。三条曲线的坐标值实测**完全相等**（偏差 0.0）。
+而"哪个点是极值""某一桶有几个值"不允许差一个。**四条**曲线的坐标值实测**完全相等**（偏差 0.0）。
 
 导出这一侧看的是字节而不是数字：`Content-Length` 必须等于真实收到的字节数，CSV 前 5 行必须与
 `GET /rows` 的同一页一致，xlsx 抽样 7 行逐格等于接口返回的列值，parquet/feather 再上传回后端后
@@ -326,23 +411,36 @@ xlsx 慢在 openpyxl 逐格写 XML，不是网络 —— 明细从头到尾没�
 
 ```
 app/
-  main.py                 FastAPI 实例、CORS、health / datasets / export
-  routers/workspace.py    工作区端点：命令式加工 + 分页窗口 + 版本重放
+  main.py                 FastAPI 实例、CORS、/api/health（能力 + limits 的唯一出处）、/api/datasets
+  routers/workspace.py    工作区端点：命令式加工 + 分页窗口 + 版本重放 + 错误映射（400/404/422）
   routers/session.py      GET/PUT/DELETE /api/session：逐个重建/核对会话引用的工作区 + 三条守卫
   schemas.py              Pydantic 请求模型与取值校验
-  services/workspace.py   DataFrame 注册表、ops 重放（含 replay 私有载荷）、时间格式、重采样
-  services/state_store.py 状态目录：命令日志落盘与重放重建（`workspaces/<wsId>.json`）+ 会话 JSON
+  services/workspace.py   DataFrame 注册表、ops 重放（含 replay 私有载荷与 `_pinParams`）、时间格式、重采样、按帧加锁
+  services/state_store.py 状态目录：命令日志落盘与重放重建（`workspaces/<wsId>.json`）+ 会话 JSON + wsId 形状校验
   services/quality.py     缺失段扫描与填补、重复时间戳合并、五种异常检测、三种修复、掩码
-  services/features.py    第五步四类特征：日历/滞后滚动/差分频域(逐行 DFT)/类别编码 + 2024 节假日表
+  services/features.py    第五步四类特征：日历/滞后滚动/差分频域(逐行 DFT)/类别编码 + 节假日表（按年预设）
   services/exo.py         外生变量三条来源：8 个预设模板生成器、表达式 AST 白名单求值、侧表按时间戳对齐
-  services/explore.py     第三步：整表统计矩阵、25 桶直方图、三种抽稀叠加曲线、首个完整行
-  services/exporter.py    DataFrame / 行数据 → 四种格式字节流
+  services/explore.py     第三步：整表统计矩阵、25 桶直方图、四档降采样叠加曲线（含 LTTB）、span 窗口与翻页、首个完整行
+  services/exporter.py    工作区帧 → 四种格式字节流（唯一入口，不再有"前端传行数据"那条）
   services/dataset_store.py 数据集目录：建目录/列举/读取/保存 + 文件名防护（侧表落 `dataset/_exo/`）
-scripts/                  smoke_workspace / make_big_csv / frontend_flow_node.mjs
-                          verify_http(期①) / verify_phase2(期②) / verify_phase3(期③) / verify_phase4(期④)
-                          / verify_phase5(期⑤)
-                          + ref_phase4.mjs（期④的浏览器旧算法 JS 参考实现，供跨语言对拍）
-                          + ref_phase5.mjs（期⑤的审计链游标投影 JS 参考实现，供三方对拍）
+scripts/
+  smoke_workspace.py          不起 HTTP，直接调服务层打印对拍数字
+  make_big_csv.py             生成 dataset/big40.csv（11000 × 40，注入 1404 个缺失）
+  make_step2_browser_fixtures.py  生成第二步浏览器复现用的样例
+  frontend_flow_node.mjs      浏览器端流程的 node 复刻（供跨语言对拍取参照值）
+  verify_http.py              期①：与 pd.read_csv 对拍 + 证明整表从未出现在响应里
+  verify_phase2.py            期②：缺失段/填补/去重/五种检测/三种修复/掩码/游标式撤销重做
+  verify_phase3.py            期③：四个特征 Tab 的列集合、标签、取值顺序、上限拒绝、重复构建幂等
+  verify_phase4.py            期④：统计矩阵/直方图/抽稀曲线跨语言对拍 + 自洽不变量 + 导出往返 + 错误面
+  verify_phase5.py            期⑤：逐版回退比整表指纹、审计链三方对拍、会话守卫、换进程重放、并发与参数钉死（G 段）
+  verify_six.py               六项修复：划分列 / 时间窗口 / 分组生成 / sin-cos 替换原列 / 节假日表可配置
+  verify_step2_time.py        第二步：时间列判定、毫秒与自定义格式、末页页大小、重采样方向
+  verify_step3_downsample.py  第三步：LTTB 与「全量不抽点」两条新语义（参照 scripts/lttb_ref.mjs）
+  verify_merge.py             第一步：多文件合并导入的行数/列并集/稳定升序与重启重建
+  verify_exit.py              第⑥轮：另存为数据集、撤销的帧缓存、失效粒度，外加并发重建（E 段）
+  ref_phase4.mjs              期④的浏览器旧算法 JS 参考实现
+  ref_phase5.mjs              期⑤的审计链游标投影 JS 参考实现
+  lttb_ref.mjs                LTTB 的独立 JS 定义实现
 dataset/                  数据集目录（首次运行自动创建，已 gitignore）
 fixtures/                 手工验证用样例数据（parquet/feather/csv 各一份，含注入尖峰与缺失）
 ```

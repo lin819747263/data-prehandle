@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import concurrent.futures as cf
 import hashlib
 import io
 import json
@@ -27,6 +28,7 @@ import subprocess
 import sys
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import uuid
 from pathlib import Path
@@ -520,6 +522,95 @@ def section_f() -> None:
     api("DELETE", f"/api/ws/{ws}")
 
 
+# ============================================================ G 现场取值的落盘闸门
+def log_ops(ws: str) -> list[dict]:
+    """直接读磁盘上那份命令日志：回执会骗人，要重放的参数只有这一份。"""
+    path = STATE_DIR / "workspaces" / f"{ws}.json"
+    if not path.exists():
+        raise SystemExit(f"命令日志没落盘：{path}")
+    return json.loads(path.read_text(encoding="utf-8")).get("ops") or []
+
+
+def column(ws: str, key: str) -> list:
+    got = api("GET", f"/api/ws/{ws}/columns?keys={urllib.parse.quote(key)}")
+    return got["columns"][key]
+
+
+def section_g() -> None:
+    print("\n== G 服务端现场取的参数（seed、侧表推导出的目标列）必须钉进日志 ==")
+    # handler 拿到的是 _execute 复制出来的 params，就地改回去是改不到日志的；旧写法就是这么
+    # 把 seed 留在 None 上——淘汰或重启后重放换一个 seed，界面上那一列整列换值。
+    created = api("POST", "/api/ws/preset", {"key": "load"})
+    ws = created["meta"]["wsId"]
+    seed_src = created["meta"]["source"].get("seed")
+    check("G1 主表预设不传 seed 时，现场挑的那个会记进来源（否则这颗帧再也拼不回来）",
+          isinstance(seed_src, int) and seed_src >= 0, {"seed": seed_src})
+
+    # 用 cloud_cover：load 预设自带的列里没有它，换个预设名就会被撞成「列已存在」
+    r = op(ws, "exo-preset", {"presetKey": "cloud_cover"})
+    ops = log_ops(ws)
+    pinned = (ops[-1].get("params") or {}).get("seed")
+    check("G2 预设外生变量不传 seed：回执里有 seed，且日志里就是同一个",
+          isinstance(r["seed"], int) and pinned == r["seed"],
+          {"回执": r["seed"], "日志": pinned, "kind": ops[-1]["kind"]})
+    inspect = inspect_side("phase5_seed.csv", side_table_bytes(
+        "phase5_seed.csv",
+        [["2024-06-01 00:00:00", 0.5], ["2024-06-01 5:00:00", 1.5], ["2024-06-01 11:00:00", 2.5]]))
+    rf = op(ws, "exo-file", {"filename": inspect["filename"], "sha": inspect["sha"],
+                             "sideTimeCol": inspect["sideTimeCol"], "mode": "nearest",
+                             "toleranceMinutes": 90, "targets": []})
+    tf = (log_ops(ws)[-1].get("params") or {}).get("targets")
+    check("G3 侧表不指定目标列名时，推导出的 targets 也钉进日志（重放不再重新推导）",
+          isinstance(tf, list) and len(tf) == rf["count"]
+          and [t.get("from") for t in tf] == [t["from"] for t in rf["targets"]],
+          {"日志": tf, "回执": rf["targets"]})
+    # 重启前的基线要取在**三条命令都执行完**之后：早一步取就少一列 rain_mm，
+    # 比对会拿「第 2 版的整表」去对「第 3 版的整表」，报出一个不存在的不一致
+    hum_before, digest_before = column(ws, "cloud_cover"), csv_digest(ws)[0]
+    keys_before = [c["key"] for c in api("GET", f"/api/ws/{ws}")["columns"]]
+
+    port = int(BASE.rsplit(":", 1)[1])
+    kill_backend()
+    spawn_backend(port)          # 同一份 state / dataset 目录，只换进程
+    api("GET", f"/api/ws/{ws}")  # 第一次访问按日志重建
+    keys_after = [c["key"] for c in api("GET", f"/api/ws/{ws}")["columns"]]
+    hum_after, digest_after = column(ws, "cloud_cover"), csv_digest(ws)[0]
+    same = len(hum_before) == len(hum_after) and all(
+        (a is None and b is None) or (a is not None and b is not None and abs(float(a) - float(b)) < 1e-12)
+        for a, b in zip(hum_before, hum_after))
+    check("G4 换一个进程重放之后：那一列逐值不变、整表指纹不变（seed 真的可复现了）",
+          same and digest_after == digest_before,
+          {"逐值一致": same, "行数": len(hum_after), "列序变没变": keys_before != keys_after,
+           "整表": f"{digest_before} → {digest_after}",
+           **({} if keys_before == keys_after else {"前列": keys_before, "后列": keys_after})})
+    api("DELETE", f"/api/ws/{ws}")
+
+    # ---- 同一颗帧上的并发：写要串行，读不能被写踩到 ----
+    ws2 = api("POST", "/api/ws/preset", {"key": "pv", "seed": 9001})["meta"]["wsId"]
+    N = 8
+    with cf.ThreadPoolExecutor(max_workers=N + 4) as pool:
+        writes = [pool.submit(status_of, "POST", f"/api/ws/{ws2}/op/convert-unit",
+                              {"key": "temperature", "factor": 1.0, "offset": 0.0, "newUnit": "°C"})
+                  for _ in range(N)]
+        reads = [pool.submit(status_of, "GET", f"/api/ws/{ws2}/overview") for _ in range(6)]
+        read_cur = [pool.submit(status_of, "GET", f"/api/ws/{ws2}/rows?offset=0&limit=20")
+                    for _ in range(6)]
+        wcode = [f.result()[0] for f in writes]
+        rcode = [f.result()[0] for f in reads + read_cur]
+    ver = api("GET", f"/api/ws/{ws2}")
+    check("G5 同一帧并发执行 8 条命令：条条成功，版本号恰好是 1~8（没有互相覆盖）",
+          all(c < 400 for c in wcode) and ver["opsTotal"] == N and ver["version"] == N,
+          {"写状态码": sorted(set(wcode)), "opsTotal": ver["opsTotal"], "version": ver["version"]})
+    check("G6 写进行中的整表读取全部 2xx：读端锁跟着这次改造一起生效了",
+          all(c < 500 for c in rcode), sorted(set(rcode)))
+    one = api("POST", f"/api/ws/{ws2}/restore?offset=0&limit=5", {"version": 4})
+    back = api("POST", f"/api/ws/{ws2}/restore?offset=0&limit=5", {"version": N})
+    check("G7 并发之后撤销/重做仍按这一串日志重放（回到第 4 版再回第 8 版）",
+          one["meta"]["version"] == 4 and back["meta"]["version"] == N,
+          {"撤销": one["meta"]["version"], "重做": back["meta"]["version"]})
+    api("DELETE", f"/api/ws/{ws2}")
+
+
 def main() -> int:
     t0 = time.time()
     print(f"状态目录：{STATE_DIR}\n数据集目录：{DATA_DIR}")
@@ -536,6 +627,7 @@ def main() -> int:
         section_d(ws)
         section_e(ws)
         section_f()
+        section_g()
     finally:
         kill_backend()
     print(f"\n{'=' * 62}\n{'全部通过' if not FAILURES else '失败项：' + ', '.join(FAILURES)}"

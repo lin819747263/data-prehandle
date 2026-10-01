@@ -573,7 +573,10 @@ def section_errors():
         ("first-complete cols 为空", f"/api/ws/{ws}/first-complete?cols=", 400),
         ("export 不支持的格式", f"/api/ws/{ws}/export?format=json", 422),
         ("export 缺 format 参数时默认 csv", "/api/ws/" + ws + "/export", 200),
-        ("工作区不存在", "/api/ws/no-such-ws/stats", 404),
+        ("工作区不存在（ID 形状合法、日志也没有）", "/api/ws/deadbeef0000/stats", 404),
+        # ID 连形状都不合法（含连字符、非十六进制）属于「请求写错了」，给 400 而不是 404：
+        # 404 会让界面以为"这个工作区被关掉了"，而真实原因是那条 URL 根本不该发出来。
+        ("非法 ID → 400", "/api/ws/no-such-ws/stats", 400),
         ("整表回传通道已删除", f"/api/ws/{ws}/replace", 404),
         ("类别列不能进统计矩阵", f"/api/ws/{ws}/stats?cols=weather", 400),
         ("时间列不能画叠加曲线", f"/api/ws/{ws}/series-multi?cols=timestamp", 400),
@@ -593,6 +596,13 @@ def section_errors():
           api("GET", f"/api/ws/{ws}/series-multi?cols={urllib.parse.quote(fkey)}&mode=raw&points=100")["points"] > 0)
     st, pl, _ = call("POST", f"/api/ws/{ws}/replace", {"columns": ["a"], "rows": [[1]]})
     check("POST /replace 也已删除（浏览器再不能整表覆盖服务端）", st == 404, st)
+    # 另外两条已拆除的通道同样要有人守着，否则哪天顺手加回来不会有任何测试变红：
+    # add-columns 是「前端算好一列再回传」，/api/export 是「前端把明细整份交给后端编码」——
+    # 两者都与「明细不出后端」这条主线冲突，而前端从未调用过后者（孤儿接口）。
+    st, pl, _ = call("POST", f"/api/ws/{ws}/op/add-columns", {"columns": []})
+    check("POST /op/add-columns 也已删除（外生变量只能在服务端生成）", st == 404, st)
+    st, pl, _ = call("POST", "/api/export", {"format": "csv", "columns": ["a"], "rows": [[1]], "filename": "x"})
+    check("POST /api/export（JSON 明细回传）已删除，导出只走 /api/ws/{id}/export", st == 404, st)
     st, pl, _ = call("DELETE", f"/api/ws/{ws}")
     check("关闭工作区后一切入口都 404", st in (200, 204) and
           call("GET", f"/api/ws/{ws}/stats")[0] == 404)

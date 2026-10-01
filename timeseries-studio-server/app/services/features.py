@@ -135,9 +135,11 @@ def round_half_up(values, nd: int) -> np.ndarray:
     base = np.sign(arr) * np.floor(ay + 0.5) / scale
     base = np.where(np.isnan(arr), np.nan, base) + 0.0     # -0.0 → 0.0，否则导出会写成 "-0"
     finite = np.isfinite(ay)
-    # np.spacing(NaN) 会刷 RuntimeWarning，先替成 1.0 再取间距（NaN 格子随后被 finite 掩掉）
-    step = np.spacing(np.where(finite, np.maximum(ay, 1.0), 1.0))
-    near = finite & (np.abs((ay - np.floor(ay)) - 0.5) <= 8.0 * step)
+    # 非有限格子（NaN/±inf）先替成 1.0 再取间距与小数位：np.spacing(NaN) 和 inf-inf 都会
+    # 刷 RuntimeWarning，而这些格子随后一律被 finite 掩掉，替身值进不了结果。
+    safe = np.where(finite, ay, 1.0)
+    step = np.spacing(np.maximum(safe, 1.0))
+    near = finite & (np.abs((safe - np.floor(safe)) - 0.5) <= 8.0 * step)
     if near.any():
         flat = arr.ravel()
         idx = np.flatnonzero(near.ravel())
@@ -559,12 +561,19 @@ def unique_in_order(series: pd.Series) -> list:
 
 
 def build_cat(frame: pd.DataFrame, cols: list[str], method: str,
-              target_col: str | None) -> tuple[dict[str, np.ndarray], list[tuple[str, str]]]:
+              target_col: str | None,
+              levels: dict[str, list] | None = None) -> tuple[dict[str, np.ndarray], list[tuple[str, str]]]:
+    """levels：调用方已经算好的取值顺序（见 unique_in_order 的说明）。传进来就复用，
+    不传才自己扫一遍——独热的列名、序数的编号、上限校验必须是同一个顺序，
+    两边各扫一次只是把同一列走两遍。"""
     out: dict[str, np.ndarray] = {}
     items: list[tuple[str, str]] = []
     for cat in cols:
         s = frame[cat]
-        uniq = unique_in_order(s)
+        if levels is not None and cat in levels:
+            uniq = levels[cat]
+        else:
+            uniq = unique_in_order(s)
         if method == "onehot":
             for v in uniq:
                 key = f"{cat}_{cat_value_str(v)}"

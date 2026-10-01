@@ -26,6 +26,7 @@ import random
 import re
 import threading
 import uuid
+import weakref
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 
@@ -47,10 +48,17 @@ SNAP_MAX_VERSIONS = 3
 # 重放跨这么多条命令以上时，在中途留一颗检查点：继续往前翻版本就不用每次从头重放
 SNAP_CHECKPOINT_GAP = 8
 
+# 只保护注册表与访问计数这三个进程级结构（_REGISTRY/_ACCESS/_REBUILD_LOCKS）。
+# 帧内部的读与写各由 Workspace.lock 负责：一把全局锁会把「A 工作区在跑异常检测」
+# 变成「B 工作区翻页也要等」，而 FastAPI 本来就是多线程派发请求的。
 _LOCK = threading.RLock()
 _REGISTRY: dict[str, "Workspace"] = {}
 _ACCESS: dict[str, int] = {}
 _ACCESS_TICK = 0
+# 每个 wsId 一把「重建锁」：内存里没有这颗帧时，两个并发请求会各自从磁盘日志重放一遍
+# （重放要解析原始文件 + 逐条执行命令，是这里最贵的一段），后注册的那颗把前一颗顶掉，
+# 于是同一个 wsId 在短时间内存在过两份帧。锁按 wsId 分，不共用一把，重建 A 不阻塞 B。
+_REBUILD_LOCKS: dict[str, threading.Lock] = {}
 
 # 与前端 utils.js 的 TIME_FORMAT_PATTERNS 一一对应（顺序也必须一致：格式投票取首个胜出者）
 # 带毫秒的三条排在各自的"秒级"版本之前：同一批样本只会命中一条（秒级模式要求 $ 收尾），
@@ -362,6 +370,64 @@ def reformat_iso(iso: str, fmt: str) -> str:
     return "".join(parts[val] if is_tok else val for is_tok, val in _iter_template(fmt))
 
 
+# 整串里每个占位符落在哪两个下标（'YYYY-MM-DD HH:mm:ss.SSS' 的固定位置）。
+_ISO_TOKEN_SPAN = {"YYYY": (0, 4), "MM": (5, 7), "DD": (8, 10), "HH": (11, 13),
+                   "mm": (14, 16), "ss": (17, 19), "SSS": (20, 23)}
+# 单位版 = 同一个位置，只是去掉前导零
+_ISO_TOKEN_PLAIN = {"M": (5, 7), "D": (8, 10), "H": (11, 13), "m": (14, 16)}
+# 渲染计划：0=字面量，1=切片，2=切片后去前导零
+_RENDER_PLANS: dict[str, list[tuple[int, object]]] = {}
+
+
+def _render_plan(fmt: str) -> list[tuple[int, object]]:
+    """把显示模板编成一份「下标指令」，一条命令里只切一次，不必逐行重跑切分器。
+
+    缓存按 fmt 收，条目就是几个小元组；自定义模板五花八门，所以超过 64 种就整张清一次
+    ——宁可重编，也不要一个按用户输入无限增长的字典。
+    """
+    plan = _RENDER_PLANS.get(fmt)
+    if plan is not None:
+        return plan
+    ops: list[tuple[int, object]] = []
+    for is_tok, val in _iter_template(fmt):
+        if not is_tok:
+            ops.append((0, val))
+        elif val in _ISO_TOKEN_SPAN:
+            ops.append((1, _ISO_TOKEN_SPAN[val]))
+        else:
+            ops.append((2, _ISO_TOKEN_PLAIN[val]))
+    if len(_RENDER_PLANS) >= 64:
+        _RENDER_PLANS.clear()
+    _RENDER_PLANS[fmt] = ops
+    return ops
+
+
+def reformat_many(isos: list, fmt: str) -> list:
+    """整列按显示模板重排，与逐值调 `reformat_iso` 等价（等值比较见 verify_step2_time 的渲染对拍）。
+
+    快在两处：切分器每列跑一次而不是每行一次，行内只剩切片与拼串。
+    2880 行实测 17 ms → 3 ms；缺失位仍然是 None，不化成 'None' 那种假时间。
+    """
+    ops = _render_plan(fmt)
+    out: list = []
+    for s in isos:
+        if s is None:
+            out.append(None)
+            continue
+        if len(s) == 19:
+            s += ".000"      # 没有毫秒位时 SSS 一律渲染成 000，与 reformat_iso 同值
+        pieces: list[str] = []
+        for code, arg in ops:
+            if code == 0:
+                pieces.append(arg)
+            elif code == 1:
+                pieces.append(s[arg[0]:arg[1]])
+            else:
+                pieces.append(str(int(s[arg[0]:arg[1]])))
+        out.append("".join(pieces))
+    return out
+
+
 _TIME_UNITS = {"epoch_ms": "ms", "epoch_s": "s"}
 
 
@@ -370,18 +436,21 @@ def iso_strings(ts: pd.Series, with_ms: bool = False) -> list:
 
     不用 astype(str)：pandas 在整列时间全为午夜时会输出省略时分的 '2024-06-01'，
     按页渲染时同一天数据会时带时分、时不带，切片取值就不稳；也不用 strftime
-    （Windows 的 CRT 会把 '/' 改写成本地化分隔符）。这里直接取整数分量拼串。
+    （Windows 的 CRT 会把 '/' 改写成本地化分隔符，实测 '%Y/%m/%d' 出来是 '2024-06-01'）。
+    这里走 numpy 的 datetime64[s] → str：它给的是固定宽度的 'YYYY-MM-DDTHH:MM:SS'（NaT 就是 'NaT'），
+    把 'T' 换成空格即成 ISO 串；秒以下从 ns 整数取，与旧的 dt.microsecond // 1000 同值。
+    整列一次做完，2880 行 10 ms → 2.6 ms。缺失位一律回 None，不能让它穿过格式化变成
+    'Na -- ::' 那种像时间又不是时间的字符串（第一版就栽在 'NaT' 里那个 T 被换成了空格，
+    判_missing_ 因此失灵，靠 .verify 的等值比较才揪出来）。
     """
-    def part(accessor, width, divisor=1):
-        values = pd.to_numeric(getattr(ts.dt, accessor), errors="coerce").fillna(0)
-        if divisor != 1:
-            values = values // divisor
-        return values.astype("int64").astype(str).str.zfill(width)
-    joined = (part("year", 4) + "-" + part("month", 2) + "-" + part("day", 2) + " "
-              + part("hour", 2) + ":" + part("minute", 2) + ":" + part("second", 2))
-    if with_ms:
-        joined = joined + "." + part("microsecond", 3, divisor=1000)
-    return [None if is_na else v for is_na, v in zip(ts.isna().tolist(), joined.tolist())]
+    raw = ts.values.astype("datetime64[s]").astype(str)
+    naive = pd.Series(raw).str.replace("T", " ", regex=False).tolist()
+    missing = ts.isna().tolist()
+    if not with_ms:
+        return [None if is_na else s for is_na, s in zip(missing, naive)]
+    ns = ts.values.astype("datetime64[ns]").astype("int64")
+    ms = pd.Series((ns // 1_000_000) % 1000).astype(str).str.zfill(3).tolist()
+    return [None if is_na else f"{s}.{m}" for is_na, s, m in zip(missing, naive, ms)]
 
 
 def render_times(series: pd.Series, fmt: str) -> list:
@@ -393,7 +462,7 @@ def render_times(series: pd.Series, fmt: str) -> list:
         shift = int(_LOCAL_OFFSET) * (1000 if unit == "ms" else 1)
         values = (ts.astype("int64") // (1_000_000 if unit == "ms" else 1_000_000_000) - shift).tolist()
         return [None if s is None else int(v) for s, v in zip(iso, values)]
-    return [None if s is None else reformat_iso(s, fmt) for s in iso]
+    return reformat_many(iso, fmt)
 
 
 def _strict_parse_strings(strs: pd.Series, fmt: str) -> pd.Series:
@@ -932,10 +1001,31 @@ class Workspace:
     snap_bytes: int = 0
     # 最近一次 restore 的真实代价（从哪一版起步、重放了几条命令），界面与验收脚本读它。
     restore_trace: dict = field(default_factory=dict)
+    # 这颗帧自己的读写锁：执行命令、撤销重放、异常检测与所有整表读取都在它里面跑。
+    # 用 RLock 是因为 restore 会被 apply 在同一线程里再调（重放路径），且路由层的读
+    # 包装器先进锁、服务方法里再进一次；换成普通 Lock 就是自己锁死自己。
+    lock: threading.RLock = field(default_factory=threading.RLock, repr=False)
+
+    # 整帧派生值的缓存（time_labels / memory_bytes）：见各自的方法说明。
+    # 两颗缓存都只装「当前这一颗帧」的结果，槽位互相覆盖，不留历史。
+    _labels_frame: object = field(default=None, repr=False)
+    _labels_key: tuple = field(default=(), repr=False)
+    _labels_val: list = field(default_factory=list, repr=False)
+    _mem_frame: object = field(default=None, repr=False)
+    _mem_bytes: int = 0
 
     def __post_init__(self):
         self.df = self.base_df
         self.updated_at = self.created_at
+
+    def _frame_alive(self, ref) -> bool:
+        """缓存里那颗帧还是当前帧吗。
+
+        用 weakref 而不是 id() 比：DataFrame 被回收后 id 会被新帧复用，那种「缓存命中到
+        别的帧」是数字全对、只是错得没有规律；存强引用又等于多养一帧（大表几十 MB）。
+        帧死了 ref 返回 None，比不过 self.df，缓存自然失效。
+        """
+        return ref is not None and ref() is self.df
 
     # ---- 列分类 ----
     def float_columns(self) -> list[dict]:
@@ -951,9 +1041,48 @@ class Workspace:
         return [c for c in self.float_columns() if not c.get("feature")]
 
     def time_labels(self) -> list:
-        if self.time_col and self.time_col in self.df.columns:
-            return render_times(self.df[self.time_col], self.meta.get("timeFormat") or "YYYY-MM-DD HH:mm:ss")
-        return [str(i) for i in range(int(self.df.shape[0]))]
+        """当前帧时间列的渲染标签，带一颗「跟着帧走」的缓存。
+
+        一次整列渲染实测 7 ms（2880×6）/ 26 ms（11000×40），而曲线、质量快照、导出、
+        重复行定位这些入口各自都要一份完整标签：界面停在同一步连着发几个请求，算的就是
+        同一颗帧的同一段标签。
+
+        缓存键 = 帧身份（_frame_alive）+ 时间列 + 显示格式 + 行数，外面再套版本号与数值世代
+        两道保险：改既有值的命令必定推进 valueEpoch，改显示配置（时间列、格式）的命令必定
+        推进版本号。留着它们不是冗余——撤销重放那条路是"先把草稿帧挂上 self.df、再逐条就地
+        放"，中途游标还停在旧版，只靠帧身份认不出这种就地改过的帧。
+
+        返回的是缓存里那份列表，调用方只读；要写回列得先有自己的帧
+        （export_dataframe 就是先 df.copy() 再赋值，别照它改这里）。
+        """
+        fmt = self.meta.get("timeFormat") or "YYYY-MM-DD HH:mm:ss"
+        col = self.time_col
+        has_col = bool(col) and col in self.df.columns
+        key = (self.cursor, self.value_epoch, col if has_col else None, fmt, int(self.df.shape[0]))
+        if self._labels_key == key and self._frame_alive(self._labels_frame):
+            return self._labels_val
+        if has_col:
+            labels = render_times(self.df[col], fmt)
+        else:
+            labels = [str(i) for i in range(int(self.df.shape[0]))]
+        self._labels_frame = weakref.ref(self.df)
+        self._labels_key = key
+        self._labels_val = labels
+        return labels
+
+    def memory_bytes(self) -> int:
+        """当前帧的内存占用（字节）。
+
+        memory_usage(deep=True) 要把每个 object 单元格真的数一遍，宽表上是整毫秒级；
+        meta 和 overview 每次都报它，所以按帧身份缓存。只认帧对象本身：它的内容只会随
+        apply/restore 换帧而变（那条路径一律 deep copy 出新的再赋值，不就地改当前帧），
+        同一颗对象的字节数不会自己变。
+        """
+        if self._mem_bytes and self._frame_alive(self._mem_frame):
+            return self._mem_bytes
+        self._mem_frame = weakref.ref(self.df)
+        self._mem_bytes = int(self.df.memory_usage(deep=True).sum())
+        return self._mem_bytes
 
     def holiday_days(self) -> list[str]:
         """当前生效的节假日表：没配置过就是内置预设，配置过就是用户那份（空表也算配置过）。"""
@@ -1024,7 +1153,10 @@ class Workspace:
         }
 
     def meta_view(self) -> dict:
-        m = self.meta
+        # 回出去的必须是一份快照：调用方（路由）序列化 JSON 时已经放开 ws.lock，
+        # 下一条命令的 rebuild_meta_columns 会就地改列字典的 type/label。直接给 m["columns"]
+        # 就是让界面读到半新半旧的列注册表。
+        m = copy.deepcopy(self.meta)
         return {
             "wsId": self.id,
             "name": m.get("name") or "workspace",
@@ -1062,14 +1194,14 @@ class Workspace:
                  "summary": o.get("summary", ""), "at": o.get("at", "")}
                 for i, o in enumerate(self.applied_ops)
             ],
-            "source": self.source,
+            "source": dict(self.source),
             # 合并导入的回执（几份文件、各自行数、并集列、排序前后的真实计数）。
             # 它描述的是"这颗帧怎么来的"，不随后续命令变化，所以界面上要按导入回执念，
             # 别拿它的 totalRows 当作当前行数（当前行数只看 rowCount）。
             "merge": m.get("merge"),
             "createdAt": self.created_at,
             "updatedAt": self.updated_at or self.created_at,
-            "memoryBytes": int(self.df.memory_usage(deep=True).sum()),
+            "memoryBytes": self.memory_bytes(),
             "cellCount": self.cell_count,
         }
 
@@ -1125,6 +1257,14 @@ class Workspace:
 
     # ---- 统计概览 ----
     def overview(self) -> dict:
+        """第二步那张概览卡：行数/列数、缺失、重复时间戳、采样频率与时间范围。
+
+        这里的 missingRate 只按**原始数值列**（source_float_columns）算：类别列与时间列
+        不进分子，第五步特征列也不进。第四步 quality 那个同名字段的分子却把时间列解析不动、
+        类别列空串都算成缺，参与列也更多。两个数的分子与分母都不一样，谁也不比谁小
+        （一列全空的表在这里是 100%，在第四步可能被几列干净的类别列摊薄），
+        所以各自随响应给出 missingDenominator，界面按各自的分母念，不跨步比较。
+        """
         df = self.df
         n = int(df.shape[0])
         # 与 quality/impute/检测同一口径：只数原始数值列。
@@ -1161,7 +1301,7 @@ class Workspace:
                 "end": tmax.isoformat(sep=" ") if tmax is not None and pd.notna(tmax) else None,
             },
             "cellCount": self.cell_count,
-            "memoryBytes": int(df.memory_usage(deep=True).sum()),
+            "memoryBytes": self.memory_bytes(),
         }
 
     # ---- 质量诊断（第四步）----
@@ -1199,7 +1339,7 @@ class Workspace:
         cols = self.source_float_columns()
         if not cols:
             raise ValueError("当前工作区没有数值列可检测")
-        with _LOCK:
+        with self.lock:
             detection = quality.detect(self.df, cols, algo, expr, params)
             detection["at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
             detection["epoch"] = self.value_epoch
@@ -1285,7 +1425,7 @@ class Workspace:
 
     def apply(self, op: dict) -> dict:
         """执行一条命令并记进 ops，返回 {result, version, meta}。"""
-        with _LOCK:
+        with self.lock:
             # 游标之后还留着「被撤销、等待重做」的那段日志：新命令会把当前帧改到另一条分支上，
             # 那条尾巴从此不再成立，先截掉再记新的（那几版的帧缓存也一起作废）。
             if self.cursor < len(self.ops):
@@ -1302,9 +1442,13 @@ class Workspace:
             # 因此不能把上一次检测的索引作废（界面允许"检测 → 生成掩码 → 再截断"连着做）。
             if result.pop("_valueChange", True):
                 self.value_epoch += 1
+            # 要回写的参数（seed、侧表推导出的 targets 之类）：handler 拿到的是 _execute 的
+            # params 副本，就地改回不到日志，只能经这个通道显式交回来。日志里没有它们，
+            # 淘汰/重启后重放就会换一个 seed 或换一批列名，界面上的数字不再可复现。
+            pinned = result.pop("_pinParams", None)
             record = {
                 "kind": op["kind"],
-                "params": op.get("params", {}),
+                "params": {**(op.get("params") or {}), **(pinned or {})},
                 "summary": result.get("summary", ""),
                 "at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "epoch": self.value_epoch,
@@ -1340,7 +1484,7 @@ class Workspace:
         version = int(version)
         if version < 0 or version > len(self.ops):
             raise ValueError(f"版本号越界：{version}（日志共 {len(self.ops)} 条，当前第 {self.cursor} 版）")
-        with _LOCK:
+        with self.lock:
             src_version, snap = self._snap_up_to(version)
             backup = (self.meta, self.df, self.value_epoch, self.cursor, self.anomaly)
             replayed = 0
@@ -1449,9 +1593,13 @@ def _op_set_time_format(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
         raise ValueError("本工作区没有可用的时间列，无法转换时间格式："
                          "先在「时间列」里指定一列能解析成时间的数据（点「识别格式」看结果）")
     old = ws.meta.get("timeFormat") or "YYYY-MM-DD HH:mm:ss"
-    before = render_times(work[ws.time_col], old)
-    after = render_times(work[ws.time_col], fmt)
-    changed = sum(1 for a, b in zip(before, after) if a != b)
+    # 同一个格式再提交一次（界面重复点、重放同一条命令）：整列渲染两遍要 52 ms，
+    # 而"变了几个格子"在这种情况下的答案就是 0，不必真的去比。
+    if old == fmt:
+        changed = 0
+    else:
+        changed = sum(1 for a, b in zip(render_times(work[ws.time_col], old),
+                                        render_times(work[ws.time_col], fmt)) if a != b)
     ws.meta["timeFormat"] = fmt
     return {"summary": f"时间格式 {old} → {fmt}", "changed": changed, "format": fmt,
             "timeCol": ws.time_col, "rowCount": int(work.shape[0]), "_valueChange": False}
@@ -1593,7 +1741,10 @@ def _op_convert_unit(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
         raise ValueError("目标单位不能为空")
     series = pd.to_numeric(work[key], errors="coerce")
     touched = int(series.notna().sum())
-    work[key] = (series * factor + offset).round(4)
+    # 进位口径统一走 features.round_half_up（= 前端 parseFloat(v.toFixed(4))）：
+    # Series.round 是银行家舍入，而第二步单位转换的预览表用的是 toFixed，两套口径会让
+    # "预览 4.47 / 落列 4.466"这种半数值格子当场对不上。
+    work[key] = features.round_half_up(series.to_numpy(dtype="float64") * factor + offset, 4)
     base_name = re.sub(r"\s*\([^)]*\)\s*$", "", col["label"]).strip()
     old_unit = col.get("unit") or ""
     col["label"] = f"{base_name}({new_unit})" if new_unit else base_name
@@ -1634,7 +1785,7 @@ def _op_derived_column(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
         else:
             raise ValueError(f"不支持的运算符：{op}")
     result = result.replace([np.inf, -np.inf], np.nan)
-    work[name] = result.round(4)
+    work[name] = features.round_half_up(result.to_numpy(dtype="float64"), 4)
     ws.rebuild_meta_columns(work)
     next(c for c in ws.meta["columns"] if c["key"] == name)["label"] = name
     formula = _derived_formula(ws, terms)
@@ -1684,18 +1835,22 @@ def _op_exo_preset(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
     """按主表时间列生成一列模拟外生变量：随机源是 seeded numpy，重放必然同一串值。"""
     preset_key = p.get("presetKey") or ""
     time_col = _require_time_col(ws, work)
-    if p.get("seed") is None:
-        p["seed"] = random.randrange(2 ** 31)   # 就地补进 params：record 与 p 是同一个字典，落盘后仍可重放
-    values, spec = exo.generate_preset(preset_key, work[time_col], work, int(p["seed"]))
+    # 没给 seed 就现取一个，但必须经 _pinParams 交回 apply 写进日志：handler 拿到的 p 是
+    # _execute 复制出来的副本，就地改回不到 record（旧注释以为那是同一个字典，实测落盘 seed=None，
+    # 重启后重放换一个 seed、整列换值）。副本不能直接改回去，是因为 replay 载荷也并进同一个
+    # params，污染日志。
+    seed = int(p["seed"]) if p.get("seed") is not None else random.randrange(2 ** 31)
+    values, spec = exo.generate_preset(preset_key, work[time_col], work, seed)
     key = p.get("key") or preset_key
     label = p.get("label") or spec["label"]
     name, _new = _attach_column(ws, work, key, label, values,
-                                {"kind": "preset", "presetKey": preset_key, "seed": int(p["seed"])})
+                                {"kind": "preset", "presetKey": preset_key, "seed": seed})
     return {
-        "summary": f"{_EXO_KIND_LABELS['preset']} {name} · {spec['rows']} 行 · seed={p['seed']}",
-        "key": name, "label": label, "presetKey": preset_key, "seed": int(p["seed"]),
+        "summary": f"{_EXO_KIND_LABELS['preset']} {name} · {spec['rows']} 行 · seed={seed}",
+        "key": name, "label": label, "presetKey": preset_key, "seed": seed,
         "rowCount": spec["rows"], "validRows": spec["validRows"],
         "preview": [_jsonable(v) for v in values[:5]],
+        "_pinParams": {"seed": seed},
     }
 
 
@@ -1730,8 +1885,8 @@ def _op_exo_file(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
         tolerance_minutes=p.get("toleranceMinutes"),
         cols=[t["from"] for t in targets] if targets else None)
     if not targets:
-        # 没指定目标列名时按表头推导，并把推导结果钉进日志：重放用的名字与首次一致
-        p["targets"] = targets = exo.default_targets(aligned["keys"])
+        # 没指定目标列名时按表头推导，并把推导结果经 _pinParams 钉进日志：重放用的名字与首次一致
+        targets = exo.default_targets(aligned["keys"])
     by_from = {t["from"]: t for t in targets}
     added = []
     for header in aligned["keys"]:
@@ -1746,7 +1901,8 @@ def _op_exo_file(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
         "summary": f"{_EXO_KIND_LABELS['file']} {len(added)} 列 · 匹配 {stats['matchedMainRows']}/"
                    f"{stats['mainRows']} 行 · {real}",
         "keys": added, "count": len(added), "sha": p.get("sha"), "stats": stats,
-        "targets": p["targets"], "coerced": aligned["coerced"], "nonNumeric": aligned["nonNumeric"],
+        "targets": targets, "coerced": aligned["coerced"], "nonNumeric": aligned["nonNumeric"],
+        "_pinParams": {"targets": targets},
     }
 
 
@@ -1809,7 +1965,7 @@ def _resample_frame(src: pd.DataFrame, time_col: str, minutes: int, method: str
             elif method == "interpolate":
                 # 真正的线性插值：空桶用相邻桶值插出来（旧版浏览器实现把 interpolate 当成均值做了）
                 s = s.interpolate(method="linear", limit_direction="both")
-            out[c] = s.round(2)
+            out[c] = features.round_half_up(s.to_numpy(dtype="float64"), 2)
         else:
             s = agg.first().reindex(idx)
             if direction == "up":
@@ -2332,7 +2488,7 @@ def _op_feature_cat(ws: Workspace, work: pd.DataFrame, p: dict) -> dict:
             raise ValueError("没有可用作目标均值参照的数值列")
         _require_feature_target(ws, work, target_col)
     plan = features.cat_plan(cols, method, levels)
-    columns, _items = features.build_cat(work, cols, method, target_col)
+    columns, _items = features.build_cat(work, cols, method, target_col, levels)
     detail = f"cols:{','.join(cols)}|method:{method}"
     result = _feature_commit(ws, work, "cat", plan, columns,
                              f"类别特征编码（{CAT_METHOD_LABELS[method]}）：{len(plan)} 列 · {detail}")
@@ -2376,6 +2532,24 @@ def _evict_if_needed() -> None:
         # 这里若顺手删掉日志，"淘汰"就变成了"历史消失"，界面上再也回不去那一版。
         _REGISTRY.pop(victim, None)
         _ACCESS.pop(victim, None)
+        # 重建锁不跟着清：那几把锁可能正被别的线程握着（它重建到一半），删了字典条目
+        # 只会让后来者拿到一把新锁，两个人同时重建同一颗帧。每个 wsId 一把小锁，
+        # 上限就是进程里见过的 wsId 数，不值得为它做回收。
+
+
+def _rebuild_lock(ws_id: str) -> threading.Lock:
+    """这个 wsId 的重建锁（进程内每颗帧一把，注册表锁保护它自己的登记）。"""
+    with _LOCK:
+        lk = _REBUILD_LOCKS.get(ws_id)
+        if lk is None:
+            lk = _REBUILD_LOCKS[ws_id] = threading.Lock()
+        return lk
+
+
+def peek(ws_id: str) -> "Workspace | None":
+    """只查内存、不重建：给「这帧在不在」的判断用，别拿它当 get 的替代。"""
+    with _LOCK:
+        return _REGISTRY.get(ws_id)
 
 
 def _register(df: pd.DataFrame, meta: dict, source: dict,
@@ -2518,10 +2692,13 @@ def reopen(ws_id: str) -> Workspace | None:
         ws.restore(min(int(doc.get("cursor") or 0), len(ops)))
     except Exception as exc:
         # 重放半途而废就别把这颗帧留在注册表里：下一次 get() 会直接命中它，
-        # 界面拿到的是一个少了外生变量列、版本号也不对的帧，每个数字都是错的
+        # 界面拿到的是一个少了外生变量列、版本号也不对的帧，每个数字都是错的。
+        # 只摘"自己刚注册的那颗"：并发下这里可能已经是别人重建好的帧，无条件 pop
+        # 等于把别人那一颗好帧删掉（它自己还握着引用继续跑，界面上就是两份历史）。
         with _LOCK:
-            _REGISTRY.pop(ws_id, None)
-            _ACCESS.pop(ws_id, None)
+            if _REGISTRY.get(ws_id) is ws:
+                _REGISTRY.pop(ws_id, None)
+                _ACCESS.pop(ws_id, None)
         raise ValueError(f"工作区 {ws_id} 按命令日志重建失败：{exc}") from exc
     return ws
 
@@ -2538,13 +2715,22 @@ def get(ws_id: str) -> Workspace:
         if ws is not None:
             _ACCESS_TICK += 1
             _ACCESS[ws_id] = _ACCESS_TICK
-    if ws is not None:
+            return ws
+    # 不在内存不等于不存在：先看命令日志能否把它重建回来（重启/被淘汰都走这条路）。
+    # 重建按 wsId 上锁并二次检查注册表：FastAPI 是多线程派发请求的，界面进第②步往往同时
+    # 打 /meta、/rows、/quality 三条——没有这把锁就是三次各自解析原始文件、重放整段日志，
+    # 后注册的那颗把前两颗顶掉（同一 wsId 短时间存在两份帧，数字还各不相同）。
+    with _rebuild_lock(ws_id):
+        with _LOCK:
+            ws = _REGISTRY.get(ws_id)
+            if ws is not None:
+                _ACCESS_TICK += 1
+                _ACCESS[ws_id] = _ACCESS_TICK
+                return ws
+        ws = reopen(ws_id)
+        if ws is None:
+            raise KeyError(ws_id)
         return ws
-    # 不在内存不等于不存在：先看命令日志能否把它重建回来（重启/被淘汰都走这条路）
-    ws = reopen(ws_id)
-    if ws is None:
-        raise KeyError(ws_id)
-    return ws
 
 
 def close(ws_id: str) -> bool:

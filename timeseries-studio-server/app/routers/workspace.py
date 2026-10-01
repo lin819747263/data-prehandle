@@ -12,6 +12,8 @@
 """
 from __future__ import annotations
 
+import functools
+import re
 import urllib.parse
 
 from fastapi import APIRouter, File, HTTPException, Query, Response, UploadFile
@@ -26,14 +28,30 @@ from ..schemas import (
     PresetRequest, RenameColumnRequest, ResampleRequest,
     RestoreRequest, SaveAsRequest, SetTimeColRequest, SplitApplyRequest, TimeFormatRequest, DeleteColumnRequest,
 )
-from ..services import dataset_store, exporter, explore, features
+from ..services import dataset_store, exporter, explore, features, state_store
 from ..services import workspace as ws_store
 from ..services.workspace import DEFAULT_PAGE, MAX_PAGE
 
 router = APIRouter(prefix="/api/ws", tags=["workspace"])
 
+# 异常原因里常带数据集目录的绝对路径（FileNotFoundError / PermissionError 的 [Errno] 那一段，
+# 以及 pandas 多行原因里逐条列出的候选路径）。界面是逐字念 detail 的，路径既淹没重点、
+# 又没有信息量——用户看不到目录名也没法据此操作，所以统一换成一个占位符。
+_PATH_RE = re.compile(r"[A-Za-z]:[\\/][^\s'\"]+|[/(][\w.\-]+/[\w.\-/]+")
+
+
+def _brief(exc: Exception) -> str:
+    """一句能照着做的失败原因：留异常类名与首行，抹掉绝对路径，超过 200 字截断。"""
+    head = (str(exc).strip().splitlines() or [""])[0]
+    text = f"{type(exc).__name__}: {_PATH_RE.sub('〈路径〉', head)}".strip()
+    return text if len(text) <= 200 else text[:199] + "…"
+
 
 def _get(ws_id: str) -> ws_store.Workspace:
+    if not state_store.is_workspace_id(ws_id):
+        # 先认形状再查表：非法 ID 是请求写错了（400），不是"这个工作区不存在"（404），
+        # 更不能让它走到 _ws_path 那一步抛 ValueError——同一个症状两种状态码，界面就没法照做
+        raise HTTPException(status_code=400, detail=f"工作区 ID 不合法：{ws_id!r}")
     try:
         return ws_store.get(ws_id)
     except KeyError as exc:
@@ -47,6 +65,15 @@ def _get(ws_id: str) -> ws_store.Workspace:
         # 日志在、进程里没有，按日志重建时才发现来源文件被删了：
         # 这类工作区界面必须提示回第一步重新载入，不能报成 500
         raise HTTPException(status_code=404, detail=str(exc)) from exc
+    except HTTPException:
+        raise
+    except Exception as exc:
+        # 重建期间还能出别的失败：来源文件成了目录 / 没权限 / 缺 pyarrow 编不出 parquet /
+        # Excel 头损坏。这些都不是"服务端坏了"，而是"这颗帧的那份原始文件此刻读不出来"，
+        # 界面要给的是一条能照着做的中文原因，不是一个没有细节的 500。
+        raise HTTPException(status_code=422,
+                            detail=f"工作区 {ws_id} 无法按命令日志重建："
+                                   f"来源此刻读不出来（{_brief(exc)}），请回第一步重新载入数据") from exc
 
 
 def _guard(fn, *args):
@@ -57,11 +84,35 @@ def _guard(fn, *args):
     except HTTPException:
         raise
     except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"{type(exc).__name__}: {exc}") from exc
+        raise HTTPException(status_code=422, detail=_brief(exc)) from exc
 
 
 def _with_page(ws: ws_store.Workspace, result: dict, offset: int, limit: int) -> dict:
     return {**result, "page": ws.rows(offset, limit)}
+
+
+def _ws_locked(fn):
+    """把整段请求套在这颗帧自己的锁里：一次 HTTP 响应描述的是同一版数据。
+
+    没有这把锁时，同一工作区的两个并发请求会互相踩：翻页的读会撞上正在执行的填补
+    （apply 期间 self.df 已经是新帧、meta 却还是旧的），撤销的重放会把另一条命令刚写好的
+    meta 整个换掉，界面拿到的是两版数据拼出来的数字、却写着同一个 version。
+    写请求尤其要整段占住——apply 之后还要回读页窗口与 meta，那两样必须与命令执行完那一瞬一致。
+
+    锁是**按工作区**的（Workspace.lock），不是进程级全局：一颗帧在跑异常检测时，
+    另一颗帧翻页不该排队等它。_get() 先于取锁执行，所以被淘汰后重建的那条路径由
+    服务层的 per-wsId 重建锁负责；重建完成后这里拿到的是注册表里那一份，两者同一个对象。
+    RLock 让 handler 内部（apply/restore/run_detection）的再次进锁变成同线程重入。
+    """
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        ws_id = kwargs.get("ws_id")
+        if not isinstance(ws_id, str):
+            return fn(*args, **kwargs)
+        ws = _get(ws_id)
+        with ws.lock:
+            return fn(*args, **kwargs)
+    return wrapper
 
 
 @router.get("")
@@ -161,17 +212,20 @@ async def create_merged_workspace(
 
 
 @router.get("/{ws_id}")
+@_ws_locked
 def get_meta(ws_id: str) -> dict:
     return _get(ws_id).meta_view()
 
 
 @router.get("/{ws_id}/rows")
+@_ws_locked
 def get_rows(ws_id: str, offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
     return {"meta": ws.meta_view(), "page": ws.rows(offset, limit)}
 
 
 @router.get("/{ws_id}/columns")
+@_ws_locked
 def get_columns(ws_id: str, keys: str = Query(..., description="逗号分隔的列名"),
                 max_rows: int | None = Query(None, ge=1)) -> dict:
     ws = _get(ws_id)
@@ -182,11 +236,13 @@ def get_columns(ws_id: str, keys: str = Query(..., description="逗号分隔的�
 
 
 @router.get("/{ws_id}/overview")
+@_ws_locked
 def get_overview(ws_id: str) -> dict:
     return _get(ws_id).overview()
 
 
 @router.get("/{ws_id}/time-detect")
+@_ws_locked
 def get_time_detect(ws_id: str, col: str = Query(..., min_length=1, description="要试的列名"),
                     format: str = Query("", description="手填的源格式（可选）：登记名、epoch_ms/epoch_s 或占位符模板"),
                     customFormat: str = Query("", description="format=custom 时的模板")) -> dict:
@@ -207,6 +263,7 @@ def get_time_detect(ws_id: str, col: str = Query(..., min_length=1, description=
 
 
 @router.get("/{ws_id}/quality")
+@_ws_locked
 def get_quality(ws_id: str) -> dict:
     """第四步诊断：各列缺失统计、缺失段区间、重复时间戳计数，全部在服务端算。"""
     ws = _get(ws_id)
@@ -225,12 +282,19 @@ def _numeric_only(ws: ws_store.Workspace, keys: list[str]) -> None:
     """
     types = {c["key"]: c["type"] for c in ws.meta["columns"]}
     for key in keys:
-        if types.get(key) not in (None, "float"):
+        t = types.get(key)
+        if t is None:
+            # 以前这里放过（types.get(key) not in (None, "float")），于是"列名写错"会一路走到
+            # 整表扫描，数出一列 n=0 或干脆 500——调用方的 bug 被洗成了「看起来是个数」。
             raise HTTPException(status_code=400,
-                                detail=f"该接口只接受数值列：{key} 是 {types[key]} 列")
+                                detail=f"列不存在：{key}（当前 {len(types)} 列，"
+                                       f"数值列 {len([k for k, v in types.items() if v == 'float'])} 列）")
+        if t != "float":
+            raise HTTPException(status_code=400, detail=f"该接口只接受数值列：{key} 是 {t} 列")
 
 
 @router.get("/{ws_id}/series")
+@_ws_locked
 def get_series(ws_id: str, cols: str = Query(..., description="逗号分隔的数值列名"),
                points: int = Query(0, ge=0, le=explore.MAX_POINTS,
                                   description="0（默认）= 全量，整表每一行都送回折线；> 0 = 按该上限抽稀")) -> dict:
@@ -257,6 +321,7 @@ def get_series(ws_id: str, cols: str = Query(..., description="逗号分隔的�
 # ---------------- 第三步：统计概览与图表 ----------------
 
 @router.get("/{ws_id}/stats")
+@_ws_locked
 def get_stats(ws_id: str, cols: str = Query("", description="逗号分隔的数值列名，留空则统计全部数值列")) -> dict:
     """统计矩阵：每列 Count/Mean/Std/Min/Q1/Median/Q3/Max/缺失率，整表在服务端数。"""
     ws = _get(ws_id)
@@ -268,6 +333,7 @@ def get_stats(ws_id: str, cols: str = Query("", description="逗号分隔的数�
 
 
 @router.get("/{ws_id}/hist")
+@_ws_locked
 def get_hist(ws_id: str, col: str = Query(..., description="列名"),
              bins: int = Query(explore.DEFAULT_BINS, ge=2, le=200)) -> dict:
     """单列频次直方图：桶边界、计数与均值/中位数所在桶，界面只管画。"""
@@ -277,6 +343,7 @@ def get_hist(ws_id: str, col: str = Query(..., description="列名"),
 
 
 @router.get("/{ws_id}/series-multi")
+@_ws_locked
 def get_series_multi(ws_id: str, cols: str = Query(..., description="逗号分隔的列名"),
                      mode: str = Query(explore.DEFAULT_MODE,
                                        description="raw 全量（每行都回，不抽点）/ extremes 极值 / mean 窗口均值 / lttb 三角面积降采样"),
@@ -307,6 +374,7 @@ def get_series_multi(ws_id: str, cols: str = Query(..., description="逗号分�
 
 
 @router.get("/{ws_id}/holidays")
+@_ws_locked
 def get_holidays(ws_id: str) -> dict:
     """当前工作区生效的节假日表：界面显示、导出复现与 feature-time 计算读的都是这一份。"""
     ws = _get(ws_id)
@@ -323,6 +391,7 @@ def get_holidays(ws_id: str) -> dict:
 
 
 @router.get("/{ws_id}/export")
+@_ws_locked
 def export_workspace(ws_id: str, fmt: str = Query("csv", alias="format",
                                                   pattern="^(csv|xlsx|parquet|feather)$")) -> Response:
     """宽表直出：后端拿着自己的工作区编码字节流，浏览器不再回传整表。"""
@@ -349,6 +418,7 @@ def export_workspace(ws_id: str, fmt: str = Query("csv", alias="format",
 # ---------------- 另存为数据集：服务端帧 → 数据集目录 ----------------
 
 @router.post("/{ws_id}/save-as")
+@_ws_locked
 def save_as_dataset(ws_id: str, payload: SaveAsRequest,
                     fmt: str = Query("csv", alias="format",
                                      pattern="^(csv|xlsx|parquet|feather)$")) -> dict:
@@ -387,6 +457,7 @@ def save_as_dataset(ws_id: str, payload: SaveAsRequest,
 # ---------------- 第五步辅助：特征预览定位 ----------------
 
 @router.get("/{ws_id}/first-complete")
+@_ws_locked
 def first_complete(ws_id: str, cols: str = Query(..., description="逗号分隔的新列名"),
                    scan_rows: int = Query(5000, ge=1, le=200000)) -> dict:
     """新增特征列里第一个「行行有值」的行号（长窗口特征开头必然为空）。"""
@@ -399,12 +470,14 @@ def first_complete(ws_id: str, cols: str = Query(..., description="逗号分隔�
 
 
 @router.get("/{ws_id}/anomaly")
+@_ws_locked
 def get_anomaly(ws_id: str) -> dict:
     ws = _get(ws_id)
     return {"meta": ws.meta_view(), **ws.anomaly_view()}
 
 
 @router.post("/{ws_id}/anomaly-detect")
+@_ws_locked
 def op_anomaly_detect(ws_id: str, payload: AnomalyDetectRequest) -> dict:
     """执行检测并把结果留在服务端：修复按这份缓存的行索引走，界面不再回传索引。"""
     ws = _get(ws_id)
@@ -418,12 +491,14 @@ def op_anomaly_detect(ws_id: str, payload: AnomalyDetectRequest) -> dict:
 
 
 @router.get("/{ws_id}/resample-preview")
+@_ws_locked
 def resample_preview(ws_id: str, targetMinutes: int = Query(..., ge=1, le=1440)) -> dict:
     ws = _get(ws_id)
     return _guard(ws_store.resample_preview, ws, targetMinutes)
 
 
 @router.post("/{ws_id}/op/time-format")
+@_ws_locked
 def op_time_format(ws_id: str, payload: TimeFormatRequest,
                    offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -432,6 +507,7 @@ def op_time_format(ws_id: str, payload: TimeFormatRequest,
 
 
 @router.post("/{ws_id}/op/time-col")
+@_ws_locked
 def op_time_col(ws_id: str, payload: SetTimeColRequest,
                 offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     """指定时间列：整列解析得过才改，改完这一列就是 datetime64（一条可撤销的命令）。"""
@@ -441,6 +517,7 @@ def op_time_col(ws_id: str, payload: SetTimeColRequest,
 
 
 @router.post("/{ws_id}/op/rename-column")
+@_ws_locked
 def op_rename(ws_id: str, payload: RenameColumnRequest,
               offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -449,6 +526,7 @@ def op_rename(ws_id: str, payload: RenameColumnRequest,
 
 
 @router.post("/{ws_id}/op/delete-column")
+@_ws_locked
 def op_delete_column(ws_id: str, payload: DeleteColumnRequest,
                      offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -457,6 +535,7 @@ def op_delete_column(ws_id: str, payload: DeleteColumnRequest,
 
 
 @router.post("/{ws_id}/op/convert-unit")
+@_ws_locked
 def op_convert_unit(ws_id: str, payload: ConvertUnitRequest,
                     offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -465,6 +544,7 @@ def op_convert_unit(ws_id: str, payload: ConvertUnitRequest,
 
 
 @router.post("/{ws_id}/op/derived-column")
+@_ws_locked
 def op_derived(ws_id: str, payload: DerivedColumnRequest,
                offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -474,6 +554,7 @@ def op_derived(ws_id: str, payload: DerivedColumnRequest,
 
 
 @router.post("/{ws_id}/op/exo-preset")
+@_ws_locked
 def op_exo_preset(ws_id: str, payload: ExoPresetRequest,
                   offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     """预设模板：服务端按主表时间列生成一列模拟外生变量（seed 进日志，可重放）。"""
@@ -483,6 +564,7 @@ def op_exo_preset(ws_id: str, payload: ExoPresetRequest,
 
 
 @router.post("/{ws_id}/op/exo-formula")
+@_ws_locked
 def op_exo_formula(ws_id: str, payload: ExoFormulaRequest,
                    offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     """时间公式：hour/day/month/weekday/idx 在服务端向量化求值，浏览器不碰整列。"""
@@ -492,6 +574,7 @@ def op_exo_formula(ws_id: str, payload: ExoFormulaRequest,
 
 
 @router.post("/{ws_id}/op/exo-file")
+@_ws_locked
 def op_exo_file(ws_id: str, payload: ExoFileRequest,
                 offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     """侧表挂列：文件在 /api/exo/inspect 那一步就落进 dataset/_exo/ 了，这里只引用文件名 + sha。
@@ -507,6 +590,7 @@ def op_exo_file(ws_id: str, payload: ExoFileRequest,
 
 
 @router.post("/{ws_id}/op/resample")
+@_ws_locked
 def op_resample(ws_id: str, payload: ResampleRequest,
                 offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -515,6 +599,7 @@ def op_resample(ws_id: str, payload: ResampleRequest,
 
 
 @router.post("/{ws_id}/op/split")
+@_ws_locked
 def op_split(ws_id: str, payload: SplitApplyRequest,
              offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     """把切分结果落成真实的一列：前端只发比例，三档行数由服务端按整表行数算并回带。"""
@@ -524,6 +609,7 @@ def op_split(ws_id: str, payload: SplitApplyRequest,
 
 
 @router.post("/{ws_id}/op/impute")
+@_ws_locked
 def op_impute(ws_id: str, payload: ImputeRequest,
               offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     """按缺失段填补（可一次跨多列多段），dedupe 非空时同时合并重复时间戳。"""
@@ -535,6 +621,7 @@ def op_impute(ws_id: str, payload: ImputeRequest,
 
 
 @router.post("/{ws_id}/op/anomaly-repair")
+@_ws_locked
 def op_anomaly_repair(ws_id: str, payload: AnomalyRepairRequest,
                       offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     """按服务端留存的检测结果修复：检测后数据又被改过就直接拒绝，不拿旧索引乱动行。"""
@@ -544,6 +631,7 @@ def op_anomaly_repair(ws_id: str, payload: AnomalyRepairRequest,
 
 
 @router.post("/{ws_id}/op/mask-generate")
+@_ws_locked
 def op_mask_generate(ws_id: str, payload: MaskGenerateRequest,
                      offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -552,6 +640,7 @@ def op_mask_generate(ws_id: str, payload: MaskGenerateRequest,
 
 
 @router.post("/{ws_id}/op/mask-delete")
+@_ws_locked
 def op_mask_delete(ws_id: str, payload: MaskDeleteRequest,
                    offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -562,6 +651,7 @@ def op_mask_delete(ws_id: str, payload: MaskDeleteRequest,
 # ---------------- 第五步：特征构建 ----------------
 
 @router.get("/{ws_id}/value-counts")
+@_ws_locked
 def value_counts(ws_id: str, keys: str = Query(..., description="逗号分隔的类别列名"),
                  method: str = Query("onehot", description="编码方式，只用于算出预计新增列数")) -> dict:
     """类别列的整表取值分布：面板上的「预计新增 N 列 / 取值占比」全部由服务端数出来。"""
@@ -585,6 +675,7 @@ def value_counts(ws_id: str, keys: str = Query(..., description="逗号分隔的
 
 
 @router.post("/{ws_id}/op/holidays")
+@_ws_locked
 def op_holidays(ws_id: str, payload: HolidaysRequest,
                 offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     """配置节假日表：只改工作区配置、不动帧，所以它仍是一条可撤销、可重放的命令。"""
@@ -594,6 +685,7 @@ def op_holidays(ws_id: str, payload: HolidaysRequest,
 
 
 @router.post("/{ws_id}/op/feature-time")
+@_ws_locked
 def op_feature_time(ws_id: str, payload: FeatureTimeRequest,
                     offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -602,6 +694,7 @@ def op_feature_time(ws_id: str, payload: FeatureTimeRequest,
 
 
 @router.post("/{ws_id}/op/feature-lag")
+@_ws_locked
 def op_feature_lag(ws_id: str, payload: FeatureLagRequest,
                    offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -610,6 +703,7 @@ def op_feature_lag(ws_id: str, payload: FeatureLagRequest,
 
 
 @router.post("/{ws_id}/op/feature-diff")
+@_ws_locked
 def op_feature_diff(ws_id: str, payload: FeatureDiffRequest,
                     offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -618,6 +712,7 @@ def op_feature_diff(ws_id: str, payload: FeatureDiffRequest,
 
 
 @router.post("/{ws_id}/op/feature-cat")
+@_ws_locked
 def op_feature_cat(ws_id: str, payload: FeatureCatRequest,
                    offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -626,6 +721,7 @@ def op_feature_cat(ws_id: str, payload: FeatureCatRequest,
 
 
 @router.post("/{ws_id}/restore")
+@_ws_locked
 def restore(ws_id: str, payload: RestoreRequest,
             offset: int = Query(0, ge=0), limit: int = Query(DEFAULT_PAGE, ge=1, le=MAX_PAGE)) -> dict:
     ws = _get(ws_id)
@@ -637,5 +733,11 @@ def restore(ws_id: str, payload: RestoreRequest,
 
 
 @router.delete("/{ws_id}")
+@_ws_locked
 def close(ws_id: str) -> dict:
-    return {"closed": ws_store.close(ws_id)}
+    try:
+        return {"closed": ws_store.close(ws_id)}
+    except ValueError as exc:
+        # wsId 是路径参数，任何字符串都能进来；state_store 认它不合法时是给 400，
+        # 不是给一个带 Python 报错的 500（非法 id 属于调用方的请求错了，服务端没坏）
+        raise HTTPException(status_code=400, detail=str(exc)) from exc

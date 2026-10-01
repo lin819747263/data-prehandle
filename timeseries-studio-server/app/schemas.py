@@ -18,13 +18,6 @@ MAX_UPLOAD_BYTES = 64 * 1024 * 1024
 MAX_UPLOAD_MB = MAX_UPLOAD_BYTES // (1024 * 1024)
 
 
-class ExportRequest(BaseModel):
-    format: str = Field(..., pattern="^(parquet|feather|csv|xlsx)$")
-    columns: list[str]
-    rows: list[dict[str, Any]]
-    filename: Optional[str] = None
-
-
 class SaveAsRequest(BaseModel):
     """另存为数据集：把服务端工作区当前帧写进数据集目录。
 

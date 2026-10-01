@@ -58,6 +58,11 @@ def stats_matrix(frame: pd.DataFrame, keys: list[str], labels: dict[str, str] | 
 
     globalMax 的起点是 1、只增不减（旧实现如此）：整表都在 0~1 之间时分布条仍按 0~1 画，
     不会因为除以一个很小的最大值而溢出画布。
+
+    这里的 missingRate 分母是**总行数**（迁移前浏览器就是如此，也是第三步那张表的定义：
+    「这一列有几成的行是空的」）。它和第四步那个"整体缺失率"不是同一个数：那边按
+    行 × 参与统计的列数（单元格总数）算。两处都随响应给出 missingDenominator，
+    界面与验收脚本拿哪个都能一眼认出分母，不用猜。
     """
     arrays = _float_arrays(frame, keys)
     total_rows = int(frame.shape[0])
@@ -71,6 +76,7 @@ def stats_matrix(frame: pd.DataFrame, keys: list[str], labels: dict[str, str] | 
             "key": key,
             "label": (labels or {}).get(key, key),
             "missingRate": (stats["missing"] / total_rows * 100) if total_rows else 0.0,
+            "missingDenominator": total_rows,
             **stats,
         })
     return {"rowCount": total_rows, "colCount": len(keys), "globalMax": global_max, "rows": rows}

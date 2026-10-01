@@ -482,6 +482,63 @@ def section_d() -> None:
           f'{qb["totalMissingCells"]} vs {q_before["totalMissingCells"]}')
 
 
+# ---------------------------------------------------------------- E 重建单飞
+
+def section_e() -> None:
+    print("\n== E. 被淘汰的帧：同一颗只重建一次，不同颗不互相排队 ==")
+    # 这一段测的是**进程内的注册表**，不走 HTTP：界面进第②步会同时打 /meta、/rows、/quality，
+    # 三个线程各自「解析原始文件 + 重放整段日志」跑一遍的话，同一颗帧短时间内存在三份，
+    # 后注册的那份把前两份顶掉——手里还握着旧帧的请求，回给界面的就是另一版数字。
+    # 放在这里测而不是开 HTTP，是因为「重建发生了几次」这件事在 HTTP 那头根本看不见。
+    sys.path.insert(0, str(ROOT))
+    import threading as th
+    import app.services.workspace as wsvc
+
+    ids = ["aaaa00000001", "bbbb00000002"]   # 必须过 state_store.is_workspace_id 那条十六进制闸门
+    calls: list[str] = []
+    broken: list[str] = []
+    pair = th.Barrier(2)          # 两颗不同的帧应当同时在重建
+    gate = th.Event()
+
+    def fake_reopen(ws_id: str):
+        calls.append(ws_id)
+        try:
+            pair.wait(3)          # 全局锁的话这里会超时（另一颗进不来）
+        except th.BrokenBarrierError:
+            broken.append(ws_id)
+        gate.wait(10)             # 模拟一次昂贵重建：解析 + 逐条重放
+        df = pd.DataFrame({"v": [1.0, 2.0, 3.0]})
+        meta = {"columns": [{"key": "v", "label": "v", "type": "float"}], "timeCol": None}
+        return wsvc._register(df, meta, {"kind": "unit-test"}, ws_id=ws_id, persist=False)
+
+    orig = wsvc.reopen
+    wsvc.reopen = fake_reopen
+    results: list[str] = []
+    try:
+        threads = [th.Thread(target=lambda i=i: results.append(wsvc.get(i).id)) for i in ids * 5]
+        for t in threads:
+            t.start()
+        time.sleep(0.6)     # 让同 ID 的其余四个都排到重建锁上，再放行那两次真重建
+        gate.set()
+        for t in threads:
+            t.join(20)
+        hold = [t for t in threads if t.is_alive()]
+        check("E0 十个线程全部返回（没有谁卡在锁上）", not hold, f"仍存活 {len(hold)}")
+    finally:
+        gate.set()
+        wsvc.reopen = orig
+        for i in ids:
+            wsvc._REGISTRY.pop(i, None)
+            wsvc._ACCESS.pop(i, None)
+    check("E1 同一颗帧被 5 个并发请求挤中：只重建一次（双检锁生效）",
+          calls.count(ids[0]) == 1 and calls.count(ids[1]) == 1,
+          {"重建记录": calls})
+    check("E2 两颗不同帧的重建是同时进行的（锁按 wsId 分，不是一把全局）", not broken,
+          {"被卡住的": broken, "重建记录": calls})
+    check("E3 每个线程拿到的都是注册表里那一份", sorted(results) == sorted(ids * 5),
+          {"得到": sorted(set(results)), "条数": len(results)})
+
+
 def main() -> int:
     for d in (STATE_DIR, DATA_DIR):
         if d.exists():
@@ -490,6 +547,9 @@ def main() -> int:
                     p.unlink() if p.is_file() else p.rmdir()
                 except OSError:
                     pass
+    sys.path.insert(0, str(ROOT))
+    os.environ["TSS_STATE_DIR"] = str(STATE_DIR)
+    os.environ["TSS_DATASET_DIR"] = str(DATA_DIR)
     port = free_port()
     spawn_backend(port)
     t0 = time.time()
@@ -498,6 +558,7 @@ def main() -> int:
         section_b()
         section_c()
         section_d()
+        section_e()
     finally:
         kill_backend()
     elapsed = time.time() - t0

@@ -3,14 +3,15 @@
 Parquet / Feather 是列式二进制压缩格式，浏览器单文件无法可靠产出，
 由后端用 pyarrow 真实编码；CSV / Excel 也一并支持，作为可复现归档。
 
-两条入口：
-- encode(df, ...)            —— 工作区直出（GET /api/ws/{id}/export），明细不过网络；
-- build_export(cols, rows..) —— 调用方自带行数据（POST /api/export），给脚本与外部工具用。
+只有一条入口：
+- encode(df, ...) —— 工作区直出（GET /api/ws/{id}/export、POST /api/ws/{id}/save-as 共用），
+  编码的永远是服务端自己那一版帧，明细不过网络。
+过去还有过一条 POST /api/export（调用方自带 rows），界面与脚本都没用它，等于多开一个
+「让外部进程往编码器里塞任意数据」的口子，已删。
 """
 from __future__ import annotations
 import io
 from functools import lru_cache
-from typing import Any
 
 import pandas as pd
 
@@ -48,10 +49,6 @@ def encode(df: pd.DataFrame, fmt: str, filename: str | None) -> tuple[bytes, str
     base = (filename or "timeseries_export").rsplit(".", 1)[0]
     download_name = f"{base}.{_EXTENSIONS[fmt]}"
     return data, media, download_name
-
-
-def build_export(fmt: str, columns: list[str], rows: list[dict[str, Any]], filename: str | None) -> tuple[bytes, str, str]:
-    return encode(pd.DataFrame(rows, columns=columns), fmt, filename)
 
 
 @lru_cache(maxsize=1)

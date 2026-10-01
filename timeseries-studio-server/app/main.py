@@ -42,25 +42,19 @@
   PUT    /api/session                保存会话（只收 UI 状态，携带整列数据的请求直接 400）
   DELETE /api/session                清除会话
 
-  POST   /api/export                 行数据 → Parquet/Feather/CSV/Excel 字节流（自带行的调用方用）
-
 工作区的命令日志与会话落在 <cwd>/.tss-state（可用 TSS_STATE_DIR 覆盖）。落的是「怎么算出来的」，
 不是明细本身：后端重启后同一个 wsId 仍能按日志重放复原，刷新页面也就不再丢撤销历史。
 """
 from __future__ import annotations
 
-import urllib.parse
-
 from fastapi import FastAPI, File, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import Response
 
 from . import __version__, schemas
 from .routers import session as session_router
 from .routers import workspace as workspace_router
-from .schemas import ExportRequest
 from .services import dataset_store, exo, explore, features, state_store
-from .services.exporter import build_export, codec_status
+from .services.exporter import codec_status
 
 app = FastAPI(
     title="TimeSeries Studio Server",
@@ -213,24 +207,3 @@ async def exo_inspect(file: UploadFile = File(..., description="外生变量侧�
         raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
         raise HTTPException(status_code=422, detail=f"侧表解析失败：{type(exc).__name__}: {exc}") from exc
-
-
-@app.post("/api/export")
-def export(payload: ExportRequest) -> Response:
-    if not payload.columns:
-        raise HTTPException(status_code=400, detail="columns 不能为空")
-    try:
-        data, media_type, download_name = build_export(
-            payload.format, payload.columns, payload.rows, payload.filename
-        )
-    except Exception as exc:
-        raise HTTPException(status_code=422, detail=f"导出失败：{type(exc).__name__}: {exc}") from exc
-    quoted = urllib.parse.quote(download_name)
-    return Response(
-        content=data,
-        media_type=media_type,
-        headers={
-            "Content-Disposition": f"attachment; filename*=UTF-8''{quoted}",
-            "Content-Length": str(len(data)),
-        },
-    )
